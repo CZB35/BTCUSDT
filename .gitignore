@@ -1,0 +1,15 @@
+target/
+
+.signal-state*/
+.futures-signal-state*/
+
+tools/
+
+android/.gradle/
+android/.kotlin/
+android/local.properties
+android/app/build/
+
+admin/node_modules/
+admin/dist/
+admin/tsconfig.tsbuildinfo

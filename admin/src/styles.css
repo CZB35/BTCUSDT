@@ -1,0 +1,341 @@
+:root {
+  color: #eaecef;
+  background: #0b0e11;
+  font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input {
+  font: inherit;
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 240px 1fr;
+  min-height: 100vh;
+  background: #0b0e11;
+}
+
+.sidebar {
+  border-right: 1px solid #2b3139;
+  background: #181a20;
+  padding: 20px 14px;
+}
+
+.brand {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px;
+  margin-bottom: 24px;
+}
+
+.brand-mark {
+  display: grid;
+  place-items: center;
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  background: #fcd535;
+  color: #181a20;
+  font-weight: 800;
+}
+
+.brand strong,
+.brand span {
+  display: block;
+}
+
+.brand span,
+.topbar p,
+.panel p,
+.stat span,
+dt {
+  color: #929aa5;
+}
+
+nav {
+  display: grid;
+  gap: 6px;
+}
+
+nav a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  color: #eaecef;
+  text-decoration: none;
+}
+
+nav a.active {
+  background: #2b3139;
+  color: #fcd535;
+}
+
+main {
+  padding: 24px;
+  display: grid;
+  gap: 18px;
+}
+
+.topbar,
+.connection,
+.panel,
+.stat {
+  border: 1px solid #2b3139;
+  background: #1e2329;
+  border-radius: 12px;
+}
+
+.topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 20px;
+}
+
+h1,
+h2,
+p {
+  margin: 0;
+}
+
+h1 {
+  font-size: 26px;
+}
+
+h2 {
+  font-size: 18px;
+}
+
+.icon-button,
+.primary,
+.trade-buttons button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 0;
+  border-radius: 6px;
+  cursor: pointer;
+}
+
+.icon-button,
+.primary {
+  min-height: 40px;
+  padding: 0 16px;
+  background: #fcd535;
+  color: #181a20;
+  font-weight: 700;
+}
+
+.connection {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) minmax(180px, 1fr) auto;
+  gap: 12px;
+  align-items: end;
+  padding: 14px;
+}
+
+label {
+  display: grid;
+  gap: 6px;
+  color: #929aa5;
+  font-size: 13px;
+}
+
+input {
+  height: 40px;
+  border: 1px solid #2b3139;
+  border-radius: 6px;
+  background: #0b0e11;
+  color: #eaecef;
+  padding: 0 12px;
+  outline: none;
+}
+
+input:focus {
+  border-color: #fcd535;
+}
+
+.status {
+  color: #fcd535;
+  font-weight: 700;
+  padding-bottom: 10px;
+}
+
+.stats-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.stat {
+  padding: 16px;
+  display: grid;
+  gap: 10px;
+}
+
+.stat svg {
+  width: 20px;
+  height: 20px;
+}
+
+.stat-icon {
+  color: #fcd535;
+}
+
+.stat strong {
+  font-size: 28px;
+  line-height: 1;
+}
+
+.split {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: 18px;
+}
+
+.panel {
+  padding: 18px;
+}
+
+.panel-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 16px;
+}
+
+.signal-panel {
+  display: grid;
+  gap: 14px;
+}
+
+.trade-buttons,
+.form-row {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+}
+
+.trade-buttons button {
+  height: 44px;
+  border: 1px solid #2b3139;
+  background: #2b3139;
+  color: #eaecef;
+}
+
+.trade-buttons button.up.active {
+  border-color: #0ecb81;
+  color: #0ecb81;
+}
+
+.trade-buttons button.down.active {
+  border-color: #f6465d;
+  color: #f6465d;
+}
+
+.latest {
+  display: grid;
+  gap: 16px;
+}
+
+.latest strong {
+  font-size: 28px;
+}
+
+.price-up {
+  color: #0ecb81;
+}
+
+.price-down {
+  color: #f6465d;
+}
+
+dl {
+  display: grid;
+  gap: 10px;
+  margin: 0;
+}
+
+dl div {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+dd {
+  margin: 0;
+  font-weight: 700;
+}
+
+.table-wrap {
+  overflow-x: auto;
+}
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+}
+
+th,
+td {
+  padding: 12px 10px;
+  border-bottom: 1px solid #2b3139;
+  text-align: left;
+  white-space: nowrap;
+}
+
+th {
+  color: #929aa5;
+  font-size: 12px;
+  font-weight: 600;
+}
+
+td {
+  font-size: 14px;
+}
+
+@media (max-width: 900px) {
+  .app {
+    grid-template-columns: 1fr;
+  }
+
+  .sidebar {
+    display: none;
+  }
+
+  main {
+    padding: 14px;
+  }
+
+  .topbar,
+  .connection,
+  .split {
+    grid-template-columns: 1fr;
+  }
+
+  .topbar {
+    display: grid;
+    gap: 14px;
+  }
+
+  .stats-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+}

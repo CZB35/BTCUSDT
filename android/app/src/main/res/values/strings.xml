@@ -1,0 +1,5 @@
+<resources>
+    <string name="app_name">事件信号</string>
+    <string name="accessibility_service_name">事件信号自动化</string>
+    <string name="accessibility_service_description">执行用户授权的事件合约自动化操作。</string>
+</resources>

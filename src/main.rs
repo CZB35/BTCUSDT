@@ -1,0 +1,3244 @@
+use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
+
+use axum::{
+    extract::{
+        ws::{Message, WebSocket},
+        Query, State, WebSocketUpgrade,
+    },
+    http::{HeaderMap, StatusCode},
+    response::{IntoResponse, Response},
+    routing::{get, post, put},
+    Json, Router,
+};
+use chrono::{DateTime, Duration, Utc};
+use clap::Parser;
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest, Sha256};
+use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
+use tokio::sync::{broadcast, RwLock};
+use tower_http::cors::{Any, CorsLayer};
+use uuid::Uuid;
+
+const DEFAULT_SYMBOL: &str = "BTCUSDT";
+const DEFAULT_PERIOD_SECONDS: i32 = 600;
+const DEFAULT_PAYOUT_RATIO: Decimal = dec!(0.80);
+const PROFIT_SHARE_RATE: Decimal = dec!(0.30);
+const DEFAULT_STAKE_PERCENT: Decimal = dec!(0.05);
+const MIN_EVENT_STAKE: Decimal = dec!(5);
+const MAX_EVENT_STAKE: Decimal = dec!(250);
+const PAGE_GATE_TTL_SECONDS: i64 = 3;
+#[derive(Parser, Debug)]
+#[command(name = "event-signal-prototype")]
+struct Cli {
+    #[arg(long)]
+    serve: bool,
+    #[arg(long)]
+    once: bool,
+    #[arg(long, default_value = "127.0.0.1:8787")]
+    listen: SocketAddr,
+    #[arg(long, env = "DATABASE_URL")]
+    database_url: Option<String>,
+}
+
+#[tokio::main]
+async fn main() -> anyhow::Result<()> {
+    let cli = Cli::parse();
+    if cli.once {
+        let signal = SignalCore::new("DOWN".to_string(), dec!(5), dec!(1));
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&signal_api_response(&signal))?
+        );
+        return Ok(());
+    }
+
+    let db = match &cli.database_url {
+        Some(database_url) => {
+            let pool = PgPoolOptions::new()
+                .max_connections(10)
+                .connect(database_url)
+                .await?;
+            sqlx::migrate!("./migrations").run(&pool).await?;
+            println!("PostgreSQL connected and migrations applied");
+            Some(pool)
+        }
+        None => None,
+    };
+
+    let state = AppState::new(db);
+    let app = router(state);
+    let listener = tokio::net::TcpListener::bind(cli.listen).await?;
+    println!("event-signal service listening on http://{}", cli.listen);
+    if cli.database_url.is_none() {
+        println!("running with in-memory state; pass --database-url later for persistent storage");
+    }
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<SocketAddr>(),
+    )
+    .await?;
+    Ok(())
+}
+
+fn router(state: SharedState) -> Router {
+    Router::new()
+        .route("/health", get(health))
+        .route("/v1/auth/register", post(register))
+        .route("/v1/auth/login", post(login))
+        .route("/v1/auth/logout", post(logout))
+        .route("/v1/auth/refresh", post(refresh_token))
+        .route("/v1/stats", get(stats))
+        .route("/v1/signals/latest", get(latest_signal))
+        .route("/v1/signals/history", get(signal_history))
+        .route("/v1/user-settings/trading", get(get_trading_settings))
+        .route("/v1/user-settings/trading", put(save_trading_settings))
+        .route("/v1/user-settings/automation", get(get_automation_settings))
+        .route(
+            "/v1/user-settings/automation",
+            put(save_automation_settings),
+        )
+        .route("/v1/automation/page-state", post(save_page_state))
+        .route("/v1/balance", get(balance))
+        .route("/v1/ledger", get(ledger))
+        .route("/v1/deposits/instructions", get(deposit_instructions))
+        .route("/v1/deposits/submit-tx", post(submit_deposit_tx))
+        .route("/v1/deposits", get(deposits))
+        .route("/v1/event-contract-orders", post(submit_order))
+        .route("/v1/execution-reports", post(submit_execution_report))
+        .route("/v1/settlements", get(settlements))
+        .route("/v1/ws", get(ws_handler))
+        .route("/v1/admin/overview", get(admin_overview))
+        .route("/v1/admin/signals/emit", post(admin_emit_signal))
+        .route("/v1/admin/users", get(admin_users))
+        .route("/v1/admin/orders", get(admin_orders))
+        .route("/v1/admin/execution-reports", get(admin_reports))
+        .route("/v1/admin/settlements", get(admin_settlements))
+        .route("/v1/admin/page-states", get(admin_page_states))
+        .layer(
+            CorsLayer::new()
+                .allow_origin(Any)
+                .allow_methods(Any)
+                .allow_headers(Any),
+        )
+        .with_state(state)
+}
+
+type SharedState = Arc<AppState>;
+
+struct AppState {
+    db: Option<PgPool>,
+    users: RwLock<HashMap<Uuid, UserRecord>>,
+    user_by_email: RwLock<HashMap<String, Uuid>>,
+    sessions: RwLock<HashMap<String, SessionRecord>>,
+    rate_limits: RwLock<HashMap<String, RegisterRateLimit>>,
+    balances: RwLock<HashMap<Uuid, BalanceRecord>>,
+    trading_settings: RwLock<HashMap<Uuid, TradingSettings>>,
+    automation_settings: RwLock<HashMap<Uuid, AutomationSettings>>,
+    page_states: RwLock<HashMap<Uuid, AutomationPageState>>,
+    signals: RwLock<Vec<SignalCore>>,
+    orders: RwLock<Vec<EventContractOrderRecord>>,
+    reports: RwLock<Vec<ExecutionReportRecord>>,
+    settlements: RwLock<Vec<SettlementRecord>>,
+    ledger: RwLock<Vec<LedgerEntry>>,
+    deposits: RwLock<Vec<DepositRecord>>,
+    reservations: RwLock<HashMap<Uuid, SignalReservation>>,
+    signal_tx: broadcast::Sender<SignalCore>,
+    started_at: DateTime<Utc>,
+}
+
+impl AppState {
+    fn new(db: Option<PgPool>) -> SharedState {
+        let (signal_tx, _) = broadcast::channel(128);
+        Arc::new(Self {
+            db,
+            users: RwLock::new(HashMap::new()),
+            user_by_email: RwLock::new(HashMap::new()),
+            sessions: RwLock::new(HashMap::new()),
+            rate_limits: RwLock::new(HashMap::new()),
+            balances: RwLock::new(HashMap::new()),
+            trading_settings: RwLock::new(HashMap::new()),
+            automation_settings: RwLock::new(HashMap::new()),
+            page_states: RwLock::new(HashMap::new()),
+            signals: RwLock::new(Vec::new()),
+            orders: RwLock::new(Vec::new()),
+            reports: RwLock::new(Vec::new()),
+            settlements: RwLock::new(Vec::new()),
+            ledger: RwLock::new(Vec::new()),
+            deposits: RwLock::new(Vec::new()),
+            reservations: RwLock::new(HashMap::new()),
+            signal_tx,
+            started_at: Utc::now(),
+        })
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct UserRecord {
+    id: Uuid,
+    email: String,
+    password_hash: String,
+    status: String,
+    active_device_fingerprint: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct SessionRecord {
+    user_id: Uuid,
+    device_fingerprint: String,
+    refresh_token: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct RegisterRateLimit {
+    window_start: DateTime<Utc>,
+    attempts: u32,
+    blocked_until: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Serialize)]
+struct BalanceRecord {
+    user_id: Uuid,
+    asset: String,
+    available: Decimal,
+    frozen: Decimal,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct TradingSettings {
+    stake_percent: Decimal,
+    min_stake_usdt: Decimal,
+    max_single_stake_usdt: Option<Decimal>,
+    min_confidence: Option<Decimal>,
+    signal_alert_enabled: bool,
+    floating_window_enabled: bool,
+}
+
+impl Default for TradingSettings {
+    fn default() -> Self {
+        Self {
+            stake_percent: DEFAULT_STAKE_PERCENT,
+            min_stake_usdt: MIN_EVENT_STAKE,
+            max_single_stake_usdt: None,
+            min_confidence: None,
+            signal_alert_enabled: true,
+            floating_window_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AutomationSettings {
+    automation_enabled: bool,
+    execution_mode: String,
+    target_app_profile: Option<String>,
+    require_final_confirmation: bool,
+    emergency_stop_enabled: bool,
+}
+
+impl Default for AutomationSettings {
+    fn default() -> Self {
+        Self {
+            automation_enabled: false,
+            execution_mode: "manual".to_string(),
+            target_app_profile: Some("binance_event_contract_v1".to_string()),
+            require_final_confirmation: true,
+            emergency_stop_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct AutomationPageState {
+    page_ready: bool,
+    screen_name: String,
+    confidence: Decimal,
+    package_name: String,
+    amount_field_found: bool,
+    up_button_found: bool,
+    down_button_found: bool,
+    observed_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct SignalCore {
+    id: Uuid,
+    symbol: String,
+    period_seconds: i32,
+    cycle_start: DateTime<Utc>,
+    cycle_end: DateTime<Utc>,
+    direction: String,
+    confidence: Decimal,
+    predicted_return: Decimal,
+    entry_price: Decimal,
+    suggested_stake: Decimal,
+    model_version: String,
+    created_at: DateTime<Utc>,
+}
+
+impl SignalCore {
+    fn new(direction: String, suggested_stake: Decimal, confidence: Decimal) -> Self {
+        let now = Utc::now();
+        Self {
+            id: Uuid::now_v7(),
+            symbol: DEFAULT_SYMBOL.to_string(),
+            period_seconds: DEFAULT_PERIOD_SECONDS,
+            cycle_start: now,
+            cycle_end: now + Duration::seconds(DEFAULT_PERIOD_SECONDS.into()),
+            direction,
+            confidence,
+            predicted_return: dec!(0.0008),
+            entry_price: dec!(0),
+            suggested_stake,
+            model_version: "score-v1".to_string(),
+            created_at: now,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct SignalReservation {
+    id: Uuid,
+    user_id: Uuid,
+    signal_id: Uuid,
+    stake_usdt: Decimal,
+    expected_profit_usdt: Decimal,
+    fee_reserve_usdt: Decimal,
+    status: String,
+    order_id: Option<Uuid>,
+    execution_report_id: Option<Uuid>,
+    expires_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct EventContractOrderRecord {
+    id: Uuid,
+    user_id: Uuid,
+    reservation_id: Option<Uuid>,
+    signal_id: String,
+    client_order_id: String,
+    source: String,
+    symbol: String,
+    period_seconds: i32,
+    direction: String,
+    stake_usdt: Decimal,
+    automation_profile: Option<String>,
+    automation_confidence: Option<Decimal>,
+    action_trace_id: Option<String>,
+    raw_audit: Option<serde_json::Value>,
+    order_status: String,
+    reported_at: Option<DateTime<Utc>>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct ExecutionReportRecord {
+    id: Uuid,
+    user_id: Uuid,
+    signal_id: String,
+    client_report_id: String,
+    source: String,
+    symbol: String,
+    period_seconds: i32,
+    direction: String,
+    stake_usdt: Decimal,
+    entry_price: Option<Decimal>,
+    expiry_price: Option<Decimal>,
+    payout_ratio: Option<Decimal>,
+    gross_profit: Option<Decimal>,
+    result: String,
+    automation_profile: Option<String>,
+    automation_confidence: Option<Decimal>,
+    action_trace_id: Option<String>,
+    report_status: String,
+    reported_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct SettlementRecord {
+    id: Uuid,
+    execution_report_id: Uuid,
+    user_id: Uuid,
+    gross_profit: Decimal,
+    profit_share_fee: Decimal,
+    loss_rebate: Decimal,
+    user_net_profit: Decimal,
+    status: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct LedgerEntry {
+    id: Uuid,
+    user_id: Uuid,
+    asset: String,
+    entry_type: String,
+    amount: Decimal,
+    balance_available_after: Decimal,
+    balance_frozen_after: Decimal,
+    ref_type: String,
+    ref_id: Uuid,
+    idempotency_key: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct DepositRecord {
+    id: Uuid,
+    user_id: Uuid,
+    chain: String,
+    asset: String,
+    tx_hash: String,
+    amount: Decimal,
+    status: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct AuthRequest {
+    email: String,
+    password: String,
+    device_fingerprint: String,
+}
+
+#[derive(Serialize)]
+struct AuthResponse {
+    access_token: String,
+    refresh_token: String,
+    expires_in: i64,
+}
+
+#[derive(Deserialize)]
+struct RefreshRequest {
+    refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct PageStateRequest {
+    page_ready: bool,
+    screen_name: String,
+    confidence: String,
+    package_name: String,
+    amount_field_found: bool,
+    up_button_found: bool,
+    down_button_found: bool,
+    observed_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct EventContractOrderRequest {
+    client_order_id: String,
+    source: String,
+    reservation_id: Option<Uuid>,
+    signal_id: String,
+    symbol: String,
+    period_seconds: i32,
+    direction: String,
+    stake_usdt: String,
+    automation_profile: Option<String>,
+    automation_confidence: Option<String>,
+    action_trace_id: Option<String>,
+    raw_audit: Option<serde_json::Value>,
+    reported_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Serialize)]
+struct SubmitOrderResponse {
+    order_id: Uuid,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct ExecutionReportRequest {
+    client_report_id: String,
+    source: String,
+    signal_id: String,
+    symbol: String,
+    period_seconds: i32,
+    direction: String,
+    stake_usdt: String,
+    entry_price: Option<String>,
+    expiry_price: Option<String>,
+    payout_ratio: Option<String>,
+    gross_profit: Option<String>,
+    result: String,
+    automation_profile: Option<String>,
+    automation_confidence: Option<String>,
+    action_trace_id: Option<String>,
+    reported_at: DateTime<Utc>,
+}
+
+#[derive(Serialize)]
+struct ExecutionReportResponse {
+    report_id: Uuid,
+    status: String,
+}
+
+#[derive(Deserialize)]
+struct DepositTxRequest {
+    tx_hash: String,
+    amount: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct EmitSignalRequest {
+    direction: String,
+    suggested_stake: Option<String>,
+    confidence: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct WsQuery {
+    access_token: Option<String>,
+}
+
+#[derive(Serialize)]
+struct SignalApiResponse {
+    id: String,
+    signal_id: String,
+    symbol: String,
+    period_seconds: i32,
+    cycle_start: DateTime<Utc>,
+    cycle_end: DateTime<Utc>,
+    direction: String,
+    confidence: String,
+    predicted_return: String,
+    entry_price: String,
+    suggested_stake: String,
+    stake_percent: String,
+    suggested_stake_rule: String,
+    trade_authorized: bool,
+    reservation_id: Option<String>,
+    fee_reserve_usdt: String,
+    authorization_status: String,
+    balance_available_after_reserve: String,
+    model_version: String,
+}
+
+#[derive(Serialize)]
+struct StatsResponse {
+    users_total: usize,
+    orders_total: usize,
+    reports_total: usize,
+    settlements_total: usize,
+    signals_total: usize,
+    wins: usize,
+    losses: usize,
+    hit_rate: String,
+    uptime_seconds: i64,
+    latest_signal: Option<SignalApiResponse>,
+}
+
+async fn health() -> &'static str {
+    "OK"
+}
+
+async fn register(
+    State(state): State<SharedState>,
+    Json(req): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    validate_email_password(&req)?;
+    enforce_register_rate_limit(&state, &req.email).await?;
+
+    let email = normalize_email(&req.email);
+    if let Some(pool) = state.db.as_ref() {
+        if db_user_id_by_email(pool, &email).await?.is_some() {
+            return Err(AppError::conflict(
+                "AUTH_EMAIL_EXISTS",
+                "email already registered",
+            ));
+        }
+    }
+    if state.user_by_email.read().await.contains_key(&email) {
+        return Err(AppError::conflict(
+            "AUTH_EMAIL_EXISTS",
+            "email already registered",
+        ));
+    }
+
+    let now = Utc::now();
+    let user_id = Uuid::now_v7();
+    let user = UserRecord {
+        id: user_id,
+        email: email.clone(),
+        password_hash: password_hash(&email, &req.password),
+        status: "active".to_string(),
+        active_device_fingerprint: Some(req.device_fingerprint.clone()),
+        created_at: now,
+        updated_at: now,
+    };
+
+    if let Some(pool) = state.db.as_ref() {
+        let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into users (id, email, password_hash, status, active_device_fingerprint, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(user.id)
+        .bind(&user.email)
+        .bind(&user.password_hash)
+        .bind(&user.status)
+        .bind(&user.active_device_fingerprint)
+        .bind(user.created_at)
+        .bind(user.updated_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into user_automation_settings
+              (user_id, automation_enabled, execution_mode, target_app_profile, require_final_confirmation, emergency_stop_enabled)
+            values ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(user_id)
+        .bind(false)
+        .bind("manual")
+        .bind("binance_event_contract_v1")
+        .bind(true)
+        .bind(true)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into user_trading_settings
+              (user_id, stake_percent, min_stake_usdt, max_single_stake_usdt, min_confidence, signal_alert_enabled, floating_window_enabled)
+            values ($1, $2, $3, $4, $5, $6, $7)
+            "#,
+        )
+        .bind(user_id)
+        .bind(DEFAULT_STAKE_PERCENT)
+        .bind(MIN_EVENT_STAKE)
+        .bind(Option::<Decimal>::None)
+        .bind(Option::<Decimal>::None)
+        .bind(true)
+        .bind(true)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into balances (user_id, asset, available, frozen, updated_at)
+            values ($1, 'USDT', 0, 0, $2)
+            "#,
+        )
+        .bind(user_id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+    }
+
+    state.users.write().await.insert(user_id, user);
+    state.user_by_email.write().await.insert(email, user_id);
+    state
+        .automation_settings
+        .write()
+        .await
+        .insert(user_id, AutomationSettings::default());
+    state
+        .trading_settings
+        .write()
+        .await
+        .insert(user_id, TradingSettings::default());
+    state.balances.write().await.insert(
+        user_id,
+        BalanceRecord {
+            user_id,
+            asset: "USDT".to_string(),
+            available: Decimal::ZERO,
+            frozen: Decimal::ZERO,
+            updated_at: now,
+        },
+    );
+
+    Ok(Json(
+        create_session(&state, user_id, &req.device_fingerprint).await?,
+    ))
+}
+
+async fn login(
+    State(state): State<SharedState>,
+    Json(req): Json<AuthRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    validate_email_password(&req)?;
+    let email = normalize_email(&req.email);
+    let user_id = if let Some(pool) = state.db.as_ref() {
+        let user = db_user_by_email(pool, &email).await?.ok_or_else(|| {
+            AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
+        })?;
+        if user.password_hash != password_hash(&email, &req.password) {
+            return Err(AppError::unauthorized(
+                "AUTH_INVALID_CREDENTIALS",
+                "invalid credentials",
+            ));
+        }
+        if let Some(active) = &user.active_device_fingerprint {
+            if active != &req.device_fingerprint {
+                return Err(AppError::conflict(
+                    "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
+                    "this account already has an active device session",
+                ));
+            }
+        }
+        sqlx::query(
+            "update users set active_device_fingerprint = $2, updated_at = $3 where id = $1",
+        )
+        .bind(user.id)
+        .bind(&req.device_fingerprint)
+        .bind(Utc::now())
+        .execute(pool)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        user.id
+    } else {
+        let user_id = state
+            .user_by_email
+            .read()
+            .await
+            .get(&email)
+            .copied()
+            .ok_or_else(|| {
+                AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
+            })?;
+
+        let mut users = state.users.write().await;
+        let user = users.get_mut(&user_id).ok_or_else(|| {
+            AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
+        })?;
+        if user.password_hash != password_hash(&email, &req.password) {
+            return Err(AppError::unauthorized(
+                "AUTH_INVALID_CREDENTIALS",
+                "invalid credentials",
+            ));
+        }
+        if let Some(active) = &user.active_device_fingerprint {
+            if active != &req.device_fingerprint {
+                return Err(AppError::conflict(
+                    "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
+                    "this account already has an active device session",
+                ));
+            }
+        }
+        user.active_device_fingerprint = Some(req.device_fingerprint.clone());
+        user.updated_at = Utc::now();
+        user_id
+    };
+
+    Ok(Json(
+        create_session(&state, user_id, &req.device_fingerprint).await?,
+    ))
+}
+
+async fn logout(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let token = bearer_token(&headers)
+        .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing bearer token"))?;
+    let session = state.sessions.write().await.remove(&token);
+    if let Some(session) = session {
+        if let Some(pool) = state.db.as_ref() {
+            let now = Utc::now();
+            sqlx::query("delete from auth_sessions where access_token = $1")
+                .bind(&token)
+                .execute(pool)
+                .await
+                .map_err(AppError::from_sqlx)?;
+            sqlx::query(
+                r#"
+                update users
+                set active_device_fingerprint = null, updated_at = $3
+                where id = $1 and active_device_fingerprint = $2
+                "#,
+            )
+            .bind(session.user_id)
+            .bind(&session.device_fingerprint)
+            .bind(now)
+            .execute(pool)
+            .await
+            .map_err(AppError::from_sqlx)?;
+        }
+        if let Some(user) = state.users.write().await.get_mut(&session.user_id) {
+            if user.active_device_fingerprint.as_deref() == Some(&session.device_fingerprint) {
+                user.active_device_fingerprint = None;
+                user.updated_at = Utc::now();
+            }
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn refresh_token(
+    State(state): State<SharedState>,
+    Json(req): Json<RefreshRequest>,
+) -> Result<Json<AuthResponse>, AppError> {
+    let session = state
+        .sessions
+        .read()
+        .await
+        .values()
+        .find(|session| session.refresh_token == req.refresh_token)
+        .cloned()
+        .or_else(|| None);
+    let session = match session {
+        Some(session) => session,
+        None => {
+            if let Some(pool) = state.db.as_ref() {
+                db_session_by_refresh_token(pool, &req.refresh_token)
+                    .await?
+                    .ok_or_else(|| {
+                        AppError::unauthorized(
+                            "AUTH_INVALID_REFRESH_TOKEN",
+                            "invalid refresh token",
+                        )
+                    })?
+            } else {
+                return Err(AppError::unauthorized(
+                    "AUTH_INVALID_REFRESH_TOKEN",
+                    "invalid refresh token",
+                ));
+            }
+        }
+    };
+    Ok(Json(
+        create_session(&state, session.user_id, &session.device_fingerprint).await?,
+    ))
+}
+
+async fn stats(State(state): State<SharedState>) -> Json<StatsResponse> {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(stats) = db_build_stats(pool, state.started_at).await {
+            return Json(stats);
+        }
+    }
+    Json(build_stats(&state).await)
+}
+
+async fn latest_signal(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<SignalApiResponse>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let latest = match state.db.as_ref() {
+        Some(pool) => db_latest_signal(pool).await?,
+        None => None,
+    };
+    let latest = match latest {
+        Some(signal) => signal,
+        None => state
+            .signals
+            .read()
+            .await
+            .last()
+            .cloned()
+            .unwrap_or_else(|| SignalCore::new("HOLD".to_string(), Decimal::ZERO, Decimal::ZERO)),
+    };
+    Ok(Json(
+        display_signal_for_user(&state, user_id, &latest).await,
+    ))
+}
+
+async fn signal_history(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SignalApiResponse>>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let signals = match state.db.as_ref() {
+        Some(pool) => db_signal_history(pool, 50).await?,
+        None => state.signals.read().await.clone(),
+    };
+    let mut out = Vec::with_capacity(signals.len());
+    for signal in signals.iter().rev().take(50) {
+        out.push(display_signal_for_user(&state, user_id, signal).await);
+    }
+    Ok(Json(out))
+}
+
+async fn get_trading_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<TradingSettings>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    Ok(Json(load_trading_settings(&state, user_id).await))
+}
+
+async fn save_trading_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<TradingSettings>,
+) -> Result<Json<TradingSettings>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    validate_trading_settings(&req)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_save_trading_settings(pool, user_id, &req).await?;
+    }
+    state
+        .trading_settings
+        .write()
+        .await
+        .insert(user_id, req.clone());
+    Ok(Json(req))
+}
+
+async fn get_automation_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<AutomationSettings>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    Ok(Json(load_automation_settings(&state, user_id).await))
+}
+
+async fn save_automation_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<AutomationSettings>,
+) -> Result<Json<AutomationSettings>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    validate_automation_settings(&req)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_save_automation_settings(pool, user_id, &req).await?;
+    }
+    state
+        .automation_settings
+        .write()
+        .await
+        .insert(user_id, req.clone());
+    Ok(Json(req))
+}
+
+async fn save_page_state(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<PageStateRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let confidence = parse_decimal(&req.confidence, "confidence")?;
+    let page_state = AutomationPageState {
+        page_ready: req.page_ready,
+        screen_name: req.screen_name,
+        confidence,
+        package_name: req.package_name,
+        amount_field_found: req.amount_field_found,
+        up_button_found: req.up_button_found,
+        down_button_found: req.down_button_found,
+        observed_at: req.observed_at,
+        updated_at: Utc::now(),
+    };
+    if let Some(pool) = state.db.as_ref() {
+        db_save_page_state(pool, user_id, &page_state).await?;
+    }
+    state.page_states.write().await.insert(user_id, page_state);
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn balance(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let balance = load_balance(&state, user_id).await;
+    Ok(Json(json!({
+        "asset": balance.asset,
+        "available": money(balance.available),
+        "frozen": money(balance.frozen),
+        "activation_status": if balance.available + balance.frozen > Decimal::ZERO { "active" } else { "inactive" },
+    })))
+}
+
+async fn ledger(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<LedgerEntry>>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_ledger_for_user(pool, user_id).await?));
+    }
+    let rows = state
+        .ledger
+        .read()
+        .await
+        .iter()
+        .filter(|entry| entry.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn deposit_instructions(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let _ = current_user(&state, &headers).await?;
+    Ok(Json(json!({
+        "chain": "bsc",
+        "asset": "USDT",
+        "token_contract": env::var("BSC_USDT_CONTRACT").unwrap_or_else(|_| "0x55d398326f99059fF775485246999027B3197955".to_string()),
+        "platform_receiver": env::var("PLATFORM_BSC_RECEIVER").unwrap_or_else(|_| "set PLATFORM_BSC_RECEIVER".to_string()),
+        "bound_wallet": null,
+        "min_amount": "10.0"
+    })))
+}
+
+async fn submit_deposit_tx(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<DepositTxRequest>,
+) -> Result<Json<DepositRecord>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let amount = req
+        .amount
+        .as_deref()
+        .map(|value| parse_decimal(value, "amount"))
+        .transpose()?
+        .ok_or_else(|| AppError::bad_request("DEPOSIT_AMOUNT_REQUIRED", "amount is required"))?;
+    let now = Utc::now();
+    let deposit = DepositRecord {
+        id: Uuid::now_v7(),
+        user_id,
+        chain: "bsc".to_string(),
+        asset: "USDT".to_string(),
+        tx_hash: req.tx_hash,
+        amount,
+        status: "pending_review".to_string(),
+        created_at: now,
+    };
+    if let Some(pool) = state.db.as_ref() {
+        let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+        insert_deposit_tx(&mut tx, &deposit).await?;
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+    }
+    state.deposits.write().await.push(deposit.clone());
+    Ok(Json(deposit))
+}
+
+async fn deposits(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DepositRecord>>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_deposits_for_user(pool, user_id).await?));
+    }
+    let rows = state
+        .deposits
+        .read()
+        .await
+        .iter()
+        .filter(|deposit| deposit.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn submit_order(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<EventContractOrderRequest>,
+) -> Result<Json<SubmitOrderResponse>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let stake_usdt = parse_decimal(&req.stake_usdt, "stake_usdt")?;
+    validate_event_stake(stake_usdt)?;
+    let now = Utc::now();
+    let order_id = Uuid::now_v7();
+    let order = EventContractOrderRecord {
+        id: order_id,
+        user_id,
+        reservation_id: req.reservation_id,
+        signal_id: req.signal_id.clone(),
+        client_order_id: req.client_order_id,
+        source: req.source,
+        symbol: req.symbol,
+        period_seconds: req.period_seconds,
+        direction: req.direction,
+        stake_usdt,
+        automation_profile: req.automation_profile,
+        automation_confidence: parse_optional_decimal(
+            req.automation_confidence.as_deref(),
+            "automation_confidence",
+        )?,
+        action_trace_id: req.action_trace_id,
+        raw_audit: req.raw_audit,
+        order_status: "submitted".to_string(),
+        reported_at: req.reported_at,
+        created_at: now,
+    };
+    if let Some(pool) = state.db.as_ref() {
+        db_insert_order(pool, &order).await?;
+    }
+    if let Some(reservation_id) = order.reservation_id {
+        if let Some(pool) = state.db.as_ref() {
+            db_mark_reservation_order_submitted(pool, reservation_id, order_id).await?;
+        }
+        if let Some(reservation) = state.reservations.write().await.get_mut(&reservation_id) {
+            reservation.status = "order_submitted".to_string();
+            reservation.order_id = Some(order_id);
+            reservation.updated_at = now;
+        }
+    }
+    state.orders.write().await.push(order);
+    Ok(Json(SubmitOrderResponse {
+        order_id,
+        status: "submitted".to_string(),
+    }))
+}
+
+async fn submit_execution_report(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ExecutionReportRequest>,
+) -> Result<Json<ExecutionReportResponse>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let report_id = Uuid::now_v7();
+    let stake_usdt = parse_decimal(&req.stake_usdt, "stake_usdt")?;
+    let report = ExecutionReportRecord {
+        id: report_id,
+        user_id,
+        signal_id: req.signal_id.clone(),
+        client_report_id: req.client_report_id,
+        source: req.source,
+        symbol: req.symbol,
+        period_seconds: req.period_seconds,
+        direction: req.direction,
+        stake_usdt,
+        entry_price: parse_optional_decimal(req.entry_price.as_deref(), "entry_price")?,
+        expiry_price: parse_optional_decimal(req.expiry_price.as_deref(), "expiry_price")?,
+        payout_ratio: parse_optional_decimal(req.payout_ratio.as_deref(), "payout_ratio")?,
+        gross_profit: parse_optional_decimal(req.gross_profit.as_deref(), "gross_profit")?,
+        result: req.result,
+        automation_profile: req.automation_profile,
+        automation_confidence: parse_optional_decimal(
+            req.automation_confidence.as_deref(),
+            "automation_confidence",
+        )?,
+        action_trace_id: req.action_trace_id,
+        report_status: "settled".to_string(),
+        reported_at: req.reported_at,
+        created_at: Utc::now(),
+    };
+    if let Some(pool) = state.db.as_ref() {
+        db_insert_execution_report(pool, &report).await?;
+    }
+    settle_execution_report(&state, &report).await?;
+    state.reports.write().await.push(report);
+    Ok(Json(ExecutionReportResponse {
+        report_id,
+        status: "settled".to_string(),
+    }))
+}
+
+async fn settlements(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SettlementRecord>>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let rows = state
+        .settlements
+        .read()
+        .await
+        .iter()
+        .filter(|settlement| settlement.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn ws_handler(
+    ws: WebSocketUpgrade,
+    Query(query): Query<WsQuery>,
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Response, AppError> {
+    let token = query
+        .access_token
+        .or_else(|| bearer_token(&headers))
+        .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing access token"))?;
+    let user_id = authenticate_token(&state, &token).await?;
+    Ok(ws.on_upgrade(move |socket| websocket_loop(socket, state, user_id)))
+}
+
+async fn websocket_loop(mut socket: WebSocket, state: SharedState, user_id: Uuid) {
+    let mut rx = state.signal_tx.subscribe();
+    let _ = socket
+        .send(Message::Text(
+            json!({"type": "connection.ready", "data": {"server_time": Utc::now()}}).to_string(),
+        ))
+        .await;
+    while let Ok(signal) = rx.recv().await {
+        let payload = authorize_signal_for_user(&state, user_id, &signal).await;
+        let text = json!({
+            "type": "signal.created",
+            "data": payload,
+        })
+        .to_string();
+        if socket.send(Message::Text(text)).await.is_err() {
+            break;
+        }
+    }
+}
+
+async fn admin_overview(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        let overview = db_admin_overview(pool, state.started_at).await?;
+        return Ok(Json(overview));
+    }
+    let stats = build_stats(&state).await;
+    let users = state.users.read().await.len();
+    let page_states = state.page_states.read().await.clone();
+    let ready_pages = page_states
+        .values()
+        .filter(|page| page_is_fresh_and_ready(page))
+        .count();
+    let orders = state.orders.read().await.clone();
+    let reports = state.reports.read().await.clone();
+    let settlements = state.settlements.read().await.clone();
+    Ok(Json(json!({
+        "stats": stats,
+        "users_total": users,
+        "ready_pages": ready_pages,
+        "orders": orders.into_iter().rev().take(20).collect::<Vec<_>>(),
+        "reports": reports.into_iter().rev().take(20).collect::<Vec<_>>(),
+        "settlements": settlements.into_iter().rev().take(20).collect::<Vec<_>>(),
+        "admin_token_hint": "set ADMIN_TOKEN in production"
+    })))
+}
+
+async fn admin_emit_signal(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<EmitSignalRequest>,
+) -> Result<Json<SignalApiResponse>, AppError> {
+    ensure_admin(&headers)?;
+    let direction = req.direction.to_uppercase();
+    if direction != "UP" && direction != "DOWN" && direction != "HOLD" {
+        return Err(AppError::bad_request(
+            "SIGNAL_DIRECTION_INVALID",
+            "direction must be UP, DOWN, or HOLD",
+        ));
+    }
+    let stake = match req.suggested_stake {
+        Some(value) => parse_decimal(&value, "suggested_stake")?,
+        None => MIN_EVENT_STAKE,
+    };
+    validate_event_stake(stake)?;
+    let confidence = match req.confidence {
+        Some(value) => parse_decimal(&value, "confidence")?,
+        None => dec!(1),
+    };
+    let signal = SignalCore::new(direction, stake, confidence);
+    if let Some(pool) = state.db.as_ref() {
+        db_insert_signal(pool, &signal).await?;
+    }
+    state.signals.write().await.push(signal.clone());
+    let _ = state.signal_tx.send(signal.clone());
+    Ok(Json(signal_api_response(&signal)))
+}
+
+async fn admin_users(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<UserRecord>>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_users(pool).await?));
+    }
+    Ok(Json(state.users.read().await.values().cloned().collect()))
+}
+
+async fn admin_orders(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EventContractOrderRecord>>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_orders(pool).await?));
+    }
+    Ok(Json(state.orders.read().await.clone()))
+}
+
+async fn admin_reports(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ExecutionReportRecord>>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_reports(pool).await?));
+    }
+    Ok(Json(state.reports.read().await.clone()))
+}
+
+async fn admin_settlements(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SettlementRecord>>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_settlements(pool).await?));
+    }
+    Ok(Json(state.settlements.read().await.clone()))
+}
+
+async fn admin_page_states(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<HashMap<Uuid, AutomationPageState>>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_page_states(pool).await?));
+    }
+    Ok(Json(state.page_states.read().await.clone()))
+}
+
+async fn enforce_register_rate_limit(state: &SharedState, email: &str) -> Result<(), AppError> {
+    let key = normalize_email(email);
+    let now = Utc::now();
+    let mut limits = state.rate_limits.write().await;
+    let limit = limits.entry(key).or_insert(RegisterRateLimit {
+        window_start: now,
+        attempts: 0,
+        blocked_until: None,
+    });
+    if let Some(blocked_until) = limit.blocked_until {
+        if blocked_until > now {
+            return Err(AppError::too_many_requests(
+                "AUTH_RATE_LIMITED",
+                "register attempts are temporarily blocked",
+            ));
+        }
+    }
+    if now - limit.window_start > Duration::minutes(10) {
+        limit.window_start = now;
+        limit.attempts = 0;
+        limit.blocked_until = None;
+    }
+    limit.attempts += 1;
+    if limit.attempts > 5 {
+        limit.blocked_until = Some(now + Duration::minutes(15));
+        return Err(AppError::too_many_requests(
+            "AUTH_RATE_LIMITED",
+            "too many register attempts",
+        ));
+    }
+    Ok(())
+}
+
+async fn create_session(
+    state: &SharedState,
+    user_id: Uuid,
+    device: &str,
+) -> Result<AuthResponse, AppError> {
+    let access_token = new_token("access");
+    let refresh_token = new_token("refresh");
+    let expires_in = 3600;
+    let expires_at = Utc::now() + Duration::seconds(expires_in);
+    if let Some(pool) = state.db.as_ref() {
+        sqlx::query(
+            r#"
+            insert into auth_sessions
+              (access_token, user_id, device_fingerprint, refresh_token, expires_at)
+            values ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(&access_token)
+        .bind(user_id)
+        .bind(device)
+        .bind(&refresh_token)
+        .bind(expires_at)
+        .execute(pool)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    }
+    state.sessions.write().await.insert(
+        access_token.clone(),
+        SessionRecord {
+            user_id,
+            device_fingerprint: device.to_string(),
+            refresh_token: refresh_token.clone(),
+            expires_at,
+        },
+    );
+    Ok(AuthResponse {
+        access_token,
+        refresh_token,
+        expires_in,
+    })
+}
+
+async fn current_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing bearer token"))?;
+    authenticate_token(state, &token).await
+}
+
+async fn authenticate_token(state: &SharedState, token: &str) -> Result<Uuid, AppError> {
+    let session = match state.sessions.read().await.get(token).cloned() {
+        Some(session) => session,
+        None => {
+            if let Some(pool) = state.db.as_ref() {
+                db_session_by_access_token(pool, token)
+                    .await?
+                    .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_TOKEN", "invalid token"))?
+            } else {
+                return Err(AppError::unauthorized(
+                    "AUTH_INVALID_TOKEN",
+                    "invalid token",
+                ));
+            }
+        }
+    };
+    if session.expires_at < Utc::now() {
+        return Err(AppError::unauthorized(
+            "AUTH_TOKEN_EXPIRED",
+            "token expired",
+        ));
+    }
+    Ok(session.user_id)
+}
+
+fn bearer_token(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn ensure_admin(headers: &HeaderMap) -> Result<(), AppError> {
+    let expected = env::var("ADMIN_TOKEN").map_err(|_| {
+        AppError::internal(
+            "ADMIN_TOKEN_MISSING",
+            "ADMIN_TOKEN must be set before using admin endpoints",
+        )
+    })?;
+    let supplied = headers
+        .get("x-admin-token")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| bearer_token(headers));
+    if supplied.as_deref() == Some(expected.as_str()) {
+        Ok(())
+    } else {
+        Err(AppError::forbidden(
+            "ADMIN_FORBIDDEN",
+            "invalid admin token",
+        ))
+    }
+}
+
+fn validate_email_password(req: &AuthRequest) -> Result<(), AppError> {
+    if !req.email.contains('@') || req.email.len() > 254 {
+        return Err(AppError::bad_request("AUTH_EMAIL_INVALID", "invalid email"));
+    }
+    if req.password.len() < 6 {
+        return Err(AppError::bad_request(
+            "AUTH_PASSWORD_WEAK",
+            "password must be at least 6 characters",
+        ));
+    }
+    if req.device_fingerprint.trim().len() < 8 {
+        return Err(AppError::bad_request(
+            "AUTH_DEVICE_INVALID",
+            "device fingerprint is required",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_trading_settings(settings: &TradingSettings) -> Result<(), AppError> {
+    if settings.stake_percent < dec!(0.01) || settings.stake_percent > dec!(0.20) {
+        return Err(AppError::bad_request(
+            "USER_SETTING_OUT_OF_RANGE",
+            "stake_percent must be between 0.01 and 0.20",
+        ));
+    }
+    if settings.min_stake_usdt <= Decimal::ZERO {
+        return Err(AppError::bad_request(
+            "USER_SETTING_OUT_OF_RANGE",
+            "min_stake_usdt must be positive",
+        ));
+    }
+    if let Some(max) = settings.max_single_stake_usdt {
+        if !(MIN_EVENT_STAKE..=MAX_EVENT_STAKE).contains(&max) {
+            return Err(AppError::bad_request(
+                "USER_SETTING_OUT_OF_RANGE",
+                "max_single_stake_usdt must be between 5 and 250",
+            ));
+        }
+    }
+    if let Some(confidence) = settings.min_confidence {
+        if confidence < Decimal::ZERO || confidence > Decimal::ONE {
+            return Err(AppError::bad_request(
+                "USER_SETTING_OUT_OF_RANGE",
+                "min_confidence must be between 0 and 1",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn validate_automation_settings(settings: &AutomationSettings) -> Result<(), AppError> {
+    if !matches!(
+        settings.execution_mode.as_str(),
+        "manual" | "assisted" | "automatic"
+    ) {
+        return Err(AppError::bad_request(
+            "AUTOMATION_SETTING_OUT_OF_RANGE",
+            "execution_mode must be manual, assisted, or automatic",
+        ));
+    }
+    if settings.execution_mode == "automatic" && !settings.automation_enabled {
+        return Err(AppError::bad_request(
+            "AUTOMATION_SETTING_OUT_OF_RANGE",
+            "automatic mode requires automation_enabled",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_event_stake(stake: Decimal) -> Result<(), AppError> {
+    if !(MIN_EVENT_STAKE..=MAX_EVENT_STAKE).contains(&stake) {
+        return Err(AppError::bad_request(
+            "STAKE_OUT_OF_RANGE",
+            "event contract stake must be between 5 and 250 USDT",
+        ));
+    }
+    Ok(())
+}
+
+async fn load_automation_settings(state: &SharedState, user_id: Uuid) -> AutomationSettings {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(Some(settings)) = db_load_automation_settings(pool, user_id).await {
+            return settings;
+        }
+    }
+    state
+        .automation_settings
+        .read()
+        .await
+        .get(&user_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn load_trading_settings(state: &SharedState, user_id: Uuid) -> TradingSettings {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(Some(settings)) = db_load_trading_settings(pool, user_id).await {
+            return settings;
+        }
+    }
+    state
+        .trading_settings
+        .read()
+        .await
+        .get(&user_id)
+        .cloned()
+        .unwrap_or_default()
+}
+
+async fn load_balance(state: &SharedState, user_id: Uuid) -> BalanceRecord {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(Some(balance)) = db_load_balance(pool, user_id).await {
+            return balance;
+        }
+    }
+    state
+        .balances
+        .read()
+        .await
+        .get(&user_id)
+        .cloned()
+        .unwrap_or(BalanceRecord {
+            user_id,
+            asset: "USDT".to_string(),
+            available: Decimal::ZERO,
+            frozen: Decimal::ZERO,
+            updated_at: Utc::now(),
+        })
+}
+
+async fn display_signal_for_user(
+    state: &SharedState,
+    user_id: Uuid,
+    signal: &SignalCore,
+) -> SignalApiResponse {
+    let settings = load_trading_settings(state, user_id).await;
+    let balance = load_balance(state, user_id).await;
+    let stake = calculated_stake(balance.available, &settings, Some(signal.suggested_stake));
+    SignalApiResponse {
+        id: signal.id.to_string(),
+        signal_id: signal.id.to_string(),
+        symbol: signal.symbol.clone(),
+        period_seconds: signal.period_seconds,
+        cycle_start: signal.cycle_start,
+        cycle_end: signal.cycle_end,
+        direction: signal.direction.clone(),
+        confidence: decimal(signal.confidence),
+        predicted_return: decimal(signal.predicted_return),
+        entry_price: money(signal.entry_price),
+        suggested_stake: money(stake),
+        stake_percent: decimal(settings.stake_percent),
+        suggested_stake_rule: "display-only; no reserve is created by latest/history endpoints"
+            .to_string(),
+        trade_authorized: false,
+        reservation_id: None,
+        fee_reserve_usdt: money(Decimal::ZERO),
+        authorization_status: "not_reserved".to_string(),
+        balance_available_after_reserve: money(balance.available),
+        model_version: signal.model_version.clone(),
+    }
+}
+
+async fn authorize_signal_for_user(
+    state: &SharedState,
+    user_id: Uuid,
+    signal: &SignalCore,
+) -> SignalApiResponse {
+    let trading = load_trading_settings(state, user_id).await;
+    let automation = load_automation_settings(state, user_id).await;
+    let balance = load_balance(state, user_id).await;
+    let stake = calculated_stake(balance.available, &trading, Some(signal.suggested_stake));
+    let expected_profit = stake * DEFAULT_PAYOUT_RATIO;
+    let fee_reserve = expected_profit * PROFIT_SHARE_RATE;
+
+    let mut status = "reserved".to_string();
+    if !automation.automation_enabled
+        || automation.execution_mode != "automatic"
+        || automation.require_final_confirmation
+    {
+        status = "automation_gate_closed".to_string();
+    }
+    let page = match state.db.as_ref() {
+        Some(pool) => db_load_page_state(pool, user_id).await.unwrap_or(None),
+        None => None,
+    };
+    let page = match page {
+        Some(page) => Some(page),
+        None => state.page_states.read().await.get(&user_id).cloned(),
+    };
+    if status == "reserved" {
+        match page {
+            None => status = "page_state_missing".to_string(),
+            Some(page) if !page_is_fresh(&page) => status = "page_state_stale".to_string(),
+            Some(page) if !page_is_fresh_and_ready(&page) => status = "page_not_ready".to_string(),
+            Some(_) => {}
+        }
+    }
+    if status == "reserved" && balance.available < fee_reserve {
+        status = "fee_reserve_insufficient".to_string();
+    }
+
+    let mut reservation_id = None;
+    let mut balance_after = balance.available;
+    if status == "reserved" {
+        let now = Utc::now();
+        let id = Uuid::now_v7();
+        let reservation = SignalReservation {
+            id,
+            user_id,
+            signal_id: signal.id,
+            stake_usdt: stake,
+            expected_profit_usdt: expected_profit,
+            fee_reserve_usdt: fee_reserve,
+            status: "reserved".to_string(),
+            order_id: None,
+            execution_report_id: None,
+            expires_at: signal.cycle_end + Duration::seconds(30),
+            created_at: now,
+            updated_at: now,
+        };
+
+        if let Some(pool) = state.db.as_ref() {
+            match db_reserve_signal_fee(pool, &reservation).await {
+                Ok(after) => {
+                    balance_after = after.available;
+                    reservation_id = Some(id);
+                }
+                Err(err) if err.code == "BALANCE_INSUFFICIENT" => {
+                    status = "fee_reserve_insufficient".to_string();
+                }
+                Err(err) => {
+                    return signal_response_with_status(
+                        signal,
+                        &trading,
+                        stake,
+                        fee_reserve,
+                        balance_after,
+                        err.code,
+                    )
+                }
+            }
+        } else {
+            let mut balances = state.balances.write().await;
+            if let Some(balance) = balances.get_mut(&user_id) {
+                if balance.available >= fee_reserve {
+                    balance.available -= fee_reserve;
+                    balance.frozen += fee_reserve;
+                    balance.updated_at = now;
+                    balance_after = balance.available;
+                    reservation_id = Some(id);
+                    state
+                        .reservations
+                        .write()
+                        .await
+                        .insert(id, reservation.clone());
+                    state.ledger.write().await.push(LedgerEntry {
+                        id: Uuid::now_v7(),
+                        user_id,
+                        asset: "USDT".to_string(),
+                        entry_type: "signal_fee_reserve".to_string(),
+                        amount: -fee_reserve,
+                        balance_available_after: balance.available,
+                        balance_frozen_after: balance.frozen,
+                        ref_type: "signal_reservation".to_string(),
+                        ref_id: id,
+                        idempotency_key: format!("signal_fee_reserve:{id}"),
+                        created_at: now,
+                    });
+                } else {
+                    status = "fee_reserve_insufficient".to_string();
+                }
+            }
+        }
+        if status == "reserved" && reservation_id.is_some() {
+            state.reservations.write().await.insert(id, reservation);
+        }
+    }
+
+    SignalApiResponse {
+        id: signal.id.to_string(),
+        signal_id: signal.id.to_string(),
+        symbol: signal.symbol.clone(),
+        period_seconds: signal.period_seconds,
+        cycle_start: signal.cycle_start,
+        cycle_end: signal.cycle_end,
+        direction: signal.direction.clone(),
+        confidence: decimal(signal.confidence),
+        predicted_return: decimal(signal.predicted_return),
+        entry_price: money(signal.entry_price),
+        suggested_stake: money(stake),
+        stake_percent: decimal(trading.stake_percent),
+        suggested_stake_rule: "clamp(max(balance * user_stake_percent, 5 USDT), 5, 250 USDT); fee reserve = expected profit * 30%".to_string(),
+        trade_authorized: status == "reserved",
+        reservation_id: reservation_id.map(|id| id.to_string()),
+        fee_reserve_usdt: money(fee_reserve),
+        authorization_status: status,
+        balance_available_after_reserve: money(balance_after),
+        model_version: signal.model_version.clone(),
+    }
+}
+
+fn signal_api_response(signal: &SignalCore) -> SignalApiResponse {
+    SignalApiResponse {
+        id: signal.id.to_string(),
+        signal_id: signal.id.to_string(),
+        symbol: signal.symbol.clone(),
+        period_seconds: signal.period_seconds,
+        cycle_start: signal.cycle_start,
+        cycle_end: signal.cycle_end,
+        direction: signal.direction.clone(),
+        confidence: decimal(signal.confidence),
+        predicted_return: decimal(signal.predicted_return),
+        entry_price: money(signal.entry_price),
+        suggested_stake: money(signal.suggested_stake),
+        stake_percent: decimal(DEFAULT_STAKE_PERCENT),
+        suggested_stake_rule: "admin preview".to_string(),
+        trade_authorized: false,
+        reservation_id: None,
+        fee_reserve_usdt: money(signal.suggested_stake * DEFAULT_PAYOUT_RATIO * PROFIT_SHARE_RATE),
+        authorization_status: "admin_preview".to_string(),
+        balance_available_after_reserve: money(Decimal::ZERO),
+        model_version: signal.model_version.clone(),
+    }
+}
+
+fn signal_response_with_status(
+    signal: &SignalCore,
+    trading: &TradingSettings,
+    stake: Decimal,
+    fee_reserve: Decimal,
+    balance_after: Decimal,
+    status: &str,
+) -> SignalApiResponse {
+    SignalApiResponse {
+        id: signal.id.to_string(),
+        signal_id: signal.id.to_string(),
+        symbol: signal.symbol.clone(),
+        period_seconds: signal.period_seconds,
+        cycle_start: signal.cycle_start,
+        cycle_end: signal.cycle_end,
+        direction: signal.direction.clone(),
+        confidence: decimal(signal.confidence),
+        predicted_return: decimal(signal.predicted_return),
+        entry_price: money(signal.entry_price),
+        suggested_stake: money(stake),
+        stake_percent: decimal(trading.stake_percent),
+        suggested_stake_rule: "clamp(max(balance * user_stake_percent, 5 USDT), 5, 250 USDT); fee reserve = expected profit * 30%".to_string(),
+        trade_authorized: false,
+        reservation_id: None,
+        fee_reserve_usdt: money(fee_reserve),
+        authorization_status: status.to_string(),
+        balance_available_after_reserve: money(balance_after),
+        model_version: signal.model_version.clone(),
+    }
+}
+
+fn calculated_stake(
+    available: Decimal,
+    settings: &TradingSettings,
+    explicit: Option<Decimal>,
+) -> Decimal {
+    let mut stake = explicit.unwrap_or(available * settings.stake_percent);
+    if stake < settings.min_stake_usdt {
+        stake = settings.min_stake_usdt;
+    }
+    if let Some(max) = settings.max_single_stake_usdt {
+        if stake > max {
+            stake = max;
+        }
+    }
+    if stake < MIN_EVENT_STAKE {
+        stake = MIN_EVENT_STAKE;
+    }
+    if stake > MAX_EVENT_STAKE {
+        stake = MAX_EVENT_STAKE;
+    }
+    stake.round_dp(2)
+}
+
+fn page_is_fresh(page: &AutomationPageState) -> bool {
+    Utc::now() - page.observed_at <= Duration::seconds(PAGE_GATE_TTL_SECONDS)
+}
+
+fn page_is_fresh_and_ready(page: &AutomationPageState) -> bool {
+    page_is_fresh(page)
+        && page.page_ready
+        && page.screen_name == "event_contract"
+        && page.amount_field_found
+        && page.up_button_found
+        && page.down_button_found
+}
+
+async fn settle_execution_report(
+    state: &SharedState,
+    report: &ExecutionReportRecord,
+) -> Result<(), AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        return db_settle_execution_report(pool, report).await;
+    }
+
+    let signal_id = Uuid::parse_str(&report.signal_id).ok();
+    let reservation = match signal_id {
+        Some(signal_id) => state
+            .reservations
+            .read()
+            .await
+            .values()
+            .find(|reservation| {
+                reservation.user_id == report.user_id && reservation.signal_id == signal_id
+            })
+            .cloned(),
+        None => None,
+    };
+
+    let result = report.result.to_uppercase();
+    let gross_profit = if result == "WIN" {
+        report
+            .gross_profit
+            .unwrap_or(report.stake_usdt * report.payout_ratio.unwrap_or(DEFAULT_PAYOUT_RATIO))
+    } else if result == "LOSS" {
+        report.gross_profit.unwrap_or(-report.stake_usdt)
+    } else {
+        Decimal::ZERO
+    };
+    let profit_share_fee = if result == "WIN" {
+        gross_profit.max(Decimal::ZERO) * PROFIT_SHARE_RATE
+    } else {
+        Decimal::ZERO
+    };
+    let loss_rebate = if result == "LOSS" {
+        report.stake_usdt * PROFIT_SHARE_RATE
+    } else {
+        Decimal::ZERO
+    };
+    let user_net_profit = gross_profit - profit_share_fee + loss_rebate;
+
+    let mut balances = state.balances.write().await;
+    let balance = balances
+        .get_mut(&report.user_id)
+        .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    let reserved = reservation
+        .as_ref()
+        .map(|reservation| reservation.fee_reserve_usdt)
+        .unwrap_or(Decimal::ZERO);
+    if reserved > Decimal::ZERO {
+        let release = reserved.min(balance.frozen);
+        balance.frozen -= release;
+        balance.available += release;
+    }
+    if profit_share_fee > Decimal::ZERO {
+        if balance.available >= profit_share_fee {
+            balance.available -= profit_share_fee;
+        } else {
+            balance.available = Decimal::ZERO;
+        }
+    }
+    if loss_rebate > Decimal::ZERO {
+        balance.available += loss_rebate;
+    }
+    balance.updated_at = Utc::now();
+    let balance_after = balance.clone();
+    drop(balances);
+
+    let settlement = SettlementRecord {
+        id: Uuid::now_v7(),
+        execution_report_id: report.id,
+        user_id: report.user_id,
+        gross_profit,
+        profit_share_fee,
+        loss_rebate,
+        user_net_profit,
+        status: "settled".to_string(),
+        created_at: Utc::now(),
+    };
+    state.settlements.write().await.push(settlement.clone());
+    if let Some(reservation) = reservation {
+        if let Some(row) = state.reservations.write().await.get_mut(&reservation.id) {
+            row.status = "settled".to_string();
+            row.execution_report_id = Some(report.id);
+            row.updated_at = Utc::now();
+        }
+    }
+    state.ledger.write().await.push(LedgerEntry {
+        id: Uuid::now_v7(),
+        user_id: report.user_id,
+        asset: "USDT".to_string(),
+        entry_type: if profit_share_fee > Decimal::ZERO {
+            "profit_share_fee".to_string()
+        } else {
+            "loss_rebate".to_string()
+        },
+        amount: if profit_share_fee > Decimal::ZERO {
+            -profit_share_fee
+        } else {
+            loss_rebate
+        },
+        balance_available_after: balance_after.available,
+        balance_frozen_after: balance_after.frozen,
+        ref_type: "settlement".to_string(),
+        ref_id: settlement.id,
+        idempotency_key: format!("settlement:{}", report.id),
+        created_at: Utc::now(),
+    });
+    Ok(())
+}
+
+async fn db_user_id_by_email(pool: &PgPool, email: &str) -> Result<Option<Uuid>, AppError> {
+    sqlx::query("select id from users where email = $1")
+        .bind(email)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.map(|row| row.get("id")))
+        .map_err(AppError::from_sqlx)
+}
+
+async fn db_user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, email, password_hash, status, active_device_fingerprint, created_at, updated_at
+        from users
+        where email = $1
+        "#,
+    )
+    .bind(email)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(user_from_row))
+    .map_err(AppError::from_sqlx)
+}
+
+fn user_from_row(row: sqlx::postgres::PgRow) -> UserRecord {
+    UserRecord {
+        id: row.get("id"),
+        email: row.get("email"),
+        password_hash: row.get("password_hash"),
+        status: row.get("status"),
+        active_device_fingerprint: row.get("active_device_fingerprint"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+async fn db_session_by_access_token(
+    pool: &PgPool,
+    access_token: &str,
+) -> Result<Option<SessionRecord>, AppError> {
+    db_session_by_token(pool, "access_token", access_token).await
+}
+
+async fn db_session_by_refresh_token(
+    pool: &PgPool,
+    refresh_token: &str,
+) -> Result<Option<SessionRecord>, AppError> {
+    db_session_by_token(pool, "refresh_token", refresh_token).await
+}
+
+async fn db_session_by_token(
+    pool: &PgPool,
+    column: &str,
+    token: &str,
+) -> Result<Option<SessionRecord>, AppError> {
+    let sql = match column {
+        "access_token" => {
+            "select user_id, device_fingerprint, refresh_token, expires_at from auth_sessions where access_token = $1"
+        }
+        "refresh_token" => {
+            "select user_id, device_fingerprint, refresh_token, expires_at from auth_sessions where refresh_token = $1"
+        }
+        _ => return Ok(None),
+    };
+    sqlx::query(sql)
+        .bind(token)
+        .fetch_optional(pool)
+        .await
+        .map(|row| {
+            row.map(|row| SessionRecord {
+                user_id: row.get("user_id"),
+                device_fingerprint: row.get("device_fingerprint"),
+                refresh_token: row.get("refresh_token"),
+                expires_at: row.get("expires_at"),
+            })
+        })
+        .map_err(AppError::from_sqlx)
+}
+
+async fn db_load_trading_settings(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<TradingSettings>, AppError> {
+    sqlx::query(
+        r#"
+        select stake_percent, min_stake_usdt, max_single_stake_usdt, min_confidence,
+               signal_alert_enabled, floating_window_enabled
+        from user_trading_settings
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| TradingSettings {
+            stake_percent: row.get("stake_percent"),
+            min_stake_usdt: row.get("min_stake_usdt"),
+            max_single_stake_usdt: row.get("max_single_stake_usdt"),
+            min_confidence: row.get("min_confidence"),
+            signal_alert_enabled: row.get("signal_alert_enabled"),
+            floating_window_enabled: row.get("floating_window_enabled"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_save_trading_settings(
+    pool: &PgPool,
+    user_id: Uuid,
+    settings: &TradingSettings,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into user_trading_settings
+          (user_id, stake_percent, min_stake_usdt, max_single_stake_usdt, min_confidence,
+           signal_alert_enabled, floating_window_enabled, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8)
+        on conflict (user_id) do update set
+          stake_percent = excluded.stake_percent,
+          min_stake_usdt = excluded.min_stake_usdt,
+          max_single_stake_usdt = excluded.max_single_stake_usdt,
+          min_confidence = excluded.min_confidence,
+          signal_alert_enabled = excluded.signal_alert_enabled,
+          floating_window_enabled = excluded.floating_window_enabled,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(settings.stake_percent)
+    .bind(settings.min_stake_usdt)
+    .bind(settings.max_single_stake_usdt)
+    .bind(settings.min_confidence)
+    .bind(settings.signal_alert_enabled)
+    .bind(settings.floating_window_enabled)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_load_automation_settings(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<AutomationSettings>, AppError> {
+    sqlx::query(
+        r#"
+        select automation_enabled, execution_mode, target_app_profile,
+               require_final_confirmation, emergency_stop_enabled
+        from user_automation_settings
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| AutomationSettings {
+            automation_enabled: row.get("automation_enabled"),
+            execution_mode: row.get("execution_mode"),
+            target_app_profile: row.get("target_app_profile"),
+            require_final_confirmation: row.get("require_final_confirmation"),
+            emergency_stop_enabled: row.get("emergency_stop_enabled"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_save_automation_settings(
+    pool: &PgPool,
+    user_id: Uuid,
+    settings: &AutomationSettings,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into user_automation_settings
+          (user_id, automation_enabled, execution_mode, target_app_profile,
+           require_final_confirmation, emergency_stop_enabled, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7)
+        on conflict (user_id) do update set
+          automation_enabled = excluded.automation_enabled,
+          execution_mode = excluded.execution_mode,
+          target_app_profile = excluded.target_app_profile,
+          require_final_confirmation = excluded.require_final_confirmation,
+          emergency_stop_enabled = excluded.emergency_stop_enabled,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(settings.automation_enabled)
+    .bind(&settings.execution_mode)
+    .bind(&settings.target_app_profile)
+    .bind(settings.require_final_confirmation)
+    .bind(settings.emergency_stop_enabled)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_load_balance(pool: &PgPool, user_id: Uuid) -> Result<Option<BalanceRecord>, AppError> {
+    sqlx::query(
+        "select user_id, asset, available, frozen, updated_at from balances where user_id = $1",
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| BalanceRecord {
+            user_id: row.get("user_id"),
+            asset: row.get("asset"),
+            available: row.get("available"),
+            frozen: row.get("frozen"),
+            updated_at: row.get("updated_at"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_load_page_state(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<AutomationPageState>, AppError> {
+    sqlx::query(
+        r#"
+        select page_ready, screen_name, confidence, package_name, amount_field_found,
+               up_button_found, down_button_found, observed_at, updated_at
+        from automation_page_states
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| AutomationPageState {
+            page_ready: row.get("page_ready"),
+            screen_name: row.get("screen_name"),
+            confidence: row.get("confidence"),
+            package_name: row.get("package_name"),
+            amount_field_found: row.get("amount_field_found"),
+            up_button_found: row.get("up_button_found"),
+            down_button_found: row.get("down_button_found"),
+            observed_at: row.get("observed_at"),
+            updated_at: row.get("updated_at"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_save_page_state(
+    pool: &PgPool,
+    user_id: Uuid,
+    page: &AutomationPageState,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into automation_page_states
+          (user_id, page_ready, screen_name, confidence, package_name, amount_field_found,
+           up_button_found, down_button_found, observed_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+        on conflict (user_id) do update set
+          page_ready = excluded.page_ready,
+          screen_name = excluded.screen_name,
+          confidence = excluded.confidence,
+          package_name = excluded.package_name,
+          amount_field_found = excluded.amount_field_found,
+          up_button_found = excluded.up_button_found,
+          down_button_found = excluded.down_button_found,
+          observed_at = excluded.observed_at,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(page.page_ready)
+    .bind(&page.screen_name)
+    .bind(page.confidence)
+    .bind(&page.package_name)
+    .bind(page.amount_field_found)
+    .bind(page.up_button_found)
+    .bind(page.down_button_found)
+    .bind(page.observed_at)
+    .bind(page.updated_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_signal(pool: &PgPool, signal: &SignalCore) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into signals
+          (id, symbol, period_seconds, cycle_start, cycle_end, direction, confidence,
+           predicted_return, entry_price, suggested_stake, model_version, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        on conflict (symbol, period_seconds, cycle_start) do nothing
+        "#,
+    )
+    .bind(signal.id)
+    .bind(&signal.symbol)
+    .bind(signal.period_seconds)
+    .bind(signal.cycle_start)
+    .bind(signal.cycle_end)
+    .bind(&signal.direction)
+    .bind(signal.confidence)
+    .bind(signal.predicted_return)
+    .bind(signal.entry_price)
+    .bind(signal.suggested_stake)
+    .bind(&signal.model_version)
+    .bind(signal.created_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_latest_signal(pool: &PgPool) -> Result<Option<SignalCore>, AppError> {
+    sqlx::query(
+        r#"
+        select id, symbol, period_seconds, cycle_start, cycle_end, direction, confidence,
+               predicted_return, entry_price, suggested_stake, model_version, created_at
+        from signals
+        order by created_at desc
+        limit 1
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(signal_from_row))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_signal_history(pool: &PgPool, limit: i64) -> Result<Vec<SignalCore>, AppError> {
+    sqlx::query(
+        r#"
+        select id, symbol, period_seconds, cycle_start, cycle_end, direction, confidence,
+               predicted_return, entry_price, suggested_stake, model_version, created_at
+        from signals
+        order by created_at desc
+        limit $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(signal_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn signal_from_row(row: sqlx::postgres::PgRow) -> SignalCore {
+    SignalCore {
+        id: row.get("id"),
+        symbol: row.get("symbol"),
+        period_seconds: row.get("period_seconds"),
+        cycle_start: row.get("cycle_start"),
+        cycle_end: row.get("cycle_end"),
+        direction: row.get("direction"),
+        confidence: row.get("confidence"),
+        predicted_return: row.get("predicted_return"),
+        entry_price: row.get("entry_price"),
+        suggested_stake: row.get("suggested_stake"),
+        model_version: row.get("model_version"),
+        created_at: row.get("created_at"),
+    }
+}
+
+async fn db_ledger_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<LedgerEntry>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, asset, entry_type, amount, balance_available_after,
+               balance_frozen_after, ref_type, ref_id, idempotency_key, created_at
+        from ledger_entries
+        where user_id = $1
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(ledger_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn ledger_from_row(row: sqlx::postgres::PgRow) -> LedgerEntry {
+    LedgerEntry {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        asset: row.get("asset"),
+        entry_type: row.get("entry_type"),
+        amount: row.get("amount"),
+        balance_available_after: row.get("balance_available_after"),
+        balance_frozen_after: row.get("balance_frozen_after"),
+        ref_type: row.get("ref_type"),
+        ref_id: row.get("ref_id"),
+        idempotency_key: row.get("idempotency_key"),
+        created_at: row.get("created_at"),
+    }
+}
+
+async fn insert_ledger_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    entry: LedgerEntry,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into ledger_entries
+          (id, user_id, asset, entry_type, amount, balance_available_after,
+           balance_frozen_after, ref_type, ref_id, idempotency_key, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+        on conflict (idempotency_key) do nothing
+        "#,
+    )
+    .bind(entry.id)
+    .bind(entry.user_id)
+    .bind(&entry.asset)
+    .bind(&entry.entry_type)
+    .bind(entry.amount)
+    .bind(entry.balance_available_after)
+    .bind(entry.balance_frozen_after)
+    .bind(&entry.ref_type)
+    .bind(entry.ref_id)
+    .bind(&entry.idempotency_key)
+    .bind(entry.created_at)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn insert_deposit_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    deposit: &DepositRecord,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into deposits
+          (id, user_id, chain, asset, tx_hash, amount, status, credited_at, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        on conflict (tx_hash) do nothing
+        "#,
+    )
+    .bind(deposit.id)
+    .bind(deposit.user_id)
+    .bind(&deposit.chain)
+    .bind(&deposit.asset)
+    .bind(&deposit.tx_hash)
+    .bind(deposit.amount)
+    .bind(&deposit.status)
+    .bind(Some(deposit.created_at))
+    .bind(deposit.created_at)
+    .execute(&mut **tx)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_deposits_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<DepositRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, tx_hash, amount, status, created_at
+        from deposits
+        where user_id = $1
+        order by created_at desc
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| DepositRecord {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                chain: row.get("chain"),
+                asset: row.get("asset"),
+                tx_hash: row.get("tx_hash"),
+                amount: row.get("amount"),
+                status: row.get("status"),
+                created_at: row.get("created_at"),
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_reserve_signal_fee(
+    pool: &PgPool,
+    reservation: &SignalReservation,
+) -> Result<BalanceRecord, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let balance_row = sqlx::query(
+        r#"
+        select user_id, asset, available, frozen, updated_at
+        from balances
+        where user_id = $1
+        for update
+        "#,
+    )
+    .bind(reservation.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    let available: Decimal = balance_row.get("available");
+    let frozen: Decimal = balance_row.get("frozen");
+    if available < reservation.fee_reserve_usdt {
+        return Err(AppError::bad_request(
+            "BALANCE_INSUFFICIENT",
+            "available balance is below fee reserve",
+        ));
+    }
+    sqlx::query(
+        r#"
+        insert into signal_reservations
+          (id, user_id, signal_id, stake_usdt, expected_profit_usdt, fee_reserve_usdt,
+           status, order_id, execution_report_id, expires_at, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        "#,
+    )
+    .bind(reservation.id)
+    .bind(reservation.user_id)
+    .bind(reservation.signal_id)
+    .bind(reservation.stake_usdt)
+    .bind(reservation.expected_profit_usdt)
+    .bind(reservation.fee_reserve_usdt)
+    .bind(&reservation.status)
+    .bind(reservation.order_id)
+    .bind(reservation.execution_report_id)
+    .bind(reservation.expires_at)
+    .bind(reservation.created_at)
+    .bind(reservation.updated_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let after_available = available - reservation.fee_reserve_usdt;
+    let after_frozen = frozen + reservation.fee_reserve_usdt;
+    let now = Utc::now();
+    let row = sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        returning user_id, asset, available, frozen, updated_at
+        "#,
+    )
+    .bind(reservation.user_id)
+    .bind(after_available)
+    .bind(after_frozen)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let after = BalanceRecord {
+        user_id: row.get("user_id"),
+        asset: row.get("asset"),
+        available: row.get("available"),
+        frozen: row.get("frozen"),
+        updated_at: row.get("updated_at"),
+    };
+    insert_ledger_tx(
+        &mut tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: reservation.user_id,
+            asset: "USDT".to_string(),
+            entry_type: "signal_fee_reserve".to_string(),
+            amount: -reservation.fee_reserve_usdt,
+            balance_available_after: after.available,
+            balance_frozen_after: after.frozen,
+            ref_type: "signal_reservation".to_string(),
+            ref_id: reservation.id,
+            idempotency_key: format!("signal_fee_reserve:{}", reservation.id),
+            created_at: now,
+        },
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(after)
+}
+
+async fn db_insert_order(pool: &PgPool, order: &EventContractOrderRecord) -> Result<(), AppError> {
+    let expected_profit = order.stake_usdt * DEFAULT_PAYOUT_RATIO;
+    let expected_payout = order.stake_usdt + expected_profit;
+    sqlx::query(
+        r#"
+        insert into event_contract_orders
+          (id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
+           period_seconds, direction, stake_usdt, payout_ratio, expected_payout_usdt,
+           expected_profit_usdt, automation_profile, automation_confidence, action_trace_id,
+           raw_audit, order_status, reported_at, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        on conflict (user_id, client_order_id) do nothing
+        "#,
+    )
+    .bind(order.id)
+    .bind(order.user_id)
+    .bind(order.reservation_id)
+    .bind(&order.signal_id)
+    .bind(&order.client_order_id)
+    .bind(&order.source)
+    .bind(&order.symbol)
+    .bind(order.period_seconds)
+    .bind(&order.direction)
+    .bind(order.stake_usdt)
+    .bind(DEFAULT_PAYOUT_RATIO)
+    .bind(expected_payout)
+    .bind(expected_profit)
+    .bind(&order.automation_profile)
+    .bind(order.automation_confidence)
+    .bind(&order.action_trace_id)
+    .bind(&order.raw_audit)
+    .bind(&order.order_status)
+    .bind(order.reported_at)
+    .bind(order.created_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_mark_reservation_order_submitted(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    order_id: Uuid,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update signal_reservations
+        set status = 'order_submitted', order_id = $2, updated_at = $3
+        where id = $1 and status in ('reserved', 'order_submitted')
+        "#,
+    )
+    .bind(reservation_id)
+    .bind(order_id)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_execution_report(
+    pool: &PgPool,
+    report: &ExecutionReportRecord,
+) -> Result<(), AppError> {
+    let signal_id = Uuid::parse_str(&report.signal_id).map_err(|_| {
+        AppError::bad_request(
+            "SIGNAL_ID_INVALID",
+            "signal_id must be a uuid for persistence",
+        )
+    })?;
+    sqlx::query(
+        r#"
+        insert into execution_reports
+          (id, user_id, signal_id, client_report_id, source, symbol, period_seconds,
+           direction, stake_usdt, entry_price, expiry_price, payout_ratio, gross_profit,
+           result, automation_profile, automation_confidence, action_trace_id,
+           report_status, reported_at, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+        on conflict (user_id, client_report_id) do nothing
+        "#,
+    )
+    .bind(report.id)
+    .bind(report.user_id)
+    .bind(signal_id)
+    .bind(&report.client_report_id)
+    .bind(&report.source)
+    .bind(&report.symbol)
+    .bind(report.period_seconds)
+    .bind(&report.direction)
+    .bind(report.stake_usdt)
+    .bind(report.entry_price)
+    .bind(report.expiry_price)
+    .bind(report.payout_ratio)
+    .bind(report.gross_profit)
+    .bind(&report.result)
+    .bind(&report.automation_profile)
+    .bind(report.automation_confidence)
+    .bind(&report.action_trace_id)
+    .bind(&report.report_status)
+    .bind(report.reported_at)
+    .bind(report.created_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_settle_execution_report(
+    pool: &PgPool,
+    report: &ExecutionReportRecord,
+) -> Result<(), AppError> {
+    let signal_id = Uuid::parse_str(&report.signal_id).map_err(|_| {
+        AppError::bad_request(
+            "SIGNAL_ID_INVALID",
+            "signal_id must be a uuid for settlement",
+        )
+    })?;
+    let result = report.result.to_uppercase();
+    let gross_profit = if result == "WIN" {
+        report
+            .gross_profit
+            .unwrap_or(report.stake_usdt * report.payout_ratio.unwrap_or(DEFAULT_PAYOUT_RATIO))
+    } else if result == "LOSS" {
+        report.gross_profit.unwrap_or(-report.stake_usdt)
+    } else {
+        Decimal::ZERO
+    };
+    let profit_share_fee = if result == "WIN" {
+        gross_profit.max(Decimal::ZERO) * PROFIT_SHARE_RATE
+    } else {
+        Decimal::ZERO
+    };
+    let loss_rebate = if result == "LOSS" {
+        report.stake_usdt * PROFIT_SHARE_RATE
+    } else {
+        Decimal::ZERO
+    };
+    let user_net_profit = gross_profit - profit_share_fee + loss_rebate;
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let existing = sqlx::query("select id from settlements where execution_report_id = $1")
+        .bind(report.id)
+        .fetch_optional(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    if existing.is_some() {
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+        return Ok(());
+    }
+    let reservation = sqlx::query(
+        r#"
+        select id, fee_reserve_usdt
+        from signal_reservations
+        where user_id = $1 and signal_id = $2
+        for update
+        "#,
+    )
+    .bind(report.user_id)
+    .bind(signal_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let row = sqlx::query("select available, frozen from balances where user_id = $1 for update")
+        .bind(report.user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    let mut available: Decimal = row.get("available");
+    let mut frozen: Decimal = row.get("frozen");
+    if let Some(reservation) = reservation.as_ref() {
+        let reserved: Decimal = reservation.get("fee_reserve_usdt");
+        let release = reserved.min(frozen);
+        frozen -= release;
+        available += release;
+    }
+    if profit_share_fee > Decimal::ZERO {
+        available = (available - profit_share_fee).max(Decimal::ZERO);
+    }
+    if loss_rebate > Decimal::ZERO {
+        available += loss_rebate;
+    }
+    let now = Utc::now();
+    let row = sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        returning available, frozen
+        "#,
+    )
+    .bind(report.user_id)
+    .bind(available)
+    .bind(frozen)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let after_available: Decimal = row.get("available");
+    let after_frozen: Decimal = row.get("frozen");
+    let settlement = SettlementRecord {
+        id: Uuid::now_v7(),
+        execution_report_id: report.id,
+        user_id: report.user_id,
+        gross_profit,
+        profit_share_fee,
+        loss_rebate,
+        user_net_profit,
+        status: "settled".to_string(),
+        created_at: now,
+    };
+    sqlx::query(
+        r#"
+        insert into settlements
+          (id, execution_report_id, user_id, gross_profit, profit_share_fee,
+           loss_rebate, user_net_profit, status, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+        "#,
+    )
+    .bind(settlement.id)
+    .bind(settlement.execution_report_id)
+    .bind(settlement.user_id)
+    .bind(settlement.gross_profit)
+    .bind(settlement.profit_share_fee)
+    .bind(settlement.loss_rebate)
+    .bind(settlement.user_net_profit)
+    .bind(&settlement.status)
+    .bind(settlement.created_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    if let Some(reservation) = reservation {
+        let reservation_id: Uuid = reservation.get("id");
+        sqlx::query(
+            r#"
+            update signal_reservations
+            set status = 'settled', execution_report_id = $2, updated_at = $3
+            where id = $1
+            "#,
+        )
+        .bind(reservation_id)
+        .bind(report.id)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    }
+    let entry_type = if profit_share_fee > Decimal::ZERO {
+        "profit_share_fee"
+    } else if loss_rebate > Decimal::ZERO {
+        "loss_rebate"
+    } else {
+        "signal_fee_reserve_release"
+    };
+    let amount = if profit_share_fee > Decimal::ZERO {
+        -profit_share_fee
+    } else {
+        loss_rebate
+    };
+    insert_ledger_tx(
+        &mut tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: report.user_id,
+            asset: "USDT".to_string(),
+            entry_type: entry_type.to_string(),
+            amount,
+            balance_available_after: after_available,
+            balance_frozen_after: after_frozen,
+            ref_type: "settlement".to_string(),
+            ref_id: settlement.id,
+            idempotency_key: format!("settlement:{}", report.id),
+            created_at: now,
+        },
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(())
+}
+
+async fn db_admin_overview(
+    pool: &PgPool,
+    started_at: DateTime<Utc>,
+) -> Result<serde_json::Value, AppError> {
+    let stats = db_build_stats(pool, started_at).await?;
+    let users_total = db_count(pool, "users").await?;
+    let ready_pages = db_ready_pages(pool).await?;
+    let orders = db_admin_orders(pool).await?;
+    let reports = db_admin_reports(pool).await?;
+    let settlements = db_admin_settlements(pool).await?;
+    Ok(json!({
+        "stats": stats,
+        "users_total": users_total,
+        "ready_pages": ready_pages,
+        "orders": orders.into_iter().take(20).collect::<Vec<_>>(),
+        "reports": reports.into_iter().take(20).collect::<Vec<_>>(),
+        "settlements": settlements.into_iter().take(20).collect::<Vec<_>>(),
+        "admin_token_hint": "set ADMIN_TOKEN in production"
+    }))
+}
+
+async fn db_build_stats(
+    pool: &PgPool,
+    started_at: DateTime<Utc>,
+) -> Result<StatsResponse, AppError> {
+    let reports = db_admin_reports(pool).await?;
+    let wins = reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("WIN"))
+        .count();
+    let losses = reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("LOSS"))
+        .count();
+    let settled = wins + losses;
+    let hit_rate = if settled == 0 {
+        "0".to_string()
+    } else {
+        format!("{:.4}", wins as f64 / settled as f64)
+    };
+    let latest_signal = db_latest_signal(pool)
+        .await?
+        .map(|signal| SignalApiResponse {
+            trade_authorized: false,
+            ..signal_api_response(&signal)
+        });
+    Ok(StatsResponse {
+        users_total: db_count(pool, "users").await? as usize,
+        orders_total: db_count(pool, "event_contract_orders").await? as usize,
+        reports_total: db_count(pool, "execution_reports").await? as usize,
+        settlements_total: db_count(pool, "settlements").await? as usize,
+        signals_total: db_count(pool, "signals").await? as usize,
+        wins,
+        losses,
+        hit_rate,
+        uptime_seconds: (Utc::now() - started_at).num_seconds(),
+        latest_signal,
+    })
+}
+
+async fn db_count(pool: &PgPool, table: &str) -> Result<i64, AppError> {
+    let sql = match table {
+        "users" => "select count(*) as count from users",
+        "event_contract_orders" => "select count(*) as count from event_contract_orders",
+        "execution_reports" => "select count(*) as count from execution_reports",
+        "settlements" => "select count(*) as count from settlements",
+        "signals" => "select count(*) as count from signals",
+        _ => return Ok(0),
+    };
+    sqlx::query(sql)
+        .fetch_one(pool)
+        .await
+        .map(|row| row.get("count"))
+        .map_err(AppError::from_sqlx)
+}
+
+async fn db_ready_pages(pool: &PgPool) -> Result<i64, AppError> {
+    sqlx::query(
+        r#"
+        select count(*) as count
+        from automation_page_states
+        where page_ready = true
+          and screen_name = 'event_contract'
+          and amount_field_found = true
+          and up_button_found = true
+          and down_button_found = true
+          and observed_at >= now() - ($1 || ' seconds')::interval
+        "#,
+    )
+    .bind(PAGE_GATE_TTL_SECONDS.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| row.get("count"))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_users(pool: &PgPool) -> Result<Vec<UserRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, email, password_hash, status, active_device_fingerprint, created_at, updated_at
+        from users
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(user_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_orders(pool: &PgPool) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
+               period_seconds, direction, stake_usdt, automation_profile,
+               automation_confidence, action_trace_id, raw_audit, order_status,
+               reported_at, created_at
+        from event_contract_orders
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| EventContractOrderRecord {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                reservation_id: row.get("reservation_id"),
+                signal_id: row.get("signal_ref"),
+                client_order_id: row.get("client_order_id"),
+                source: row.get("source"),
+                symbol: row.get("symbol"),
+                period_seconds: row.get("period_seconds"),
+                direction: row.get("direction"),
+                stake_usdt: row.get("stake_usdt"),
+                automation_profile: row.get("automation_profile"),
+                automation_confidence: row.get("automation_confidence"),
+                action_trace_id: row.get("action_trace_id"),
+                raw_audit: row.get("raw_audit"),
+                order_status: row.get("order_status"),
+                reported_at: row.get("reported_at"),
+                created_at: row.get("created_at"),
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
+               period_seconds, direction, stake_usdt, entry_price, expiry_price,
+               payout_ratio, gross_profit, result, automation_profile,
+               automation_confidence, action_trace_id, report_status, reported_at, created_at
+        from execution_reports
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| ExecutionReportRecord {
+                id: row.get("id"),
+                user_id: row.get("user_id"),
+                signal_id: row.get("signal_id"),
+                client_report_id: row.get("client_report_id"),
+                source: row.get("source"),
+                symbol: row.get("symbol"),
+                period_seconds: row.get("period_seconds"),
+                direction: row.get("direction"),
+                stake_usdt: row.get("stake_usdt"),
+                entry_price: row.get("entry_price"),
+                expiry_price: row.get("expiry_price"),
+                payout_ratio: row.get("payout_ratio"),
+                gross_profit: row.get("gross_profit"),
+                result: row.get("result"),
+                automation_profile: row.get("automation_profile"),
+                automation_confidence: row.get("automation_confidence"),
+                action_trace_id: row.get("action_trace_id"),
+                report_status: row.get("report_status"),
+                reported_at: row.get("reported_at"),
+                created_at: row.get("created_at"),
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_settlements(pool: &PgPool) -> Result<Vec<SettlementRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, execution_report_id, user_id, gross_profit, profit_share_fee,
+               loss_rebate, user_net_profit, status, created_at
+        from settlements
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| SettlementRecord {
+                id: row.get("id"),
+                execution_report_id: row.get("execution_report_id"),
+                user_id: row.get("user_id"),
+                gross_profit: row.get("gross_profit"),
+                profit_share_fee: row.get("profit_share_fee"),
+                loss_rebate: row.get("loss_rebate"),
+                user_net_profit: row.get("user_net_profit"),
+                status: row.get("status"),
+                created_at: row.get("created_at"),
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_page_states(
+    pool: &PgPool,
+) -> Result<HashMap<Uuid, AutomationPageState>, AppError> {
+    sqlx::query(
+        r#"
+        select user_id, page_ready, screen_name, confidence, package_name,
+               amount_field_found, up_button_found, down_button_found, observed_at, updated_at
+        from automation_page_states
+        order by updated_at desc
+        limit 500
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| {
+                (
+                    row.get("user_id"),
+                    AutomationPageState {
+                        page_ready: row.get("page_ready"),
+                        screen_name: row.get("screen_name"),
+                        confidence: row.get("confidence"),
+                        package_name: row.get("package_name"),
+                        amount_field_found: row.get("amount_field_found"),
+                        up_button_found: row.get("up_button_found"),
+                        down_button_found: row.get("down_button_found"),
+                        observed_at: row.get("observed_at"),
+                        updated_at: row.get("updated_at"),
+                    },
+                )
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn build_stats(state: &SharedState) -> StatsResponse {
+    let reports = state.reports.read().await;
+    let wins = reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("WIN"))
+        .count();
+    let losses = reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("LOSS"))
+        .count();
+    let settled = wins + losses;
+    let hit_rate = if settled == 0 {
+        "0".to_string()
+    } else {
+        let value = wins as f64 / settled as f64;
+        format!("{value:.4}")
+    };
+    let latest_signal =
+        state
+            .signals
+            .read()
+            .await
+            .last()
+            .cloned()
+            .map(|signal| SignalApiResponse {
+                trade_authorized: false,
+                ..signal_api_response(&signal)
+            });
+    StatsResponse {
+        users_total: state.users.read().await.len(),
+        orders_total: state.orders.read().await.len(),
+        reports_total: reports.len(),
+        settlements_total: state.settlements.read().await.len(),
+        signals_total: state.signals.read().await.len(),
+        wins,
+        losses,
+        hit_rate,
+        uptime_seconds: (Utc::now() - state.started_at).num_seconds(),
+        latest_signal,
+    }
+}
+
+fn normalize_email(email: &str) -> String {
+    email.trim().to_ascii_lowercase()
+}
+
+fn password_hash(email: &str, password: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(b"event-signal-password-v1");
+    hasher.update(email.as_bytes());
+    hasher.update(b":");
+    hasher.update(password.as_bytes());
+    hex::encode(hasher.finalize())
+}
+
+fn new_token(prefix: &str) -> String {
+    format!("{prefix}-{}", Uuid::now_v7().simple())
+}
+
+fn parse_decimal(value: &str, field: &str) -> Result<Decimal, AppError> {
+    Decimal::from_str(value.trim()).map_err(|_| {
+        AppError::bad_request(
+            "DECIMAL_INVALID",
+            format!("{field} must be a decimal string"),
+        )
+    })
+}
+
+fn parse_optional_decimal(value: Option<&str>, field: &str) -> Result<Option<Decimal>, AppError> {
+    value
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| parse_decimal(value, field))
+        .transpose()
+}
+
+fn decimal(value: Decimal) -> String {
+    value.normalize().to_string()
+}
+
+fn money(value: Decimal) -> String {
+    value.round_dp(8).normalize().to_string()
+}
+
+#[derive(Debug)]
+struct AppError {
+    status: StatusCode,
+    code: &'static str,
+    message: String,
+}
+
+impl AppError {
+    fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::BAD_REQUEST,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn unauthorized(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn forbidden(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::FORBIDDEN,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn conflict(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::CONFLICT,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn too_many_requests(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn internal(code: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code,
+            message: message.into(),
+        }
+    }
+
+    fn from_sqlx(err: sqlx::Error) -> Self {
+        if let sqlx::Error::Database(db_err) = &err {
+            if db_err.is_unique_violation() {
+                return Self::conflict("DATABASE_CONFLICT", db_err.message());
+            }
+        }
+        Self::internal("DATABASE_ERROR", err.to_string())
+    }
+}
+
+impl IntoResponse for AppError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "code": self.code,
+                "message": self.message,
+            })),
+        )
+            .into_response()
+    }
+}
