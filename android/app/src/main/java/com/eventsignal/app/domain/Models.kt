@@ -29,7 +29,8 @@ data class AutomationSettings(
 
 @Serializable
 data class AuthRequest(
-    val email: String,
+    @SerialName("wallet_address")
+    val walletAddress: String,
     val password: String,
     @SerialName("device_fingerprint")
     val deviceFingerprint: String,

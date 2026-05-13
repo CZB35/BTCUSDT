@@ -1,6 +1,6 @@
 create table if not exists users (
   id uuid primary key,
-  email text unique not null,
+  wallet_address text unique not null,
   password_hash text not null,
   status text not null default 'active',
   active_device_fingerprint text,
@@ -26,6 +26,17 @@ create table if not exists auth_rate_limits (
   blocked_until timestamptz,
   updated_at timestamptz not null default now(),
   unique(scope, key)
+);
+
+create table if not exists wallet_bindings (
+  id uuid primary key,
+  user_id uuid not null references users(id) on delete cascade,
+  chain text not null default 'bsc',
+  address text not null,
+  verified boolean not null default false,
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
+  unique(chain, address)
 );
 
 create table if not exists balances (
@@ -203,6 +214,7 @@ create table if not exists settlements (
 );
 
 create index if not exists auth_sessions_user_id_idx on auth_sessions(user_id);
+create index if not exists wallet_bindings_user_chain_idx on wallet_bindings(user_id, chain);
 create index if not exists ledger_entries_user_created_idx on ledger_entries(user_id, created_at desc);
 create index if not exists event_contract_orders_user_created_idx on event_contract_orders(user_id, created_at desc);
 create index if not exists execution_reports_user_created_idx on execution_reports(user_id, created_at desc);

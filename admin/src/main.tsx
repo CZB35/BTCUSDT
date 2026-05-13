@@ -130,6 +130,21 @@ function App() {
     setStatus("信号已发送一次");
   }
 
+  async function settleReport(reportId: string) {
+    setStatus("结算审核中");
+    const res = await fetch(`${apiBase.replace(/\/$/, "")}/v1/admin/execution-reports/settle`, {
+      method: "POST",
+      headers,
+      body: JSON.stringify({ report_id: reportId })
+    });
+    if (!res.ok) {
+      setStatus(`结算失败 ${res.status}`);
+      return;
+    }
+    await loadOverview();
+    setStatus("结算完成");
+  }
+
   useEffect(() => {
     loadOverview().catch(() => undefined);
     const id = window.setInterval(() => loadOverview().catch(() => undefined), 5000);
@@ -260,6 +275,29 @@ function App() {
         <section className="panel">
           <div className="panel-title">
             <div>
+              <h2>待审核回报</h2>
+              <p>执行结果需人工确认后才会扣费或返还。</p>
+            </div>
+          </div>
+          <Table
+            columns={["时间", "方向", "金额", "结果", "毛盈利", "状态", "操作"]}
+            rows={(overview?.reports || []).map((report) => [
+              shortTime(report.created_at),
+              labelDirection(report.direction),
+              `${report.stake_usdt} USDT`,
+              report.result,
+              report.gross_profit || "-",
+              report.report_status,
+              report.report_status === "pending_review"
+                ? <button className="table-action" onClick={() => settleReport(report.id)}>确认结算</button>
+                : <span>-</span>
+            ])}
+          />
+        </section>
+
+        <section className="panel">
+          <div className="panel-title">
+            <div>
               <h2>结算</h2>
               <p>赢单从盈利扣 30%，输单按本金的 30% 返到平台余额。</p>
             </div>
@@ -290,7 +328,7 @@ function Stat({ icon, label, value }: { icon: React.ReactNode; label: string; va
   );
 }
 
-function Table({ columns, rows }: { columns: string[]; rows: string[][] }) {
+function Table({ columns, rows }: { columns: string[]; rows: React.ReactNode[][] }) {
   return (
     <div className="table-wrap">
       <table>

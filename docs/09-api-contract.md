@@ -8,19 +8,19 @@ All APIs use JSON over HTTPS. All authenticated endpoints require `Authorization
 
 ```json
 {
-  "email": "user@example.com",
+  "wallet_address": "0x1111111111111111111111111111111111111111",
   "password": "secret",
   "device_fingerprint": "android-device-id"
 }
 ```
 
-Register is rate limited per email and per IP to reduce scripted bulk signups. A blocked request returns `429` with `AUTH_RATE_LIMITED`.
+Register is rate limited per wallet address to reduce scripted bulk signups. A blocked request returns `429` with `AUTH_RATE_LIMITED`.
 
 ### POST /v1/auth/login
 
 ```json
 {
-  "email": "user@example.com",
+  "wallet_address": "0x1111111111111111111111111111111111111111",
   "password": "secret",
   "device_fingerprint": "android-device-id"
 }
@@ -92,9 +92,12 @@ Response:
 
 ```json
 {
-  "tx_hash": "0x..."
+  "tx_hash": "0x...",
+  "amount": "10"
 }
 ```
+
+The DApp should first ask the wallet to send a BSC USDT contract transfer to `platform_receiver`, then submit the returned transaction hash. The submitted amount is only an expected amount for review; backend crediting must verify the actual chain transfer event.
 
 ### GET /v1/deposits
 
@@ -307,7 +310,7 @@ Android sends this immediately after the confirmation dialog is clicked. Automat
 
 ## Execution Reports
 
-This endpoint records manual or Android automation execution results for settlement, audit review, and profit-share accounting.
+This endpoint records manual or Android automation execution results for audit review. It does not change balances by itself.
 
 ### POST /v1/execution-reports
 
@@ -332,7 +335,7 @@ This endpoint records manual or Android automation execution results for settlem
 }
 ```
 
-For losing reports, send negative `gross_profit` when available. If unavailable, backend treats the loss amount as `stake_usdt` for the 30% loss rebate.
+For losing reports, send negative `gross_profit` when available. If unavailable, the reviewed settlement treats the loss amount as `stake_usdt` for the 30% loss rebate.
 
 Response:
 
@@ -340,6 +343,25 @@ Response:
 {
   "report_id": "018f...",
   "status": "pending_review"
+}
+```
+
+### POST /v1/admin/execution-reports/settle
+
+Admin-only endpoint. It settles one `pending_review` execution report after manual verification and writes the balance/ledger changes in one transaction.
+
+```json
+{
+  "report_id": "018f..."
+}
+```
+
+Response:
+
+```json
+{
+  "report_id": "018f...",
+  "status": "settled"
 }
 ```
 

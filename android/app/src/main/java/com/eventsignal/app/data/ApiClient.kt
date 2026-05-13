@@ -44,11 +44,11 @@ class ApiClient(context: Context) {
             .apply()
     }
 
-    fun register(email: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
-        auth("/v1/auth/register", email, password, deviceFingerprint)
+    fun register(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
+        auth("/v1/auth/register", walletAddress, password, deviceFingerprint)
 
-    fun login(email: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
-        auth("/v1/auth/login", email, password, deviceFingerprint)
+    fun login(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
+        auth("/v1/auth/login", walletAddress, password, deviceFingerprint)
 
     fun getLatestSignal(): Result<SignalSnapshot> = runCatching {
         val request = authedRequest("/v1/signals/latest").get().build()
@@ -122,12 +122,12 @@ class ApiClient(context: Context) {
         return builder
     }
 
-    private fun auth(path: String, email: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
+    private fun auth(path: String, walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         runCatching {
-            if (email.isBlank() || password.isBlank()) error("email and password are required")
+            if (walletAddress.isBlank() || password.isBlank()) error("wallet address and password are required")
             val body = json.encodeToString(
                 AuthRequest(
-                    email = email.trim(),
+                    walletAddress = walletAddress.trim(),
                     password = password,
                     deviceFingerprint = deviceFingerprint,
                 ),

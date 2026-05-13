@@ -76,6 +76,8 @@ Alerts:
 - JWT access tokens short-lived.
 - Refresh token rotation.
 - Passwords hashed with Argon2id.
+- Set `ADMIN_TOKEN` before enabling admin endpoints.
+- Set `CORS_ALLOWED_ORIGINS` to comma-separated trusted admin/app origins; leave unset only for non-browser local API use.
 - Strict rate limits on auth, wallet binding, tx submission.
 - Admin endpoints behind separate auth and IP allowlist.
 - Principle of least privilege for database users.

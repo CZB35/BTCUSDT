@@ -31,8 +31,8 @@ This means exchange direct withdrawals are not supported for automatic crediting
 
 1. User opens recharge page.
 2. App shows platform BSC receiving address and bound wallet address.
-3. User transfers BEP20 USDT from bound wallet to platform address.
-4. User optionally submits tx hash.
+3. DApp requests the wallet to call BEP20 USDT `transfer(platform_receiver, amount)` on BSC.
+4. DApp submits the returned tx hash to the backend.
 5. Backend watches chain logs and/or verifies submitted tx hash.
 6. Backend validates token contract, from, to, amount, and confirmations.
 7. Backend credits user ledger.

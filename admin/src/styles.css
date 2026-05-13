@@ -124,7 +124,8 @@ h2 {
 
 .icon-button,
 .primary,
-.trade-buttons button {
+.trade-buttons button,
+.table-action {
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -135,12 +136,19 @@ h2 {
 }
 
 .icon-button,
-.primary {
+.primary,
+.table-action {
   min-height: 40px;
   padding: 0 16px;
   background: #fcd535;
   color: #181a20;
   font-weight: 700;
+}
+
+.table-action {
+  min-height: 32px;
+  padding: 0 10px;
+  font-size: 13px;
 }
 
 .connection {

@@ -1,0 +1,375 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>事件信号充值</title>
+    <style>
+      :root {
+        color-scheme: light;
+        font-family: Inter, "PingFang SC", "Microsoft YaHei", Arial, sans-serif;
+        background: #ffffff;
+        color: #181a20;
+      }
+      * {
+        box-sizing: border-box;
+      }
+      body {
+        margin: 0;
+        background: #ffffff;
+      }
+      main {
+        width: min(960px, 100%);
+        margin: 0 auto;
+        padding: 28px 18px 40px;
+      }
+      header {
+        display: flex;
+        align-items: flex-start;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 18px;
+      }
+      h1 {
+        margin: 0 0 6px;
+        font-size: 26px;
+        line-height: 1.2;
+      }
+      p {
+        margin: 0;
+        color: #707a8a;
+        line-height: 1.6;
+      }
+      section {
+        border: 1px solid #eaecef;
+        border-radius: 8px;
+        padding: 18px;
+        margin-top: 14px;
+        background: #ffffff;
+      }
+      h2 {
+        margin: 0 0 14px;
+        font-size: 17px;
+      }
+      label {
+        display: grid;
+        gap: 7px;
+        margin-top: 12px;
+        color: #474d57;
+        font-size: 13px;
+      }
+      input {
+        width: 100%;
+        height: 42px;
+        border: 1px solid #d5d8df;
+        border-radius: 6px;
+        padding: 0 12px;
+        font: inherit;
+        color: #181a20;
+      }
+      input:focus {
+        outline: 2px solid rgba(240, 185, 11, 0.28);
+        border-color: #f0b90b;
+      }
+      button {
+        min-height: 42px;
+        border: 0;
+        border-radius: 6px;
+        padding: 0 16px;
+        font: inherit;
+        font-weight: 700;
+        cursor: pointer;
+        background: #f0b90b;
+        color: #181a20;
+      }
+      button.secondary {
+        background: #f5f5f5;
+        color: #181a20;
+        border: 1px solid #d5d8df;
+      }
+      button:disabled {
+        cursor: not-allowed;
+        opacity: 0.55;
+      }
+      .row {
+        display: flex;
+        gap: 10px;
+        flex-wrap: wrap;
+      }
+      .row > * {
+        flex: 1 1 180px;
+      }
+      .status {
+        display: inline-flex;
+        align-items: center;
+        min-height: 34px;
+        padding: 6px 10px;
+        border-radius: 999px;
+        background: #f5f5f5;
+        color: #474d57;
+        font-size: 13px;
+      }
+      .address {
+        word-break: break-all;
+        font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      .success {
+        color: #0ecb81;
+      }
+      .danger {
+        color: #f6465d;
+      }
+      @media (max-width: 640px) {
+        header {
+          display: block;
+        }
+        h1 {
+          font-size: 22px;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>事件信号充值</h1>
+          <p>先连接钱包，再用钱包地址登录或注册。充值到账以后归平台账号余额，不归临时钱包会话。</p>
+        </div>
+        <span id="status" class="status">未连接钱包</span>
+      </header>
+
+      <section>
+        <h2>1. 连接钱包</h2>
+        <div class="row">
+          <button id="connectWallet">连接钱包</button>
+          <button id="returnApp" class="secondary" disabled>回填到 App</button>
+        </div>
+        <p class="address" id="walletAddress">-</p>
+      </section>
+
+      <section>
+        <h2>2. 登录账号</h2>
+        <label>
+          后端地址
+          <input id="apiBase" value="" />
+        </label>
+        <label>
+          钱包地址
+          <input id="accountAddress" placeholder="连接钱包后自动填入" />
+        </label>
+        <label>
+          密码
+          <input id="password" type="password" placeholder="至少 6 位" />
+        </label>
+        <div class="row" style="margin-top: 14px">
+          <button id="login">登录</button>
+          <button id="register" class="secondary">注册</button>
+        </div>
+      </section>
+
+      <section>
+        <h2>3. 充值提交</h2>
+        <p>平台收款地址：<span class="address" id="receiver">登录后获取</span></p>
+        <p>绑定钱包：<span class="address" id="boundWallet">-</span></p>
+        <label>
+          交易哈希
+          <input id="txHash" placeholder="0x..." />
+        </label>
+        <label>
+          金额 USDT
+          <input id="amount" placeholder="例如 10" />
+        </label>
+        <div class="row" style="margin-top: 14px">
+          <button id="sendDeposit">发起链上充值</button>
+          <button id="submitTx" class="secondary">只提交交易哈希</button>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const qs = new URLSearchParams(location.search);
+      const apiBaseInput = document.querySelector("#apiBase");
+      const accountInput = document.querySelector("#accountAddress");
+      const passwordInput = document.querySelector("#password");
+      const statusEl = document.querySelector("#status");
+      const walletEl = document.querySelector("#walletAddress");
+      const receiverEl = document.querySelector("#receiver");
+      const boundWalletEl = document.querySelector("#boundWallet");
+      const txHashInput = document.querySelector("#txHash");
+      const amountInput = document.querySelector("#amount");
+      const returnButton = document.querySelector("#returnApp");
+      let token = localStorage.getItem("event_signal_access_token") || "";
+      let walletAddress = "";
+      let depositInstructions = null;
+
+      apiBaseInput.value = localStorage.getItem("event_signal_api_base") || location.origin;
+
+      function apiBase() {
+        return apiBaseInput.value.replace(/\/$/, "");
+      }
+
+      function setStatus(text, type = "") {
+        statusEl.textContent = text;
+        statusEl.className = `status ${type}`;
+      }
+
+      async function request(path, options = {}) {
+        const headers = { "content-type": "application/json", ...(options.headers || {}) };
+        if (token) headers.authorization = `Bearer ${token}`;
+        const res = await fetch(`${apiBase()}${path}`, { ...options, headers });
+        if (!res.ok) throw new Error(await res.text());
+        return res.json();
+      }
+
+      async function connectWallet() {
+        if (!window.ethereum) {
+          setStatus("当前浏览器没有钱包插件", "danger");
+          return;
+        }
+        const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
+        walletAddress = accounts[0] || "";
+        walletEl.textContent = walletAddress || "-";
+        accountInput.value = walletAddress;
+        returnButton.disabled = !walletAddress;
+        setStatus(walletAddress ? "钱包已连接" : "未获取到地址", walletAddress ? "success" : "danger");
+      }
+
+      async function auth(path) {
+        localStorage.setItem("event_signal_api_base", apiBase());
+        const data = await request(path, {
+          method: "POST",
+          body: JSON.stringify({
+            wallet_address: accountInput.value.trim(),
+            password: passwordInput.value,
+            device_fingerprint: `dapp-${navigator.userAgent.slice(0, 96)}`
+          })
+        });
+        token = data.access_token;
+        localStorage.setItem("event_signal_access_token", token);
+        setStatus("账号已登录", "success");
+        await bindWalletBySignature();
+        await loadDepositInstructions();
+      }
+
+      async function bindWalletBySignature() {
+        const address = accountInput.value.trim();
+        if (!window.ethereum || !address) return;
+        const challenge = await request("/v1/wallets/bind-message", {
+          method: "POST",
+          body: JSON.stringify({ chain: "bsc", address })
+        });
+        const signature = await window.ethereum.request({
+          method: "personal_sign",
+          params: [challenge.message, address]
+        });
+        await request("/v1/wallets/verify", {
+          method: "POST",
+          body: JSON.stringify({
+            chain: "bsc",
+            address,
+            message: challenge.message,
+            signature
+          })
+        });
+        setStatus("钱包签名绑定完成", "success");
+      }
+
+      async function loadDepositInstructions() {
+        const data = await request("/v1/deposits/instructions");
+        depositInstructions = data;
+        receiverEl.textContent = data.platform_receiver || "-";
+        boundWalletEl.textContent = data.bound_wallet || accountInput.value || "-";
+      }
+
+      async function switchToBsc() {
+        try {
+          await window.ethereum.request({
+            method: "wallet_switchEthereumChain",
+            params: [{ chainId: "0x38" }]
+          });
+        } catch (err) {
+          if (err && err.code === 4902) {
+            await window.ethereum.request({
+              method: "wallet_addEthereumChain",
+              params: [{
+                chainId: "0x38",
+                chainName: "BNB Smart Chain",
+                nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
+                rpcUrls: ["https://bsc-dataseed.binance.org/"],
+                blockExplorerUrls: ["https://bscscan.com/"]
+              }]
+            });
+          } else {
+            throw err;
+          }
+        }
+      }
+
+      function encodeTransferData(to, amountText) {
+        const address = normalizeAddress(to).slice(2).padStart(64, "0");
+        const amount = decimalToUnits(amountText, 18).toString(16).padStart(64, "0");
+        return `0xa9059cbb${address}${amount}`;
+      }
+
+      function normalizeAddress(value) {
+        const address = String(value || "").trim().toLowerCase();
+        if (!/^0x[0-9a-f]{40}$/.test(address)) throw new Error("钱包地址格式不正确");
+        return address;
+      }
+
+      function decimalToUnits(value, decimals) {
+        const text = String(value || "").trim();
+        if (!/^\d+(\.\d+)?$/.test(text)) throw new Error("金额格式不正确");
+        const [whole, fraction = ""] = text.split(".");
+        if (fraction.length > decimals) throw new Error("金额小数位过多");
+        return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, "0"));
+      }
+
+      async function sendDeposit() {
+        if (!window.ethereum) throw new Error("当前浏览器没有钱包插件");
+        if (!depositInstructions) await loadDepositInstructions();
+        const from = normalizeAddress(accountInput.value || walletAddress);
+        const receiver = normalizeAddress(depositInstructions.platform_receiver);
+        const tokenContract = normalizeAddress(depositInstructions.token_contract);
+        const data = encodeTransferData(receiver, amountInput.value);
+        await switchToBsc();
+        const txHash = await window.ethereum.request({
+          method: "eth_sendTransaction",
+          params: [{
+            from,
+            to: tokenContract,
+            value: "0x0",
+            data
+          }]
+        });
+        txHashInput.value = txHash;
+        setStatus("链上交易已发送，正在提交记录", "success");
+        await submitTx();
+      }
+
+      async function submitTx() {
+        await request("/v1/deposits/submit-tx", {
+          method: "POST",
+          body: JSON.stringify({
+            tx_hash: txHashInput.value.trim(),
+            amount: amountInput.value.trim()
+          })
+        });
+        setStatus("充值记录已提交，等待后端核验", "success");
+      }
+
+      document.querySelector("#connectWallet").addEventListener("click", connectWallet);
+      document.querySelector("#login").addEventListener("click", () => auth("/v1/auth/login").catch((err) => setStatus(err.message, "danger")));
+      document.querySelector("#register").addEventListener("click", () => auth("/v1/auth/register").catch((err) => setStatus(err.message, "danger")));
+      document.querySelector("#sendDeposit").addEventListener("click", () => sendDeposit().catch((err) => setStatus(err.message, "danger")));
+      document.querySelector("#submitTx").addEventListener("click", () => submitTx().catch((err) => setStatus(err.message, "danger")));
+      returnButton.addEventListener("click", () => {
+        const returnUri = qs.get("return_uri");
+        if (returnUri && walletAddress) {
+          location.href = `${returnUri}?address=${encodeURIComponent(walletAddress)}`;
+        }
+      });
+    </script>
+  </body>
+</html>

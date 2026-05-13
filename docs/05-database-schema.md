@@ -7,7 +7,7 @@ Use PostgreSQL. Monetary fields must use `numeric(38, 18)` or Rust `Decimal`; ne
 ```sql
 create table users (
   id uuid primary key,
-  email text unique,
+  wallet_address text unique not null,
   password_hash text not null,
   status text not null default 'active',
   created_at timestamptz not null default now(),
@@ -32,7 +32,7 @@ create table devices (
 
 ## auth_rate_limits
 
-Tracks register attempts per email and per IP. Blocked rows reject requests until `blocked_until`.
+Tracks register attempts per wallet address. Blocked rows reject requests until `blocked_until`.
 
 ```sql
 create table auth_rate_limits (
@@ -55,9 +55,9 @@ create table wallet_bindings (
   user_id uuid not null references users(id),
   chain text not null default 'bsc',
   address text not null,
-  verified_at timestamptz not null,
-  status text not null default 'active',
+  verified boolean not null default false,
   created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now(),
   unique(chain, address)
 );
 ```

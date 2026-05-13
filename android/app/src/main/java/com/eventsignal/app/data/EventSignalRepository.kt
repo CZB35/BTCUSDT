@@ -34,11 +34,11 @@ class EventSignalRepository(context: Context) {
     fun websocketRequest() =
         api.websocketRequest()
 
-    fun register(email: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
-        api.register(email, password, deviceFingerprint)
+    fun register(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
+        api.register(walletAddress, password, deviceFingerprint)
 
-    fun login(email: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
-        api.login(email, password, deviceFingerprint)
+    fun login(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
+        api.login(walletAddress, password, deviceFingerprint)
 
     fun baseUrl(): String = api.baseUrl
 

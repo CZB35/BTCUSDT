@@ -1,25 +1,30 @@
 use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
 
+use argon2::{
+    password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
+    Argon2,
+};
 use axum::{
     extract::{
         ws::{Message, WebSocket},
         Query, State, WebSocketUpgrade,
     },
-    http::{HeaderMap, StatusCode},
+    http::{HeaderMap, HeaderValue, Method, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post, put},
     Json, Router,
 };
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
+use ethers_core::types::{Address, Signature};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
-use sha2::{Digest, Sha256};
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::sync::{broadcast, RwLock};
 use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::ServeDir;
 use uuid::Uuid;
 
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
@@ -90,6 +95,8 @@ fn router(state: SharedState) -> Router {
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/refresh", post(refresh_token))
+        .route("/v1/wallets/bind-message", post(wallet_bind_message))
+        .route("/v1/wallets/verify", post(wallet_verify))
         .route("/v1/stats", get(stats))
         .route("/v1/signals/latest", get(latest_signal))
         .route("/v1/signals/history", get(signal_history))
@@ -115,15 +122,36 @@ fn router(state: SharedState) -> Router {
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/orders", get(admin_orders))
         .route("/v1/admin/execution-reports", get(admin_reports))
+        .route(
+            "/v1/admin/execution-reports/settle",
+            post(admin_settle_execution_report),
+        )
         .route("/v1/admin/settlements", get(admin_settlements))
         .route("/v1/admin/page-states", get(admin_page_states))
-        .layer(
-            CorsLayer::new()
-                .allow_origin(Any)
-                .allow_methods(Any)
-                .allow_headers(Any),
-        )
+        .nest_service("/dapp", ServeDir::new("dapp"))
+        .layer(cors_layer())
         .with_state(state)
+}
+
+fn cors_layer() -> CorsLayer {
+    let methods = [Method::GET, Method::POST, Method::PUT, Method::OPTIONS];
+    match env::var("CORS_ALLOWED_ORIGINS") {
+        Ok(origins) => {
+            let origins = origins
+                .split(',')
+                .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
+                .collect::<Vec<_>>();
+            if origins.is_empty() {
+                CorsLayer::new().allow_methods(methods).allow_headers(Any)
+            } else {
+                CorsLayer::new()
+                    .allow_origin(origins)
+                    .allow_methods(methods)
+                    .allow_headers(Any)
+            }
+        }
+        Err(_) => CorsLayer::new().allow_methods(methods).allow_headers(Any),
+    }
 }
 
 type SharedState = Arc<AppState>;
@@ -131,7 +159,8 @@ type SharedState = Arc<AppState>;
 struct AppState {
     db: Option<PgPool>,
     users: RwLock<HashMap<Uuid, UserRecord>>,
-    user_by_email: RwLock<HashMap<String, Uuid>>,
+    user_by_wallet: RwLock<HashMap<String, Uuid>>,
+    wallet_nonces: RwLock<HashMap<Uuid, WalletBindChallenge>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     rate_limits: RwLock<HashMap<String, RegisterRateLimit>>,
     balances: RwLock<HashMap<Uuid, BalanceRecord>>,
@@ -155,7 +184,8 @@ impl AppState {
         Arc::new(Self {
             db,
             users: RwLock::new(HashMap::new()),
-            user_by_email: RwLock::new(HashMap::new()),
+            user_by_wallet: RwLock::new(HashMap::new()),
+            wallet_nonces: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
             balances: RwLock::new(HashMap::new()),
@@ -178,12 +208,20 @@ impl AppState {
 #[derive(Clone, Serialize)]
 struct UserRecord {
     id: Uuid,
-    email: String,
+    wallet_address: String,
     password_hash: String,
     status: String,
     active_device_fingerprint: Option<String>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct WalletBindChallenge {
+    chain: String,
+    address: String,
+    message: String,
+    expires_at: DateTime<Utc>,
 }
 
 #[derive(Clone)]
@@ -406,7 +444,7 @@ struct DepositRecord {
 
 #[derive(Deserialize)]
 struct AuthRequest {
-    email: String,
+    wallet_address: String,
     password: String,
     device_fingerprint: String,
 }
@@ -421,6 +459,29 @@ struct AuthResponse {
 #[derive(Deserialize)]
 struct RefreshRequest {
     refresh_token: String,
+}
+
+#[derive(Deserialize)]
+struct WalletBindMessageRequest {
+    chain: Option<String>,
+    address: String,
+}
+
+#[derive(Serialize)]
+struct WalletBindMessageResponse {
+    message: String,
+    nonce: String,
+    address: String,
+    chain: String,
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct WalletVerifyRequest {
+    chain: Option<String>,
+    address: String,
+    message: String,
+    signature: String,
 }
 
 #[derive(Deserialize)]
@@ -482,6 +543,11 @@ struct ExecutionReportRequest {
 struct ExecutionReportResponse {
     report_id: Uuid,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct AdminSettleExecutionReportRequest {
+    report_id: Uuid,
 }
 
 #[derive(Deserialize)]
@@ -547,22 +613,22 @@ async fn register(
     State(state): State<SharedState>,
     Json(req): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    validate_email_password(&req)?;
-    enforce_register_rate_limit(&state, &req.email).await?;
+    validate_auth_request(&req)?;
+    let account = account_from_auth(&req)?;
+    enforce_register_rate_limit(&state, &account).await?;
 
-    let email = normalize_email(&req.email);
     if let Some(pool) = state.db.as_ref() {
-        if db_user_id_by_email(pool, &email).await?.is_some() {
+        if db_user_id_by_wallet(pool, &account).await?.is_some() {
             return Err(AppError::conflict(
-                "AUTH_EMAIL_EXISTS",
-                "email already registered",
+                "AUTH_ACCOUNT_EXISTS",
+                "wallet address already registered",
             ));
         }
     }
-    if state.user_by_email.read().await.contains_key(&email) {
+    if state.user_by_wallet.read().await.contains_key(&account) {
         return Err(AppError::conflict(
-            "AUTH_EMAIL_EXISTS",
-            "email already registered",
+            "AUTH_ACCOUNT_EXISTS",
+            "wallet address already registered",
         ));
     }
 
@@ -570,8 +636,8 @@ async fn register(
     let user_id = Uuid::now_v7();
     let user = UserRecord {
         id: user_id,
-        email: email.clone(),
-        password_hash: password_hash(&email, &req.password),
+        wallet_address: account.clone(),
+        password_hash: password_hash(&req.password)?,
         status: "active".to_string(),
         active_device_fingerprint: Some(req.device_fingerprint.clone()),
         created_at: now,
@@ -582,12 +648,12 @@ async fn register(
         let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
         sqlx::query(
             r#"
-            insert into users (id, email, password_hash, status, active_device_fingerprint, created_at, updated_at)
+            insert into users (id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at)
             values ($1, $2, $3, $4, $5, $6, $7)
             "#,
         )
         .bind(user.id)
-        .bind(&user.email)
+        .bind(&user.wallet_address)
         .bind(&user.password_hash)
         .bind(&user.status)
         .bind(&user.active_device_fingerprint)
@@ -644,7 +710,7 @@ async fn register(
     }
 
     state.users.write().await.insert(user_id, user);
-    state.user_by_email.write().await.insert(email, user_id);
+    state.user_by_wallet.write().await.insert(account, user_id);
     state
         .automation_settings
         .write()
@@ -675,13 +741,13 @@ async fn login(
     State(state): State<SharedState>,
     Json(req): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
-    validate_email_password(&req)?;
-    let email = normalize_email(&req.email);
+    validate_auth_request(&req)?;
+    let account = account_from_auth(&req)?;
     let user_id = if let Some(pool) = state.db.as_ref() {
-        let user = db_user_by_email(pool, &email).await?.ok_or_else(|| {
+        let user = db_user_by_wallet(pool, &account).await?.ok_or_else(|| {
             AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
         })?;
-        if user.password_hash != password_hash(&email, &req.password) {
+        if !verify_password(&user.password_hash, &req.password) {
             return Err(AppError::unauthorized(
                 "AUTH_INVALID_CREDENTIALS",
                 "invalid credentials",
@@ -707,10 +773,10 @@ async fn login(
         user.id
     } else {
         let user_id = state
-            .user_by_email
+            .user_by_wallet
             .read()
             .await
-            .get(&email)
+            .get(&account)
             .copied()
             .ok_or_else(|| {
                 AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
@@ -720,7 +786,7 @@ async fn login(
         let user = users.get_mut(&user_id).ok_or_else(|| {
             AppError::unauthorized("AUTH_INVALID_CREDENTIALS", "invalid credentials")
         })?;
-        if user.password_hash != password_hash(&email, &req.password) {
+        if !verify_password(&user.password_hash, &req.password) {
             return Err(AppError::unauthorized(
                 "AUTH_INVALID_CREDENTIALS",
                 "invalid credentials",
@@ -783,6 +849,99 @@ async fn logout(
     Ok(Json(json!({ "ok": true })))
 }
 
+async fn wallet_bind_message(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<WalletBindMessageRequest>,
+) -> Result<Json<WalletBindMessageResponse>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let chain = normalize_chain(req.chain.as_deref());
+    let address = normalize_wallet_address(&req.address)?;
+    let account_wallet = load_user_wallet_address(&state, user_id).await?;
+    if address != account_wallet {
+        return Err(AppError::forbidden(
+            "WALLET_ACCOUNT_MISMATCH",
+            "wallet address must match the logged-in account",
+        ));
+    }
+    let nonce = new_token("wallet-nonce");
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let message = format!(
+        "Bind wallet to BTCUSDT Event Signal Platform\nUser ID: {user_id}\nChain: {chain}\nAddress: {address}\nNonce: {nonce}"
+    );
+    state.wallet_nonces.write().await.insert(
+        user_id,
+        WalletBindChallenge {
+            chain: chain.clone(),
+            address: address.clone(),
+            message: message.clone(),
+            expires_at,
+        },
+    );
+    Ok(Json(WalletBindMessageResponse {
+        message,
+        nonce,
+        address,
+        chain,
+        expires_at,
+    }))
+}
+
+async fn wallet_verify(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<WalletVerifyRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = current_user(&state, &headers).await?;
+    let chain = normalize_chain(req.chain.as_deref());
+    let address = normalize_wallet_address(&req.address)?;
+    let account_wallet = load_user_wallet_address(&state, user_id).await?;
+    if address != account_wallet {
+        return Err(AppError::forbidden(
+            "WALLET_ACCOUNT_MISMATCH",
+            "wallet address must match the logged-in account",
+        ));
+    }
+    let challenge = state
+        .wallet_nonces
+        .write()
+        .await
+        .remove(&user_id)
+        .ok_or_else(|| {
+            AppError::bad_request("WALLET_NONCE_MISSING", "request a bind message first")
+        })?;
+    if challenge.expires_at < Utc::now() {
+        return Err(AppError::bad_request(
+            "WALLET_NONCE_EXPIRED",
+            "wallet bind message expired",
+        ));
+    }
+    if challenge.chain != chain || challenge.address != address || challenge.message != req.message
+    {
+        return Err(AppError::bad_request(
+            "WALLET_MESSAGE_MISMATCH",
+            "wallet bind message does not match current challenge",
+        ));
+    }
+    let recovered = recover_wallet_address(&req.message, &req.signature)?;
+    if recovered != address {
+        return Err(AppError::unauthorized(
+            "WALLET_SIGNATURE_INVALID",
+            "signature does not match wallet address",
+        ));
+    }
+
+    if let Some(pool) = state.db.as_ref() {
+        upsert_wallet_binding(pool, user_id, &chain, &address, true).await?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "chain": chain,
+        "address": address,
+        "verified": true
+    })))
+}
+
 async fn refresh_token(
     State(state): State<SharedState>,
     Json(req): Json<RefreshRequest>,
@@ -793,8 +952,7 @@ async fn refresh_token(
         .await
         .values()
         .find(|session| session.refresh_token == req.refresh_token)
-        .cloned()
-        .or_else(|| None);
+        .cloned();
     let session = match session {
         Some(session) => session,
         None => {
@@ -983,13 +1141,23 @@ async fn deposit_instructions(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let _ = current_user(&state, &headers).await?;
+    let user_id = current_user(&state, &headers).await?;
+    let bound_wallet = if let Some(pool) = state.db.as_ref() {
+        db_bound_wallet(pool, user_id, "bsc").await?
+    } else {
+        state
+            .users
+            .read()
+            .await
+            .get(&user_id)
+            .map(|user| user.wallet_address.clone())
+    };
     Ok(Json(json!({
         "chain": "bsc",
         "asset": "USDT",
         "token_contract": env::var("BSC_USDT_CONTRACT").unwrap_or_else(|_| "0x55d398326f99059fF775485246999027B3197955".to_string()),
         "platform_receiver": env::var("PLATFORM_BSC_RECEIVER").unwrap_or_else(|_| "set PLATFORM_BSC_RECEIVER".to_string()),
-        "bound_wallet": null,
+        "bound_wallet": bound_wallet,
         "min_amount": "10.0"
     })))
 }
@@ -1053,18 +1221,31 @@ async fn submit_order(
     let user_id = current_user(&state, &headers).await?;
     let stake_usdt = parse_decimal(&req.stake_usdt, "stake_usdt")?;
     validate_event_stake(stake_usdt)?;
+    let direction = req.direction.to_uppercase();
+    if direction != "UP" && direction != "DOWN" {
+        return Err(AppError::bad_request(
+            "ORDER_DIRECTION_INVALID",
+            "direction must be UP or DOWN",
+        ));
+    }
+    let reservation_id = req.reservation_id.ok_or_else(|| {
+        AppError::bad_request(
+            "RESERVATION_REQUIRED",
+            "automatic orders must include reservation_id",
+        )
+    })?;
     let now = Utc::now();
     let order_id = Uuid::now_v7();
     let order = EventContractOrderRecord {
         id: order_id,
         user_id,
-        reservation_id: req.reservation_id,
+        reservation_id: Some(reservation_id),
         signal_id: req.signal_id.clone(),
         client_order_id: req.client_order_id,
         source: req.source,
         symbol: req.symbol,
         period_seconds: req.period_seconds,
-        direction: req.direction,
+        direction,
         stake_usdt,
         automation_profile: req.automation_profile,
         automation_confidence: parse_optional_decimal(
@@ -1078,17 +1259,24 @@ async fn submit_order(
         created_at: now,
     };
     if let Some(pool) = state.db.as_ref() {
-        db_insert_order(pool, &order).await?;
-    }
-    if let Some(reservation_id) = order.reservation_id {
-        if let Some(pool) = state.db.as_ref() {
-            db_mark_reservation_order_submitted(pool, reservation_id, order_id).await?;
+        db_insert_order_with_reservation_validation(pool, &order).await?;
+    } else {
+        let signal_id = Uuid::parse_str(&order.signal_id)
+            .map_err(|_| AppError::bad_request("SIGNAL_ID_INVALID", "signal_id must be a uuid"))?;
+        let mut reservations = state.reservations.write().await;
+        let reservation = reservations.get_mut(&reservation_id).ok_or_else(|| {
+            AppError::bad_request("RESERVATION_NOT_FOUND", "reservation not found")
+        })?;
+        validate_order_against_reservation(&order, reservation, signal_id)?;
+        if reservation.status != "reserved" && reservation.status != "order_submitted" {
+            return Err(AppError::conflict(
+                "RESERVATION_STATUS_INVALID",
+                "reservation is not open for order submission",
+            ));
         }
-        if let Some(reservation) = state.reservations.write().await.get_mut(&reservation_id) {
-            reservation.status = "order_submitted".to_string();
-            reservation.order_id = Some(order_id);
-            reservation.updated_at = now;
-        }
+        reservation.status = "order_submitted".to_string();
+        reservation.order_id = Some(order_id);
+        reservation.updated_at = now;
     }
     state.orders.write().await.push(order);
     Ok(Json(SubmitOrderResponse {
@@ -1126,18 +1314,17 @@ async fn submit_execution_report(
             "automation_confidence",
         )?,
         action_trace_id: req.action_trace_id,
-        report_status: "settled".to_string(),
+        report_status: "pending_review".to_string(),
         reported_at: req.reported_at,
         created_at: Utc::now(),
     };
     if let Some(pool) = state.db.as_ref() {
         db_insert_execution_report(pool, &report).await?;
     }
-    settle_execution_report(&state, &report).await?;
     state.reports.write().await.push(report);
     Ok(Json(ExecutionReportResponse {
         report_id,
-        status: "settled".to_string(),
+        status: "pending_review".to_string(),
     }))
 }
 
@@ -1285,6 +1472,50 @@ async fn admin_reports(
     Ok(Json(state.reports.read().await.clone()))
 }
 
+async fn admin_settle_execution_report(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminSettleExecutionReportRequest>,
+) -> Result<Json<ExecutionReportResponse>, AppError> {
+    ensure_admin(&headers)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_admin_settle_execution_report(pool, req.report_id).await?;
+        return Ok(Json(ExecutionReportResponse {
+            report_id: req.report_id,
+            status: "settled".to_string(),
+        }));
+    }
+
+    let report = state
+        .reports
+        .write()
+        .await
+        .iter_mut()
+        .find(|report| report.id == req.report_id)
+        .ok_or_else(|| AppError::bad_request("REPORT_NOT_FOUND", "execution report not found"))?
+        .clone();
+    if report.report_status != "pending_review" {
+        return Err(AppError::conflict(
+            "REPORT_STATUS_INVALID",
+            "only pending_review reports can be settled",
+        ));
+    }
+    settle_execution_report(&state, &report).await?;
+    if let Some(report) = state
+        .reports
+        .write()
+        .await
+        .iter_mut()
+        .find(|report| report.id == req.report_id)
+    {
+        report.report_status = "settled".to_string();
+    }
+    Ok(Json(ExecutionReportResponse {
+        report_id: req.report_id,
+        status: "settled".to_string(),
+    }))
+}
+
 async fn admin_settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -1307,8 +1538,12 @@ async fn admin_page_states(
     Ok(Json(state.page_states.read().await.clone()))
 }
 
-async fn enforce_register_rate_limit(state: &SharedState, email: &str) -> Result<(), AppError> {
-    let key = normalize_email(email);
+async fn enforce_register_rate_limit(state: &SharedState, account: &str) -> Result<(), AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        return db_enforce_register_rate_limit(pool, account).await;
+    }
+
+    let key = normalize_account(account);
     let now = Utc::now();
     let mut limits = state.rate_limits.write().await;
     let limit = limits.entry(key).or_insert(RegisterRateLimit {
@@ -1388,6 +1623,19 @@ async fn current_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, 
     authenticate_token(state, &token).await
 }
 
+async fn load_user_wallet_address(state: &SharedState, user_id: Uuid) -> Result<String, AppError> {
+    if let Some(user) = state.users.read().await.get(&user_id) {
+        return Ok(user.wallet_address.clone());
+    }
+    if let Some(pool) = state.db.as_ref() {
+        return db_user_wallet_address(pool, user_id).await;
+    }
+    Err(AppError::unauthorized(
+        "AUTH_INVALID_USER",
+        "user account not found",
+    ))
+}
+
 async fn authenticate_token(state: &SharedState, token: &str) -> Result<Uuid, AppError> {
     let session = match state.sessions.read().await.get(token).cloned() {
         Some(session) => session,
@@ -1447,10 +1695,9 @@ fn ensure_admin(headers: &HeaderMap) -> Result<(), AppError> {
     }
 }
 
-fn validate_email_password(req: &AuthRequest) -> Result<(), AppError> {
-    if !req.email.contains('@') || req.email.len() > 254 {
-        return Err(AppError::bad_request("AUTH_EMAIL_INVALID", "invalid email"));
-    }
+fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
+    let account = account_from_auth(req)?;
+    normalize_wallet_address(&account)?;
     if req.password.len() < 6 {
         return Err(AppError::bad_request(
             "AUTH_PASSWORD_WEAK",
@@ -1840,6 +2087,70 @@ fn page_is_fresh_and_ready(page: &AutomationPageState) -> bool {
         && page.down_button_found
 }
 
+fn validate_order_against_reservation(
+    order: &EventContractOrderRecord,
+    reservation: &SignalReservation,
+    signal_id: Uuid,
+) -> Result<(), AppError> {
+    if reservation.user_id != order.user_id {
+        return Err(AppError::forbidden(
+            "RESERVATION_USER_MISMATCH",
+            "reservation does not belong to this user",
+        ));
+    }
+    if reservation.signal_id != signal_id {
+        return Err(AppError::bad_request(
+            "RESERVATION_SIGNAL_MISMATCH",
+            "reservation does not match signal_id",
+        ));
+    }
+    if reservation.stake_usdt != order.stake_usdt {
+        return Err(AppError::bad_request(
+            "RESERVATION_STAKE_MISMATCH",
+            "order stake does not match reservation",
+        ));
+    }
+    if order.symbol != DEFAULT_SYMBOL || order.period_seconds != DEFAULT_PERIOD_SECONDS {
+        return Err(AppError::bad_request(
+            "ORDER_CONTRACT_MISMATCH",
+            "order symbol or period does not match event contract settings",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_report_against_reservation(
+    report: &ExecutionReportRecord,
+    reservation: &SignalReservation,
+    signal_id: Uuid,
+) -> Result<(), AppError> {
+    if reservation.user_id != report.user_id {
+        return Err(AppError::forbidden(
+            "RESERVATION_USER_MISMATCH",
+            "reservation does not belong to this user",
+        ));
+    }
+    if reservation.signal_id != signal_id {
+        return Err(AppError::bad_request(
+            "RESERVATION_SIGNAL_MISMATCH",
+            "reservation does not match signal_id",
+        ));
+    }
+    if reservation.stake_usdt != report.stake_usdt {
+        return Err(AppError::bad_request(
+            "RESERVATION_STAKE_MISMATCH",
+            "report stake does not match reservation",
+        ));
+    }
+    if report.symbol != DEFAULT_SYMBOL || report.period_seconds != DEFAULT_PERIOD_SECONDS {
+        return Err(AppError::bad_request(
+            "REPORT_CONTRACT_MISMATCH",
+            "report symbol or period does not match event contract settings",
+        ));
+    }
+    Ok(())
+}
+
 async fn settle_execution_report(
     state: &SharedState,
     report: &ExecutionReportRecord,
@@ -1954,24 +2265,30 @@ async fn settle_execution_report(
     Ok(())
 }
 
-async fn db_user_id_by_email(pool: &PgPool, email: &str) -> Result<Option<Uuid>, AppError> {
-    sqlx::query("select id from users where email = $1")
-        .bind(email)
+async fn db_user_id_by_wallet(
+    pool: &PgPool,
+    wallet_address: &str,
+) -> Result<Option<Uuid>, AppError> {
+    sqlx::query("select id from users where wallet_address = $1")
+        .bind(wallet_address)
         .fetch_optional(pool)
         .await
         .map(|row| row.map(|row| row.get("id")))
         .map_err(AppError::from_sqlx)
 }
 
-async fn db_user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserRecord>, AppError> {
+async fn db_user_by_wallet(
+    pool: &PgPool,
+    wallet_address: &str,
+) -> Result<Option<UserRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, email, password_hash, status, active_device_fingerprint, created_at, updated_at
+        select id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at
         from users
-        where email = $1
+        where wallet_address = $1
         "#,
     )
-    .bind(email)
+    .bind(wallet_address)
     .fetch_optional(pool)
     .await
     .map(|row| row.map(user_from_row))
@@ -1981,13 +2298,93 @@ async fn db_user_by_email(pool: &PgPool, email: &str) -> Result<Option<UserRecor
 fn user_from_row(row: sqlx::postgres::PgRow) -> UserRecord {
     UserRecord {
         id: row.get("id"),
-        email: row.get("email"),
+        wallet_address: row.get("wallet_address"),
         password_hash: row.get("password_hash"),
         status: row.get("status"),
         active_device_fingerprint: row.get("active_device_fingerprint"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+async fn db_user_wallet_address(pool: &PgPool, user_id: Uuid) -> Result<String, AppError> {
+    sqlx::query("select wallet_address from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from_sqlx)?
+        .map(|row| row.get("wallet_address"))
+        .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
+}
+
+async fn db_enforce_register_rate_limit(pool: &PgPool, account: &str) -> Result<(), AppError> {
+    let key = normalize_account(account);
+    let now = Utc::now();
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let row = sqlx::query(
+        r#"
+        insert into auth_rate_limits (id, scope, key, window_start, attempts, blocked_until, updated_at)
+        values ($1, 'register_wallet', $2, $3, 0, null, $3)
+        on conflict (scope, key) do update set updated_at = excluded.updated_at
+        returning id, window_start, attempts, blocked_until
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(&key)
+    .bind(now)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    let id: Uuid = row.get("id");
+    let mut window_start: DateTime<Utc> = row.get("window_start");
+    let mut attempts: i32 = row.get("attempts");
+    let mut blocked_until: Option<DateTime<Utc>> = row.get("blocked_until");
+
+    if let Some(until) = blocked_until {
+        if until > now {
+            tx.commit().await.map_err(AppError::from_sqlx)?;
+            return Err(AppError::too_many_requests(
+                "AUTH_RATE_LIMITED",
+                "register attempts are temporarily blocked",
+            ));
+        }
+    }
+
+    if now - window_start > Duration::minutes(10) {
+        window_start = now;
+        attempts = 0;
+        blocked_until = None;
+    }
+    attempts += 1;
+    if attempts > 5 {
+        blocked_until = Some(now + Duration::minutes(15));
+    }
+
+    sqlx::query(
+        r#"
+        update auth_rate_limits
+        set window_start = $2, attempts = $3, blocked_until = $4, updated_at = $5
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(window_start)
+    .bind(attempts)
+    .bind(blocked_until)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+
+    if attempts > 5 {
+        return Err(AppError::too_many_requests(
+            "AUTH_RATE_LIMITED",
+            "too many register attempts",
+        ));
+    }
+    Ok(())
 }
 
 async fn db_session_by_access_token(
@@ -2406,11 +2803,62 @@ async fn insert_deposit_tx(
     .bind(&deposit.tx_hash)
     .bind(deposit.amount)
     .bind(&deposit.status)
-    .bind(Some(deposit.created_at))
+    .bind(Option::<DateTime<Utc>>::None)
     .bind(deposit.created_at)
     .execute(&mut **tx)
     .await
     .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn upsert_wallet_binding(
+    pool: &PgPool,
+    user_id: Uuid,
+    chain: &str,
+    address: &str,
+    verified: bool,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into wallet_bindings (id, user_id, chain, address, verified, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $6)
+        on conflict (chain, address) do update
+        set user_id = excluded.user_id,
+            verified = excluded.verified,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(user_id)
+    .bind(chain)
+    .bind(address)
+    .bind(verified)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_bound_wallet(
+    pool: &PgPool,
+    user_id: Uuid,
+    chain: &str,
+) -> Result<Option<String>, AppError> {
+    sqlx::query(
+        r#"
+        select address
+        from wallet_bindings
+        where user_id = $1 and chain = $2 and verified = true
+        order by updated_at desc
+        limit 1
+        "#,
+    )
+    .bind(user_id)
+    .bind(chain)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(|row| row.get("address")))
     .map_err(AppError::from_sqlx)
 }
 
@@ -2541,7 +2989,51 @@ async fn db_reserve_signal_fee(
     Ok(after)
 }
 
-async fn db_insert_order(pool: &PgPool, order: &EventContractOrderRecord) -> Result<(), AppError> {
+async fn db_insert_order_with_reservation_validation(
+    pool: &PgPool,
+    order: &EventContractOrderRecord,
+) -> Result<(), AppError> {
+    let reservation_id = order.reservation_id.ok_or_else(|| {
+        AppError::bad_request("RESERVATION_REQUIRED", "reservation_id is required")
+    })?;
+    let signal_id = Uuid::parse_str(&order.signal_id)
+        .map_err(|_| AppError::bad_request("SIGNAL_ID_INVALID", "signal_id must be a uuid"))?;
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let reservation_row = sqlx::query(
+        r#"
+        select id, user_id, signal_id, stake_usdt, expected_profit_usdt, fee_reserve_usdt,
+               status, order_id, execution_report_id, expires_at, created_at, updated_at
+        from signal_reservations
+        where id = $1
+        for update
+        "#,
+    )
+    .bind(reservation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("RESERVATION_NOT_FOUND", "reservation not found"))?;
+    let reservation = SignalReservation {
+        id: reservation_row.get("id"),
+        user_id: reservation_row.get("user_id"),
+        signal_id: reservation_row.get("signal_id"),
+        stake_usdt: reservation_row.get("stake_usdt"),
+        expected_profit_usdt: reservation_row.get("expected_profit_usdt"),
+        fee_reserve_usdt: reservation_row.get("fee_reserve_usdt"),
+        status: reservation_row.get("status"),
+        order_id: reservation_row.get("order_id"),
+        execution_report_id: reservation_row.get("execution_report_id"),
+        expires_at: reservation_row.get("expires_at"),
+        created_at: reservation_row.get("created_at"),
+        updated_at: reservation_row.get("updated_at"),
+    };
+    validate_order_against_reservation(order, &reservation, signal_id)?;
+    if reservation.status != "reserved" && reservation.status != "order_submitted" {
+        return Err(AppError::conflict(
+            "RESERVATION_STATUS_INVALID",
+            "reservation is not open for order submission",
+        ));
+    }
     let expected_profit = order.stake_usdt * DEFAULT_PAYOUT_RATIO;
     let expected_payout = order.stake_usdt + expected_profit;
     sqlx::query(
@@ -2575,17 +3067,9 @@ async fn db_insert_order(pool: &PgPool, order: &EventContractOrderRecord) -> Res
     .bind(&order.order_status)
     .bind(order.reported_at)
     .bind(order.created_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map(|_| ())
-    .map_err(AppError::from_sqlx)
-}
-
-async fn db_mark_reservation_order_submitted(
-    pool: &PgPool,
-    reservation_id: Uuid,
-    order_id: Uuid,
-) -> Result<(), AppError> {
+    .map_err(AppError::from_sqlx)?;
     sqlx::query(
         r#"
         update signal_reservations
@@ -2594,12 +3078,13 @@ async fn db_mark_reservation_order_submitted(
         "#,
     )
     .bind(reservation_id)
-    .bind(order_id)
+    .bind(order.id)
     .bind(Utc::now())
-    .execute(pool)
+    .execute(&mut *tx)
     .await
-    .map(|_| ())
-    .map_err(AppError::from_sqlx)
+    .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(())
 }
 
 async fn db_insert_execution_report(
@@ -2649,8 +3134,51 @@ async fn db_insert_execution_report(
     .map_err(AppError::from_sqlx)
 }
 
+async fn db_admin_settle_execution_report(pool: &PgPool, report_id: Uuid) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let report_row = sqlx::query(
+        r#"
+        select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
+               period_seconds, direction, stake_usdt, entry_price, expiry_price,
+               payout_ratio, gross_profit, result, automation_profile,
+               automation_confidence, action_trace_id, report_status, reported_at, created_at
+        from execution_reports
+        where id = $1
+        for update
+        "#,
+    )
+    .bind(report_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("REPORT_NOT_FOUND", "execution report not found"))?;
+    let report = execution_report_from_row(report_row);
+    if report.report_status != "pending_review" {
+        return Err(AppError::conflict(
+            "REPORT_STATUS_INVALID",
+            "only pending_review reports can be settled",
+        ));
+    }
+    db_settle_execution_report_tx(&mut tx, &report).await?;
+    sqlx::query("update execution_reports set report_status = 'settled' where id = $1")
+        .bind(report.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
 async fn db_settle_execution_report(
     pool: &PgPool,
+    report: &ExecutionReportRecord,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    db_settle_execution_report_tx(&mut tx, report).await?;
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
+async fn db_settle_execution_report_tx(
+    tx: &mut Transaction<'_, Postgres>,
     report: &ExecutionReportRecord,
 ) -> Result<(), AppError> {
     let signal_id = Uuid::parse_str(&report.signal_id).map_err(|_| {
@@ -2680,19 +3208,18 @@ async fn db_settle_execution_report(
         Decimal::ZERO
     };
     let user_net_profit = gross_profit - profit_share_fee + loss_rebate;
-    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
     let existing = sqlx::query("select id from settlements where execution_report_id = $1")
         .bind(report.id)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&mut **tx)
         .await
         .map_err(AppError::from_sqlx)?;
     if existing.is_some() {
-        tx.commit().await.map_err(AppError::from_sqlx)?;
         return Ok(());
     }
     let reservation = sqlx::query(
         r#"
-        select id, fee_reserve_usdt
+        select id, user_id, signal_id, stake_usdt, expected_profit_usdt, fee_reserve_usdt,
+               status, order_id, execution_report_id, expires_at, created_at, updated_at
         from signal_reservations
         where user_id = $1 and signal_id = $2
         for update
@@ -2700,22 +3227,42 @@ async fn db_settle_execution_report(
     )
     .bind(report.user_id)
     .bind(signal_id)
-    .fetch_optional(&mut *tx)
+    .fetch_optional(&mut **tx)
     .await
     .map_err(AppError::from_sqlx)?;
+    let reservation = reservation
+        .map(|row| SignalReservation {
+            id: row.get("id"),
+            user_id: row.get("user_id"),
+            signal_id: row.get("signal_id"),
+            stake_usdt: row.get("stake_usdt"),
+            expected_profit_usdt: row.get("expected_profit_usdt"),
+            fee_reserve_usdt: row.get("fee_reserve_usdt"),
+            status: row.get("status"),
+            order_id: row.get("order_id"),
+            execution_report_id: row.get("execution_report_id"),
+            expires_at: row.get("expires_at"),
+            created_at: row.get("created_at"),
+            updated_at: row.get("updated_at"),
+        })
+        .ok_or_else(|| AppError::bad_request("RESERVATION_NOT_FOUND", "reservation not found"))?;
+    validate_report_against_reservation(report, &reservation, signal_id)?;
+    if reservation.status != "order_submitted" && reservation.status != "reserved" {
+        return Err(AppError::conflict(
+            "RESERVATION_STATUS_INVALID",
+            "reservation is not open for settlement",
+        ));
+    }
     let row = sqlx::query("select available, frozen from balances where user_id = $1 for update")
         .bind(report.user_id)
-        .fetch_one(&mut *tx)
+        .fetch_one(&mut **tx)
         .await
         .map_err(AppError::from_sqlx)?;
     let mut available: Decimal = row.get("available");
     let mut frozen: Decimal = row.get("frozen");
-    if let Some(reservation) = reservation.as_ref() {
-        let reserved: Decimal = reservation.get("fee_reserve_usdt");
-        let release = reserved.min(frozen);
-        frozen -= release;
-        available += release;
-    }
+    let release = reservation.fee_reserve_usdt.min(frozen);
+    frozen -= release;
+    available += release;
     if profit_share_fee > Decimal::ZERO {
         available = (available - profit_share_fee).max(Decimal::ZERO);
     }
@@ -2735,7 +3282,7 @@ async fn db_settle_execution_report(
     .bind(available)
     .bind(frozen)
     .bind(now)
-    .fetch_one(&mut *tx)
+    .fetch_one(&mut **tx)
     .await
     .map_err(AppError::from_sqlx)?;
     let after_available: Decimal = row.get("available");
@@ -2768,25 +3315,22 @@ async fn db_settle_execution_report(
     .bind(settlement.user_net_profit)
     .bind(&settlement.status)
     .bind(settlement.created_at)
-    .execute(&mut *tx)
+    .execute(&mut **tx)
     .await
     .map_err(AppError::from_sqlx)?;
-    if let Some(reservation) = reservation {
-        let reservation_id: Uuid = reservation.get("id");
-        sqlx::query(
-            r#"
-            update signal_reservations
-            set status = 'settled', execution_report_id = $2, updated_at = $3
-            where id = $1
-            "#,
-        )
-        .bind(reservation_id)
-        .bind(report.id)
-        .bind(now)
-        .execute(&mut *tx)
-        .await
-        .map_err(AppError::from_sqlx)?;
-    }
+    sqlx::query(
+        r#"
+        update signal_reservations
+        set status = 'settled', execution_report_id = $2, updated_at = $3
+        where id = $1
+        "#,
+    )
+    .bind(reservation.id)
+    .bind(report.id)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
     let entry_type = if profit_share_fee > Decimal::ZERO {
         "profit_share_fee"
     } else if loss_rebate > Decimal::ZERO {
@@ -2800,7 +3344,7 @@ async fn db_settle_execution_report(
         loss_rebate
     };
     insert_ledger_tx(
-        &mut tx,
+        tx,
         LedgerEntry {
             id: Uuid::now_v7(),
             user_id: report.user_id,
@@ -2816,7 +3360,6 @@ async fn db_settle_execution_report(
         },
     )
     .await?;
-    tx.commit().await.map_err(AppError::from_sqlx)?;
     Ok(())
 }
 
@@ -2919,7 +3462,7 @@ async fn db_ready_pages(pool: &PgPool) -> Result<i64, AppError> {
 async fn db_admin_users(pool: &PgPool) -> Result<Vec<UserRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, email, password_hash, status, active_device_fingerprint, created_at, updated_at
+        select id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at
         from users
         order by created_at desc
         limit 200
@@ -2985,33 +3528,33 @@ async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, A
     )
     .fetch_all(pool)
     .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| ExecutionReportRecord {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                signal_id: row.get("signal_id"),
-                client_report_id: row.get("client_report_id"),
-                source: row.get("source"),
-                symbol: row.get("symbol"),
-                period_seconds: row.get("period_seconds"),
-                direction: row.get("direction"),
-                stake_usdt: row.get("stake_usdt"),
-                entry_price: row.get("entry_price"),
-                expiry_price: row.get("expiry_price"),
-                payout_ratio: row.get("payout_ratio"),
-                gross_profit: row.get("gross_profit"),
-                result: row.get("result"),
-                automation_profile: row.get("automation_profile"),
-                automation_confidence: row.get("automation_confidence"),
-                action_trace_id: row.get("action_trace_id"),
-                report_status: row.get("report_status"),
-                reported_at: row.get("reported_at"),
-                created_at: row.get("created_at"),
-            })
-            .collect()
-    })
+    .map(|rows| rows.into_iter().map(execution_report_from_row).collect())
     .map_err(AppError::from_sqlx)
+}
+
+fn execution_report_from_row(row: sqlx::postgres::PgRow) -> ExecutionReportRecord {
+    ExecutionReportRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        signal_id: row.get("signal_id"),
+        client_report_id: row.get("client_report_id"),
+        source: row.get("source"),
+        symbol: row.get("symbol"),
+        period_seconds: row.get("period_seconds"),
+        direction: row.get("direction"),
+        stake_usdt: row.get("stake_usdt"),
+        entry_price: row.get("entry_price"),
+        expiry_price: row.get("expiry_price"),
+        payout_ratio: row.get("payout_ratio"),
+        gross_profit: row.get("gross_profit"),
+        result: row.get("result"),
+        automation_profile: row.get("automation_profile"),
+        automation_confidence: row.get("automation_confidence"),
+        action_trace_id: row.get("action_trace_id"),
+        report_status: row.get("report_status"),
+        reported_at: row.get("reported_at"),
+        created_at: row.get("created_at"),
+    }
 }
 
 async fn db_admin_settlements(pool: &PgPool) -> Result<Vec<SettlementRecord>, AppError> {
@@ -3123,17 +3666,64 @@ async fn build_stats(state: &SharedState) -> StatsResponse {
     }
 }
 
-fn normalize_email(email: &str) -> String {
-    email.trim().to_ascii_lowercase()
+fn account_from_auth(req: &AuthRequest) -> Result<String, AppError> {
+    normalize_wallet_address(&req.wallet_address)
 }
 
-fn password_hash(email: &str, password: &str) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(b"event-signal-password-v1");
-    hasher.update(email.as_bytes());
-    hasher.update(b":");
-    hasher.update(password.as_bytes());
-    hex::encode(hasher.finalize())
+fn normalize_account(account: &str) -> String {
+    account.trim().to_ascii_lowercase()
+}
+
+fn normalize_chain(chain: Option<&str>) -> String {
+    chain
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("bsc")
+        .to_ascii_lowercase()
+}
+
+fn normalize_wallet_address(address: &str) -> Result<String, AppError> {
+    let normalized = normalize_account(address);
+    if normalized.len() != 42 || !normalized.starts_with("0x") {
+        return Err(AppError::bad_request(
+            "AUTH_WALLET_INVALID",
+            "wallet address must be a 0x-prefixed EVM address",
+        ));
+    }
+    if !normalized[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "AUTH_WALLET_INVALID",
+            "wallet address contains invalid characters",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn recover_wallet_address(message: &str, signature: &str) -> Result<String, AppError> {
+    let signature = Signature::from_str(signature).map_err(|_| {
+        AppError::bad_request("WALLET_SIGNATURE_INVALID", "invalid wallet signature")
+    })?;
+    let recovered: Address = signature.recover(message).map_err(|_| {
+        AppError::bad_request("WALLET_SIGNATURE_INVALID", "invalid wallet signature")
+    })?;
+    Ok(format!("{recovered:?}").to_ascii_lowercase())
+}
+
+fn password_hash(password: &str) -> Result<String, AppError> {
+    let salt = SaltString::generate(&mut OsRng);
+    Argon2::default()
+        .hash_password(password.as_bytes(), &salt)
+        .map(|hash| hash.to_string())
+        .map_err(|err| AppError::internal("PASSWORD_HASH_FAILED", err.to_string()))
+}
+
+fn verify_password(stored_hash: &str, password: &str) -> bool {
+    if let Ok(parsed) = PasswordHash::new(stored_hash) {
+        return Argon2::default()
+            .verify_password(password.as_bytes(), &parsed)
+            .is_ok();
+    }
+    false
 }
 
 fn new_token(prefix: &str) -> String {
