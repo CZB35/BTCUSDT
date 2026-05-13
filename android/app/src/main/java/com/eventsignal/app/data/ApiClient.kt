@@ -1,6 +1,7 @@
 package com.eventsignal.app.data
 
 import android.content.Context
+import com.eventsignal.app.BuildConfig
 import com.eventsignal.app.domain.AuthRequest
 import com.eventsignal.app.domain.AuthResponse
 import com.eventsignal.app.domain.AutomationSettings
@@ -29,20 +30,11 @@ class ApiClient(context: Context) {
     }
     private val mediaType = "application/json".toMediaType()
 
-    var baseUrl: String
-        get() = prefs.getString("base_url", "http://10.0.2.2:8787") ?: "http://10.0.2.2:8787"
-        set(value) = prefs.edit().putString("base_url", value.trimEnd('/')).apply()
+    val baseUrl: String = BuildConfig.API_BASE_URL.trimEnd('/')
 
     var accessToken: String?
         get() = prefs.getString("access_token", null)
         set(value) = prefs.edit().putString("access_token", value).apply()
-
-    fun saveConnection(baseUrl: String, accessToken: String) {
-        prefs.edit()
-            .putString("base_url", baseUrl.trimEnd('/'))
-            .putString("access_token", accessToken.trim())
-            .apply()
-    }
 
     fun register(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         auth("/v1/auth/register", walletAddress, password, deviceFingerprint)

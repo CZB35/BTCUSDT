@@ -5,6 +5,13 @@ plugins {
     id("org.jetbrains.kotlin.plugin.serialization")
 }
 
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"").trimEnd('/')}\""
+
+val eventSignalApiBaseUrl = providers.gradleProperty("EVENT_SIGNAL_API_BASE_URL")
+    .orElse(providers.environmentVariable("EVENT_SIGNAL_API_BASE_URL"))
+    .orElse("http://10.0.2.2:8787")
+
 android {
     namespace = "com.eventsignal.app"
     compileSdk = 35
@@ -15,10 +22,12 @@ android {
         targetSdk = 35
         versionCode = 1
         versionName = "0.1.0"
+        buildConfigField("String", "API_BASE_URL", buildConfigString(eventSignalApiBaseUrl.get()))
     }
 
     buildFeatures {
         compose = true
+        buildConfig = true
     }
 
     compileOptions {

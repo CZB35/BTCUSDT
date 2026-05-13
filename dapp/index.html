@@ -3,7 +3,7 @@
   <head>
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-    <title>事件信号充值</title>
+    <title>事件合约 DApp</title>
     <style>
       :root {
         color-scheme: light;
@@ -25,7 +25,6 @@
       }
       header {
         display: flex;
-        align-items: flex-start;
         justify-content: space-between;
         gap: 16px;
         margin-bottom: 18px;
@@ -33,7 +32,10 @@
       h1 {
         margin: 0 0 6px;
         font-size: 26px;
-        line-height: 1.2;
+      }
+      h2 {
+        margin: 0 0 14px;
+        font-size: 17px;
       }
       p {
         margin: 0;
@@ -46,10 +48,6 @@
         padding: 18px;
         margin-top: 14px;
         background: #ffffff;
-      }
-      h2 {
-        margin: 0 0 14px;
-        font-size: 17px;
       }
       label {
         display: grid;
@@ -65,11 +63,6 @@
         border-radius: 6px;
         padding: 0 12px;
         font: inherit;
-        color: #181a20;
-      }
-      input:focus {
-        outline: 2px solid rgba(240, 185, 11, 0.28);
-        border-color: #f0b90b;
       }
       button {
         min-height: 42px;
@@ -84,12 +77,7 @@
       }
       button.secondary {
         background: #f5f5f5;
-        color: #181a20;
         border: 1px solid #d5d8df;
-      }
-      button:disabled {
-        cursor: not-allowed;
-        opacity: 0.55;
       }
       .row {
         display: flex;
@@ -109,9 +97,15 @@
         color: #474d57;
         font-size: 13px;
       }
-      .address {
+      .address,
+      pre {
         word-break: break-all;
         font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      }
+      pre {
+        white-space: pre-wrap;
+        margin: 10px 0 0;
+        color: #474d57;
       }
       .success {
         color: #0ecb81;
@@ -133,35 +127,25 @@
     <main>
       <header>
         <div>
-          <h1>事件信号充值</h1>
-          <p>先连接钱包，再用钱包地址登录或注册。充值到账以后归平台账号余额，不归临时钱包会话。</p>
+          <h1>事件合约 DApp</h1>
+          <p>连接钱包后登录账号，签名绑定钱包，通过合约充值 USDT，并提交提现申请。</p>
         </div>
-        <span id="status" class="status">未连接钱包</span>
+        <span id="status" class="status">未连接</span>
       </header>
 
       <section>
         <h2>1. 连接钱包</h2>
         <div class="row">
           <button id="connectWallet">连接钱包</button>
-          <button id="returnApp" class="secondary" disabled>回填到 App</button>
+          <button id="refresh" class="secondary">刷新充值信息</button>
         </div>
         <p class="address" id="walletAddress">-</p>
       </section>
 
       <section>
         <h2>2. 登录账号</h2>
-        <label>
-          后端地址
-          <input id="apiBase" value="" />
-        </label>
-        <label>
-          钱包地址
-          <input id="accountAddress" placeholder="连接钱包后自动填入" />
-        </label>
-        <label>
-          密码
-          <input id="password" type="password" placeholder="至少 6 位" />
-        </label>
+        <label>钱包地址<input id="accountAddress" placeholder="连接钱包后自动填入" /></label>
+        <label>密码<input id="password" type="password" placeholder="至少 6 位" /></label>
         <div class="row" style="margin-top: 14px">
           <button id="login">登录</button>
           <button id="register" class="secondary">注册</button>
@@ -169,44 +153,52 @@
       </section>
 
       <section>
-        <h2>3. 充值提交</h2>
-        <p>平台收款地址：<span class="address" id="receiver">登录后获取</span></p>
+        <h2>3. 合约充值</h2>
+        <p>合约地址：<span class="address" id="vaultContract">-</span></p>
+        <p>收款钱包：<span class="address" id="settlementWallet">-</span></p>
         <p>绑定钱包：<span class="address" id="boundWallet">-</span></p>
-        <label>
-          交易哈希
-          <input id="txHash" placeholder="0x..." />
-        </label>
-        <label>
-          金额 USDT
-          <input id="amount" placeholder="例如 10" />
-        </label>
+        <p>充值 ID：<span class="address" id="depositId">-</span></p>
+        <label>充值金额（USDT）<input id="amount" placeholder="例如 10" /></label>
+        <label>交易哈希<input id="txHash" placeholder="自动充值后自动填入，也可手动提交" /></label>
         <div class="row" style="margin-top: 14px">
-          <button id="sendDeposit">发起链上充值</button>
-          <button id="submitTx" class="secondary">只提交交易哈希</button>
+          <button id="sendDeposit">授权并充值</button>
+          <button id="submitTx" class="secondary">仅提交哈希</button>
         </div>
+      </section>
+
+      <section>
+        <h2>4. 提现申请</h2>
+        <label>提现金额（USDT）<input id="withdrawAmount" placeholder="例如 5" /></label>
+        <label>到账地址<input id="withdrawAddress" placeholder="默认使用绑定钱包" /></label>
+        <div class="row" style="margin-top: 14px">
+          <button id="requestWithdraw">申请提现</button>
+          <button id="loadWithdrawals" class="secondary">查看提现记录</button>
+        </div>
+        <pre id="withdrawalsInfo">-</pre>
       </section>
     </main>
 
     <script>
       const qs = new URLSearchParams(location.search);
-      const apiBaseInput = document.querySelector("#apiBase");
       const accountInput = document.querySelector("#accountAddress");
       const passwordInput = document.querySelector("#password");
       const statusEl = document.querySelector("#status");
       const walletEl = document.querySelector("#walletAddress");
-      const receiverEl = document.querySelector("#receiver");
-      const boundWalletEl = document.querySelector("#boundWallet");
+      const vaultEl = document.querySelector("#vaultContract");
+      const settlementEl = document.querySelector("#settlementWallet");
+      const boundEl = document.querySelector("#boundWallet");
+      const depositIdEl = document.querySelector("#depositId");
       const txHashInput = document.querySelector("#txHash");
       const amountInput = document.querySelector("#amount");
-      const returnButton = document.querySelector("#returnApp");
+      const withdrawAmountInput = document.querySelector("#withdrawAmount");
+      const withdrawAddressInput = document.querySelector("#withdrawAddress");
+      const withdrawalsInfoEl = document.querySelector("#withdrawalsInfo");
       let token = localStorage.getItem("event_signal_access_token") || "";
       let walletAddress = "";
       let depositInstructions = null;
 
-      apiBaseInput.value = localStorage.getItem("event_signal_api_base") || location.origin;
-
       function apiBase() {
-        return apiBaseInput.value.replace(/\/$/, "");
+        return location.origin.replace(/\/$/, "");
       }
 
       function setStatus(text, type = "") {
@@ -223,26 +215,23 @@
       }
 
       async function connectWallet() {
-        if (!window.ethereum) {
-          setStatus("当前浏览器没有钱包插件", "danger");
-          return;
-        }
+        if (!window.ethereum) throw new Error("当前浏览器没有钱包插件");
         const accounts = await window.ethereum.request({ method: "eth_requestAccounts" });
         walletAddress = accounts[0] || "";
         walletEl.textContent = walletAddress || "-";
         accountInput.value = walletAddress;
-        returnButton.disabled = !walletAddress;
+        withdrawAddressInput.value = walletAddress;
         setStatus(walletAddress ? "钱包已连接" : "未获取到地址", walletAddress ? "success" : "danger");
       }
 
       async function auth(path) {
-        localStorage.setItem("event_signal_api_base", apiBase());
         const data = await request(path, {
           method: "POST",
           body: JSON.stringify({
             wallet_address: accountInput.value.trim(),
             password: passwordInput.value,
-            device_fingerprint: `dapp-${navigator.userAgent.slice(0, 96)}`
+            device_fingerprint: `dapp-${navigator.userAgent.slice(0, 96)}`,
+            client_type: "dapp"
           })
         });
         token = data.access_token;
@@ -265,29 +254,23 @@
         });
         await request("/v1/wallets/verify", {
           method: "POST",
-          body: JSON.stringify({
-            chain: "bsc",
-            address,
-            message: challenge.message,
-            signature
-          })
+          body: JSON.stringify({ chain: "bsc", address, message: challenge.message, signature })
         });
-        setStatus("钱包签名绑定完成", "success");
+        setStatus("钱包已绑定", "success");
       }
 
       async function loadDepositInstructions() {
         const data = await request("/v1/deposits/instructions");
         depositInstructions = data;
-        receiverEl.textContent = data.platform_receiver || "-";
-        boundWalletEl.textContent = data.bound_wallet || accountInput.value || "-";
+        vaultEl.textContent = data.vault_contract || "-";
+        settlementEl.textContent = data.settlement_wallet || "-";
+        boundEl.textContent = data.bound_wallet || accountInput.value || "-";
+        depositIdEl.textContent = data.deposit_id || "-";
       }
 
       async function switchToBsc() {
         try {
-          await window.ethereum.request({
-            method: "wallet_switchEthereumChain",
-            params: [{ chainId: "0x38" }]
-          });
+          await window.ethereum.request({ method: "wallet_switchEthereumChain", params: [{ chainId: "0x38" }] });
         } catch (err) {
           if (err && err.code === 4902) {
             await window.ethereum.request({
@@ -306,16 +289,16 @@
         }
       }
 
-      function encodeTransferData(to, amountText) {
-        const address = normalizeAddress(to).slice(2).padStart(64, "0");
-        const amount = decimalToUnits(amountText, 18).toString(16).padStart(64, "0");
-        return `0xa9059cbb${address}${amount}`;
-      }
-
       function normalizeAddress(value) {
         const address = String(value || "").trim().toLowerCase();
-        if (!/^0x[0-9a-f]{40}$/.test(address)) throw new Error("钱包地址格式不正确");
+        if (!/^0x[0-9a-f]{40}$/.test(address)) throw new Error("地址格式不正确");
         return address;
+      }
+
+      function normalizeBytes32(value) {
+        const text = String(value || "").trim().toLowerCase();
+        if (!/^0x[0-9a-f]{64}$/.test(text)) throw new Error("bytes32 格式不正确");
+        return text;
       }
 
       function decimalToUnits(value, decimals) {
@@ -326,50 +309,106 @@
         return BigInt(whole) * 10n ** BigInt(decimals) + BigInt(fraction.padEnd(decimals, "0"));
       }
 
+      function encodeApprove(spender, amountText) {
+        const addr = normalizeAddress(spender).slice(2).padStart(64, "0");
+        const amount = decimalToUnits(amountText, 18).toString(16).padStart(64, "0");
+        return `0x095ea7b3${addr}${amount}`;
+      }
+
+      function encodeDeposit(accountId, depositId, amountText) {
+        const account = normalizeBytes32(accountId).slice(2);
+        const deposit = normalizeBytes32(depositId).slice(2);
+        const amount = decimalToUnits(amountText, 18).toString(16).padStart(64, "0");
+        return `0x9844b73f${account}${deposit}${amount}`;
+      }
+
+      async function waitForTransaction(txHash) {
+        for (let i = 0; i < 60; i += 1) {
+          const receipt = await window.ethereum.request({
+            method: "eth_getTransactionReceipt",
+            params: [txHash]
+          });
+          if (receipt) {
+            if (receipt.status !== "0x1") throw new Error("链上交易失败");
+            return receipt;
+          }
+          await new Promise((resolve) => setTimeout(resolve, 2000));
+        }
+        throw new Error("等待链上确认超时");
+      }
+
       async function sendDeposit() {
         if (!window.ethereum) throw new Error("当前浏览器没有钱包插件");
         if (!depositInstructions) await loadDepositInstructions();
         const from = normalizeAddress(accountInput.value || walletAddress);
-        const receiver = normalizeAddress(depositInstructions.platform_receiver);
+        const vaultContract = normalizeAddress(depositInstructions.vault_contract);
         const tokenContract = normalizeAddress(depositInstructions.token_contract);
-        const data = encodeTransferData(receiver, amountInput.value);
         await switchToBsc();
+        const approveHash = await window.ethereum.request({
+          method: "eth_sendTransaction",
+          params: [{ from, to: tokenContract, value: "0x0", data: encodeApprove(vaultContract, amountInput.value) }]
+        });
+        setStatus("授权已发送，等待确认", "success");
+        await waitForTransaction(approveHash);
         const txHash = await window.ethereum.request({
           method: "eth_sendTransaction",
           params: [{
             from,
-            to: tokenContract,
+            to: vaultContract,
             value: "0x0",
-            data
+            data: encodeDeposit(depositInstructions.account_id, depositInstructions.deposit_id, amountInput.value)
           }]
         });
         txHashInput.value = txHash;
-        setStatus("链上交易已发送，正在提交记录", "success");
+        setStatus("充值交易已发送，正在提交后台核验", "success");
         await submitTx();
       }
 
       async function submitTx() {
-        await request("/v1/deposits/submit-tx", {
+        if (!depositInstructions) throw new Error("请先登录并刷新充值信息");
+        const deposit = await request("/v1/deposits/submit-tx", {
           method: "POST",
           body: JSON.stringify({
             tx_hash: txHashInput.value.trim(),
-            amount: amountInput.value.trim()
+            amount: amountInput.value.trim(),
+            deposit_id: String(depositInstructions.deposit_id || "")
           })
         });
-        setStatus("充值记录已提交，等待后端核验", "success");
+        const text = deposit.status === "credited"
+          ? `充值已入账：${deposit.amount} USDT`
+          : `充值状态：${deposit.status}，确认数 ${deposit.confirmations}`;
+        setStatus(text, "success");
       }
 
-      document.querySelector("#connectWallet").addEventListener("click", connectWallet);
+      async function requestWithdraw() {
+        const data = await request("/v1/withdrawals", {
+          method: "POST",
+          body: JSON.stringify({
+            amount: withdrawAmountInput.value.trim(),
+            to_address: withdrawAddressInput.value.trim() || null
+          })
+        });
+        setStatus(`提现已提交：${data.status}`, "success");
+        withdrawalsInfoEl.textContent = JSON.stringify(data, null, 2);
+      }
+
+      async function loadWithdrawals() {
+        const data = await request("/v1/withdrawals");
+        withdrawalsInfoEl.textContent = JSON.stringify(data, null, 2);
+      }
+
+      document.querySelector("#connectWallet").addEventListener("click", () => connectWallet().catch((err) => setStatus(err.message, "danger")));
+      document.querySelector("#refresh").addEventListener("click", () => loadDepositInstructions().catch((err) => setStatus(err.message, "danger")));
       document.querySelector("#login").addEventListener("click", () => auth("/v1/auth/login").catch((err) => setStatus(err.message, "danger")));
       document.querySelector("#register").addEventListener("click", () => auth("/v1/auth/register").catch((err) => setStatus(err.message, "danger")));
       document.querySelector("#sendDeposit").addEventListener("click", () => sendDeposit().catch((err) => setStatus(err.message, "danger")));
       document.querySelector("#submitTx").addEventListener("click", () => submitTx().catch((err) => setStatus(err.message, "danger")));
-      returnButton.addEventListener("click", () => {
-        const returnUri = qs.get("return_uri");
-        if (returnUri && walletAddress) {
-          location.href = `${returnUri}?address=${encodeURIComponent(walletAddress)}`;
-        }
-      });
+      document.querySelector("#requestWithdraw").addEventListener("click", () => requestWithdraw().catch((err) => setStatus(err.message, "danger")));
+      document.querySelector("#loadWithdrawals").addEventListener("click", () => loadWithdrawals().catch((err) => setStatus(err.message, "danger")));
+
+      if (qs.get("autofill") === "1" && window.ethereum) {
+        connectWallet().catch(() => undefined);
+      }
     </script>
   </body>
 </html>

@@ -5,14 +5,14 @@
 - Chain: BSC.
 - Asset: USDT BEP20.
 - USDT contract: `0x55d398326f99059fF775485246999027B3197955`.
-- Platform receiving address: one shared address controlled by the platform.
+- Vault contract: one BSC contract configured with the platform settlement wallet.
 
 ## User Binding Requirement
 
-Because all users recharge into one shared receiving address, the system must identify the payer. The safest first-release rule is:
+Because all users recharge through one vault contract, the system must identify both the account and payer. The first-release rule is:
 
 ```text
-Credit deposits only when the transfer comes from the user's verified bound wallet address.
+Credit deposits only when the vault emits DepositReceived for the user's account_id and the payer is the user's verified bound wallet address.
 
 Deposits are account scoped. The user must log in first, bind a wallet to that account, and submit/confirm the transaction under that account. The wallet proves source ownership, but the credited balance belongs to the platform account.
 ```
@@ -30,22 +30,24 @@ This means exchange direct withdrawals are not supported for automatic crediting
 ## Deposit Flow
 
 1. User opens recharge page.
-2. App shows platform BSC receiving address and bound wallet address.
-3. DApp requests the wallet to call BEP20 USDT `transfer(platform_receiver, amount)` on BSC.
-4. DApp submits the returned tx hash to the backend.
-5. Backend watches chain logs and/or verifies submitted tx hash.
-6. Backend validates token contract, from, to, amount, and confirmations.
-7. Backend credits user ledger.
+2. Backend returns `vault_contract`, `account_id`, `deposit_id`, token contract, settlement wallet, and bound wallet.
+3. DApp asks the wallet to approve USDT spending for `vault_contract`.
+4. DApp calls `EventSignalVault.deposit(account_id, deposit_id, amount)`.
+5. DApp submits the returned tx hash and `deposit_id` to the backend.
+6. Backend verifies `DepositReceived` and the matching USDT `Transfer`.
+7. Backend credits user ledger after the required confirmations.
 
 ## Validation Rules
 
 A deposit is valid only if:
 
 - Transaction exists on BSC.
-- Transaction contains a USDT `Transfer` event.
+- Transaction contains `DepositReceived(account_id, deposit_id, payer, receiver, amount)`.
+- Transaction contains a matching USDT `Transfer` event.
 - `token_contract == BSC_USDT_CONTRACT`.
-- `from == user's verified wallet address`.
-- `to == PLATFORM_BSC_RECEIVER`.
+- `payer == user's verified wallet address`.
+- `receiver == BSC_SETTLEMENT_WALLET`.
+- `deposit_id` matches the backend-issued deposit id.
 - `amount >= min_deposit_amount`.
 - Transaction hash has not been credited before.
 - Confirmation count is greater than or equal to configured minimum.

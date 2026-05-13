@@ -122,7 +122,6 @@ private fun MainScreen(repository: EventSignalRepository) {
     var debugState by remember { mutableStateOf(AutomationDebugState()) }
     var automationRunning by remember { mutableStateOf(false) }
     var status by remember { mutableStateOf("就绪") }
-    var baseUrl by remember { mutableStateOf(repository.baseUrl()) }
     var accessToken by remember { mutableStateOf(repository.accessToken().orEmpty()) }
     var walletAddress by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
@@ -203,26 +202,17 @@ private fun MainScreen(repository: EventSignalRepository) {
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 AuthCard(
-                    baseUrl = baseUrl,
                     accessToken = accessToken,
                     walletAddress = walletAddress,
                     password = password,
                     status = status,
-                    onBaseUrlChange = { baseUrl = it },
                     onWalletAddressChange = { walletAddress = it },
                     onPasswordChange = { password = it },
-                    onSaveConnection = {
-                        repository.saveConnection(baseUrl, accessToken)
-                        status = "接口地址已保存"
-                    },
                     onOpenDapp = {
-                        repository.saveConnection(baseUrl, accessToken)
-                        val url = "${baseUrl.trimEnd('/')}/dapp/?return_uri=eventsignal://wallet"
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(repository.dappUrl())))
                         status = "已打开充值 DApp"
                     },
                     onLogin = {
-                        repository.saveConnection(baseUrl, accessToken)
                         val device = deviceFingerprint(context)
                         scope.launch {
                             status = "登录中"
@@ -239,7 +229,6 @@ private fun MainScreen(repository: EventSignalRepository) {
                         }
                     },
                     onRegister = {
-                        repository.saveConnection(baseUrl, accessToken)
                         val device = deviceFingerprint(context)
                         scope.launch {
                             status = "注册中"
@@ -315,28 +304,18 @@ private fun MainScreen(repository: EventSignalRepository) {
 
 @Composable
 private fun AuthCard(
-    baseUrl: String,
     accessToken: String,
     walletAddress: String,
     password: String,
     status: String,
-    onBaseUrlChange: (String) -> Unit,
     onWalletAddressChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
-    onSaveConnection: () -> Unit,
     onOpenDapp: () -> Unit,
     onLogin: () -> Unit,
     onRegister: () -> Unit,
 ) {
     AppCard {
         SectionHeader(title = "账号连接", subtitle = "登录后接收后端 WebSocket 信号")
-        OutlinedTextField(
-            value = baseUrl,
-            onValueChange = onBaseUrlChange,
-            label = { Text("后端地址") },
-            singleLine = true,
-            modifier = Modifier.fillMaxWidth(),
-        )
         OutlinedTextField(
             value = walletAddress,
             onValueChange = onWalletAddressChange,
@@ -357,7 +336,6 @@ private fun AuthCard(
             SecondaryButton(text = "注册", modifier = Modifier.weight(1f), onClick = onRegister)
         }
         SecondaryButton(text = "连接钱包 / 充值", modifier = Modifier.fillMaxWidth(), onClick = onOpenDapp)
-        SecondaryButton(text = "仅保存接口地址", modifier = Modifier.fillMaxWidth(), onClick = onSaveConnection)
         StatusChip(
             label = if (accessToken.isBlank()) "未登录" else "令牌已保存",
             active = accessToken.isNotBlank(),

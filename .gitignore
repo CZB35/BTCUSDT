@@ -1,5 +1,8 @@
 target/
 
+.env
+.env.local
+
 .signal-state*/
 .futures-signal-state*/
 
@@ -13,3 +16,14 @@ android/app/build/
 admin/node_modules/
 admin/dist/
 admin/tsconfig.tsbuildinfo
+admin/.env
+admin/.env.local
+admin/.env.*.local
+
+logs/
+
+contracts/cache/
+contracts/out/
+contracts/broadcast/
+contracts/.env
+contracts/.env.local

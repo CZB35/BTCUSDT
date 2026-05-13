@@ -34,6 +34,8 @@ data class AuthRequest(
     val password: String,
     @SerialName("device_fingerprint")
     val deviceFingerprint: String,
+    @SerialName("client_type")
+    val clientType: String = "android",
 )
 
 @Serializable

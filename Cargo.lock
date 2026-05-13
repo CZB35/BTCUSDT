@@ -870,6 +870,7 @@ dependencies = [
  "base64",
  "chrono",
  "clap",
+ "dotenvy",
  "ethers-core",
  "futures-util",
  "hex",

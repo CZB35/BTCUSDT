@@ -16,10 +16,10 @@ use axum::{
 };
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
-use ethers_core::types::{Address, Signature};
+use ethers_core::types::{Address, Signature, U256};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::sync::{broadcast, RwLock};
@@ -35,6 +35,13 @@ const DEFAULT_STAKE_PERCENT: Decimal = dec!(0.05);
 const MIN_EVENT_STAKE: Decimal = dec!(5);
 const MAX_EVENT_STAKE: Decimal = dec!(250);
 const PAGE_GATE_TTL_SECONDS: i64 = 3;
+const MIN_DEPOSIT_AMOUNT: Decimal = dec!(10);
+const DEFAULT_BSC_USDT_CONTRACT: &str = "0x55d398326f99059fF775485246999027B3197955";
+const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
+const DEPOSIT_RECEIVED_TOPIC: &str =
+    "0xd5f368bbc2e92420807de92261859985839a9c191a4bcab25726232ce32263d9";
+const REFUND_PAID_TOPIC: &str =
+    "0x7ade7bc44016a79fbe4e7479cc3af8669b5af6b309802d1a23a4910bb84b80aa";
 #[derive(Parser, Debug)]
 #[command(name = "event-signal-prototype")]
 struct Cli {
@@ -50,6 +57,7 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
+    let _ = dotenvy::dotenv();
     let cli = Cli::parse();
     if cli.once {
         let signal = SignalCore::new("DOWN".to_string(), dec!(5), dec!(1));
@@ -74,6 +82,7 @@ async fn main() -> anyhow::Result<()> {
     };
 
     let state = AppState::new(db);
+    bootstrap_memory_admin(&state).await;
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     println!("event-signal service listening on http://{}", cli.listen);
@@ -113,14 +122,28 @@ fn router(state: SharedState) -> Router {
         .route("/v1/deposits/instructions", get(deposit_instructions))
         .route("/v1/deposits/submit-tx", post(submit_deposit_tx))
         .route("/v1/deposits", get(deposits))
+        .route("/v1/withdrawals", get(withdrawals).post(create_withdrawal))
         .route("/v1/event-contract-orders", post(submit_order))
         .route("/v1/execution-reports", post(submit_execution_report))
         .route("/v1/settlements", get(settlements))
         .route("/v1/ws", get(ws_handler))
+        .route("/v1/admin/login", post(admin_login))
         .route("/v1/admin/overview", get(admin_overview))
+        .route("/v1/admin/signals", get(admin_signals))
         .route("/v1/admin/signals/emit", post(admin_emit_signal))
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/orders", get(admin_orders))
+        .route("/v1/admin/deposits", get(admin_deposits))
+        .route("/v1/admin/withdrawals", get(admin_withdrawals))
+        .route(
+            "/v1/admin/withdrawals/confirm",
+            post(admin_confirm_withdrawal),
+        )
+        .route(
+            "/v1/admin/withdrawals/reject",
+            post(admin_reject_withdrawal),
+        )
+        .route("/v1/admin/ledger", get(admin_ledger))
         .route("/v1/admin/execution-reports", get(admin_reports))
         .route(
             "/v1/admin/execution-reports/settle",
@@ -131,6 +154,21 @@ fn router(state: SharedState) -> Router {
         .nest_service("/dapp", ServeDir::new("dapp"))
         .layer(cors_layer())
         .with_state(state)
+}
+
+async fn bootstrap_memory_admin(state: &SharedState) {
+    if state.db.is_some() {
+        return;
+    }
+    state.admin_users.write().await.insert(
+        "2752186242".to_string(),
+        AdminAccountRecord {
+            id: Uuid::from_u128(0x018f0000000070008000000000000001),
+            password_hash: "$argon2id$v=19$m=19456,t=2,p=1$Yg+Rws/AhevYWlikD3F7lg$2QqeBfA9pR0qOgiCrDuEYF0XKCWxZ0ViQ+yisx80XF4"
+                .to_string(),
+            status: "active".to_string(),
+        },
+    );
 }
 
 fn cors_layer() -> CorsLayer {
@@ -159,6 +197,8 @@ type SharedState = Arc<AppState>;
 struct AppState {
     db: Option<PgPool>,
     users: RwLock<HashMap<Uuid, UserRecord>>,
+    admin_users: RwLock<HashMap<String, AdminAccountRecord>>,
+    admin_sessions: RwLock<HashMap<String, AdminSessionRecord>>,
     user_by_wallet: RwLock<HashMap<String, Uuid>>,
     wallet_nonces: RwLock<HashMap<Uuid, WalletBindChallenge>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
@@ -173,6 +213,7 @@ struct AppState {
     settlements: RwLock<Vec<SettlementRecord>>,
     ledger: RwLock<Vec<LedgerEntry>>,
     deposits: RwLock<Vec<DepositRecord>>,
+    withdrawals: RwLock<Vec<WithdrawalRecord>>,
     reservations: RwLock<HashMap<Uuid, SignalReservation>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
@@ -184,6 +225,8 @@ impl AppState {
         Arc::new(Self {
             db,
             users: RwLock::new(HashMap::new()),
+            admin_users: RwLock::new(HashMap::new()),
+            admin_sessions: RwLock::new(HashMap::new()),
             user_by_wallet: RwLock::new(HashMap::new()),
             wallet_nonces: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
@@ -198,6 +241,7 @@ impl AppState {
             settlements: RwLock::new(Vec::new()),
             ledger: RwLock::new(Vec::new()),
             deposits: RwLock::new(Vec::new()),
+            withdrawals: RwLock::new(Vec::new()),
             reservations: RwLock::new(HashMap::new()),
             signal_tx,
             started_at: Utc::now(),
@@ -217,6 +261,50 @@ struct UserRecord {
 }
 
 #[derive(Clone)]
+struct AdminAccountRecord {
+    id: Uuid,
+    password_hash: String,
+    status: String,
+}
+
+#[derive(Clone)]
+struct AdminSessionRecord {
+    expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct AdminUserRecord {
+    id: Uuid,
+    wallet_address: String,
+    status: String,
+    active_device_fingerprint: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
+impl From<UserRecord> for AdminUserRecord {
+    fn from(user: UserRecord) -> Self {
+        Self {
+            id: user.id,
+            wallet_address: user.wallet_address,
+            status: user.status,
+            active_device_fingerprint: user.active_device_fingerprint,
+            created_at: user.created_at,
+            updated_at: user.updated_at,
+        }
+    }
+}
+
+impl ClientType {
+    fn as_str(self) -> &'static str {
+        match self {
+            ClientType::Android => "android",
+            ClientType::Dapp => "dapp",
+        }
+    }
+}
+
+#[derive(Clone)]
 struct WalletBindChallenge {
     chain: String,
     address: String,
@@ -229,7 +317,14 @@ struct SessionRecord {
     user_id: Uuid,
     device_fingerprint: String,
     refresh_token: String,
+    client_type: ClientType,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ClientType {
+    Android,
+    Dapp,
 }
 
 #[derive(Clone)]
@@ -436,10 +531,95 @@ struct DepositRecord {
     user_id: Uuid,
     chain: String,
     asset: String,
+    token_contract: String,
+    contract_address: String,
+    deposit_id: String,
     tx_hash: String,
+    from_address: String,
+    to_address: String,
     amount: Decimal,
+    block_number: i64,
+    confirmations: i32,
     status: String,
+    credited_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
+}
+
+#[derive(Clone)]
+struct VerifiedDeposit {
+    tx_hash: String,
+    token_contract: String,
+    contract_address: String,
+    deposit_id: String,
+    from_address: String,
+    to_address: String,
+    amount: Decimal,
+    block_number: i64,
+    confirmations: i32,
+    status: String,
+    credited_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone, Serialize)]
+struct WithdrawalRecord {
+    id: Uuid,
+    user_id: Uuid,
+    chain: String,
+    asset: String,
+    token_contract: String,
+    contract_address: String,
+    tx_hash: Option<String>,
+    refund_id: String,
+    payout_wallet: Option<String>,
+    to_address: String,
+    amount: Decimal,
+    block_number: Option<i64>,
+    confirmations: i32,
+    status: String,
+    requested_at: DateTime<Utc>,
+    processed_at: Option<DateTime<Utc>>,
+    rejected_at: Option<DateTime<Utc>>,
+    reject_reason: Option<String>,
+}
+
+#[derive(Clone)]
+struct VerifiedRefund {
+    tx_hash: String,
+    token_contract: String,
+    contract_address: String,
+    payout_wallet: String,
+    to_address: String,
+    amount: Decimal,
+    block_number: i64,
+    confirmations: i32,
+    status: String,
+    processed_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Deserialize)]
+struct RpcResponse<T> {
+    result: Option<T>,
+    error: Option<RpcError>,
+}
+
+#[derive(Deserialize)]
+struct RpcError {
+    message: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RpcTransactionReceipt {
+    block_number: Option<String>,
+    status: Option<String>,
+    logs: Vec<RpcLog>,
+}
+
+#[derive(Deserialize)]
+struct RpcLog {
+    address: String,
+    topics: Vec<String>,
+    data: String,
 }
 
 #[derive(Deserialize)]
@@ -447,6 +627,7 @@ struct AuthRequest {
     wallet_address: String,
     password: String,
     device_fingerprint: String,
+    client_type: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -551,9 +732,40 @@ struct AdminSettleExecutionReportRequest {
 }
 
 #[derive(Deserialize)]
+struct AdminLoginRequest {
+    username: String,
+    password: String,
+}
+
+#[derive(Serialize)]
+struct AdminLoginResponse {
+    access_token: String,
+    expires_in: i64,
+}
+
+#[derive(Deserialize)]
 struct DepositTxRequest {
     tx_hash: String,
     amount: Option<String>,
+    deposit_id: String,
+}
+
+#[derive(Deserialize)]
+struct CreateWithdrawalRequest {
+    amount: String,
+    to_address: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct AdminConfirmWithdrawalRequest {
+    withdrawal_id: Uuid,
+    tx_hash: String,
+}
+
+#[derive(Deserialize)]
+struct AdminRejectWithdrawalRequest {
+    withdrawal_id: Uuid,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -733,7 +945,13 @@ async fn register(
     );
 
     Ok(Json(
-        create_session(&state, user_id, &req.device_fingerprint).await?,
+        create_session(
+            &state,
+            user_id,
+            &req.device_fingerprint,
+            client_type_from_auth(&req)?,
+        )
+        .await?,
     ))
 }
 
@@ -806,7 +1024,13 @@ async fn login(
     };
 
     Ok(Json(
-        create_session(&state, user_id, &req.device_fingerprint).await?,
+        create_session(
+            &state,
+            user_id,
+            &req.device_fingerprint,
+            client_type_from_auth(&req)?,
+        )
+        .await?,
     ))
 }
 
@@ -854,7 +1078,7 @@ async fn wallet_bind_message(
     headers: HeaderMap,
     Json(req): Json<WalletBindMessageRequest>,
 ) -> Result<Json<WalletBindMessageResponse>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     let chain = normalize_chain(req.chain.as_deref());
     let address = normalize_wallet_address(&req.address)?;
     let account_wallet = load_user_wallet_address(&state, user_id).await?;
@@ -892,7 +1116,7 @@ async fn wallet_verify(
     headers: HeaderMap,
     Json(req): Json<WalletVerifyRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     let chain = normalize_chain(req.chain.as_deref());
     let address = normalize_wallet_address(&req.address)?;
     let account_wallet = load_user_wallet_address(&state, user_id).await?;
@@ -974,7 +1198,13 @@ async fn refresh_token(
         }
     };
     Ok(Json(
-        create_session(&state, session.user_id, &session.device_fingerprint).await?,
+        create_session(
+            &state,
+            session.user_id,
+            &session.device_fingerprint,
+            session.client_type,
+        )
+        .await?,
     ))
 }
 
@@ -991,7 +1221,7 @@ async fn latest_signal(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<SignalApiResponse>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let latest = match state.db.as_ref() {
         Some(pool) => db_latest_signal(pool).await?,
         None => None,
@@ -1015,7 +1245,7 @@ async fn signal_history(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SignalApiResponse>>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let signals = match state.db.as_ref() {
         Some(pool) => db_signal_history(pool, 50).await?,
         None => state.signals.read().await.clone(),
@@ -1031,7 +1261,7 @@ async fn get_trading_settings(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<TradingSettings>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     Ok(Json(load_trading_settings(&state, user_id).await))
 }
 
@@ -1040,7 +1270,7 @@ async fn save_trading_settings(
     headers: HeaderMap,
     Json(req): Json<TradingSettings>,
 ) -> Result<Json<TradingSettings>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     validate_trading_settings(&req)?;
     if let Some(pool) = state.db.as_ref() {
         db_save_trading_settings(pool, user_id, &req).await?;
@@ -1057,7 +1287,7 @@ async fn get_automation_settings(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<AutomationSettings>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     Ok(Json(load_automation_settings(&state, user_id).await))
 }
 
@@ -1066,7 +1296,7 @@ async fn save_automation_settings(
     headers: HeaderMap,
     Json(req): Json<AutomationSettings>,
 ) -> Result<Json<AutomationSettings>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     validate_automation_settings(&req)?;
     if let Some(pool) = state.db.as_ref() {
         db_save_automation_settings(pool, user_id, &req).await?;
@@ -1084,7 +1314,7 @@ async fn save_page_state(
     headers: HeaderMap,
     Json(req): Json<PageStateRequest>,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let confidence = parse_decimal(&req.confidence, "confidence")?;
     let page_state = AutomationPageState {
         page_ready: req.page_ready,
@@ -1108,7 +1338,7 @@ async fn balance(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     let balance = load_balance(&state, user_id).await;
     Ok(Json(json!({
         "asset": balance.asset,
@@ -1122,7 +1352,7 @@ async fn ledger(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_ledger_for_user(pool, user_id).await?));
     }
@@ -1141,7 +1371,7 @@ async fn deposit_instructions(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     let bound_wallet = if let Some(pool) = state.db.as_ref() {
         db_bound_wallet(pool, user_id, "bsc").await?
     } else {
@@ -1155,10 +1385,13 @@ async fn deposit_instructions(
     Ok(Json(json!({
         "chain": "bsc",
         "asset": "USDT",
-        "token_contract": env::var("BSC_USDT_CONTRACT").unwrap_or_else(|_| "0x55d398326f99059fF775485246999027B3197955".to_string()),
-        "platform_receiver": env::var("PLATFORM_BSC_RECEIVER").unwrap_or_else(|_| "set PLATFORM_BSC_RECEIVER".to_string()),
+        "token_contract": bsc_usdt_contract(),
+        "vault_contract": bsc_vault_contract()?,
+        "settlement_wallet": bsc_settlement_wallet()?,
+        "account_id": account_id_topic(user_id),
+        "deposit_id": new_bytes32_id(),
         "bound_wallet": bound_wallet,
-        "min_amount": "10.0"
+        "min_amount": money(MIN_DEPOSIT_AMOUNT)
     })))
 }
 
@@ -1167,30 +1400,47 @@ async fn submit_deposit_tx(
     headers: HeaderMap,
     Json(req): Json<DepositTxRequest>,
 ) -> Result<Json<DepositRecord>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
-    let amount = req
+    let user_id = require_dapp_user(&state, &headers).await?;
+    let expected_amount = req
         .amount
         .as_deref()
         .map(|value| parse_decimal(value, "amount"))
-        .transpose()?
-        .ok_or_else(|| AppError::bad_request("DEPOSIT_AMOUNT_REQUIRED", "amount is required"))?;
+        .transpose()?;
+    let tx_hash = normalize_tx_hash(&req.tx_hash)?;
+    let deposit_id = normalize_topic(&req.deposit_id)?;
+    let bound_wallet = bound_wallet_for_user(&state, user_id).await?;
+    let verified = verify_bsc_contract_deposit(
+        &tx_hash,
+        user_id,
+        &bound_wallet,
+        &deposit_id,
+        expected_amount,
+    )
+    .await?;
     let now = Utc::now();
     let deposit = DepositRecord {
         id: Uuid::now_v7(),
         user_id,
         chain: "bsc".to_string(),
         asset: "USDT".to_string(),
-        tx_hash: req.tx_hash,
-        amount,
-        status: "pending_review".to_string(),
+        token_contract: verified.token_contract,
+        contract_address: verified.contract_address,
+        deposit_id: verified.deposit_id,
+        tx_hash: verified.tx_hash,
+        from_address: verified.from_address,
+        to_address: verified.to_address,
+        amount: verified.amount,
+        block_number: verified.block_number,
+        confirmations: verified.confirmations,
+        status: verified.status,
+        credited_at: verified.credited_at,
         created_at: now,
     };
     if let Some(pool) = state.db.as_ref() {
-        let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
-        insert_deposit_tx(&mut tx, &deposit).await?;
-        tx.commit().await.map_err(AppError::from_sqlx)?;
+        db_credit_deposit(pool, &deposit).await?;
+    } else {
+        credit_deposit_memory(&state, &deposit).await?;
     }
-    state.deposits.write().await.push(deposit.clone());
     Ok(Json(deposit))
 }
 
@@ -1198,7 +1448,7 @@ async fn deposits(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<DepositRecord>>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_deposits_for_user(pool, user_id).await?));
     }
@@ -1213,12 +1463,676 @@ async fn deposits(
     Ok(Json(rows))
 }
 
+async fn create_withdrawal(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<CreateWithdrawalRequest>,
+) -> Result<Json<WithdrawalRecord>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    let amount = parse_decimal(&req.amount, "amount")?;
+    if amount <= Decimal::ZERO {
+        return Err(AppError::bad_request(
+            "WITHDRAWAL_AMOUNT_INVALID",
+            "withdrawal amount must be positive",
+        ));
+    }
+    let to_address = match req.to_address.as_deref() {
+        Some(value) if !value.trim().is_empty() => normalize_wallet_address(value)?,
+        _ => bound_wallet_for_user(&state, user_id).await?,
+    };
+    let now = Utc::now();
+    let refund_id = bytes32_from_uuid(Uuid::now_v7());
+    let withdrawal = WithdrawalRecord {
+        id: Uuid::now_v7(),
+        user_id,
+        chain: "bsc".to_string(),
+        asset: "USDT".to_string(),
+        token_contract: bsc_usdt_contract(),
+        contract_address: bsc_vault_contract()?,
+        tx_hash: None,
+        refund_id,
+        payout_wallet: None,
+        to_address,
+        amount,
+        block_number: None,
+        confirmations: 0,
+        status: "pending_review".to_string(),
+        requested_at: now,
+        processed_at: None,
+        rejected_at: None,
+        reject_reason: None,
+    };
+    if let Some(pool) = state.db.as_ref() {
+        db_create_withdrawal(pool, &withdrawal).await?;
+    } else {
+        create_withdrawal_memory(&state, &withdrawal).await?;
+    }
+    Ok(Json(withdrawal))
+}
+
+async fn withdrawals(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WithdrawalRecord>>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_withdrawals_for_user(pool, user_id).await?));
+    }
+    let rows = state
+        .withdrawals
+        .read()
+        .await
+        .iter()
+        .filter(|withdrawal| withdrawal.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn bound_wallet_for_user(state: &SharedState, user_id: Uuid) -> Result<String, AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        return db_bound_wallet(pool, user_id, "bsc").await?.ok_or_else(|| {
+            AppError::bad_request("WALLET_NOT_BOUND", "bind and verify a BSC wallet first")
+        });
+    }
+    state
+        .users
+        .read()
+        .await
+        .get(&user_id)
+        .map(|user| user.wallet_address.clone())
+        .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
+}
+
+async fn credit_deposit_memory(
+    state: &SharedState,
+    deposit: &DepositRecord,
+) -> Result<(), AppError> {
+    if state
+        .deposits
+        .read()
+        .await
+        .iter()
+        .any(|row| row.tx_hash.eq_ignore_ascii_case(&deposit.tx_hash))
+    {
+        return Err(AppError::conflict(
+            "DEPOSIT_ALREADY_SUBMITTED",
+            "deposit transaction was already submitted",
+        ));
+    }
+    let mut balances = state.balances.write().await;
+    let balance = balances
+        .get_mut(&deposit.user_id)
+        .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    if deposit.status == "credited" {
+        balance.available += deposit.amount;
+        balance.updated_at = Utc::now();
+    }
+    let balance_after = balance.clone();
+    drop(balances);
+
+    state.deposits.write().await.push(deposit.clone());
+    if deposit.status == "credited" {
+        state.ledger.write().await.push(LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: deposit.user_id,
+            asset: "USDT".to_string(),
+            entry_type: "deposit_credit".to_string(),
+            amount: deposit.amount,
+            balance_available_after: balance_after.available,
+            balance_frozen_after: balance_after.frozen,
+            ref_type: "deposit".to_string(),
+            ref_id: deposit.id,
+            idempotency_key: format!("deposit:{}", deposit.tx_hash),
+            created_at: Utc::now(),
+        });
+    }
+    Ok(())
+}
+
+async fn create_withdrawal_memory(
+    state: &SharedState,
+    withdrawal: &WithdrawalRecord,
+) -> Result<(), AppError> {
+    let mut balances = state.balances.write().await;
+    let balance = balances
+        .get_mut(&withdrawal.user_id)
+        .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    if balance.available < withdrawal.amount {
+        return Err(AppError::bad_request(
+            "BALANCE_INSUFFICIENT",
+            "available balance is below withdrawal amount",
+        ));
+    }
+    balance.available -= withdrawal.amount;
+    balance.frozen += withdrawal.amount;
+    balance.updated_at = Utc::now();
+    let balance_after = balance.clone();
+    drop(balances);
+
+    state.withdrawals.write().await.push(withdrawal.clone());
+    state.ledger.write().await.push(LedgerEntry {
+        id: Uuid::now_v7(),
+        user_id: withdrawal.user_id,
+        asset: "USDT".to_string(),
+        entry_type: "withdrawal_reserve".to_string(),
+        amount: -withdrawal.amount,
+        balance_available_after: balance_after.available,
+        balance_frozen_after: balance_after.frozen,
+        ref_type: "withdrawal".to_string(),
+        ref_id: withdrawal.id,
+        idempotency_key: format!("withdrawal_reserve:{}", withdrawal.id),
+        created_at: Utc::now(),
+    });
+    Ok(())
+}
+
+async fn confirm_withdrawal_memory(
+    state: &SharedState,
+    withdrawal_id: Uuid,
+    verified: VerifiedRefund,
+) -> Result<(), AppError> {
+    let mut withdrawals = state.withdrawals.write().await;
+    let withdrawal = withdrawals
+        .iter_mut()
+        .find(|row| row.id == withdrawal_id)
+        .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    if withdrawal.status != "pending_review" && withdrawal.status != "confirming" {
+        return Err(AppError::conflict(
+            "WITHDRAWAL_STATUS_INVALID",
+            "only pending or confirming withdrawals can be confirmed",
+        ));
+    }
+    withdrawal.tx_hash = Some(verified.tx_hash);
+    withdrawal.token_contract = verified.token_contract;
+    withdrawal.contract_address = verified.contract_address;
+    withdrawal.payout_wallet = Some(verified.payout_wallet);
+    withdrawal.to_address = verified.to_address;
+    withdrawal.amount = verified.amount;
+    withdrawal.block_number = Some(verified.block_number);
+    withdrawal.confirmations = verified.confirmations;
+    withdrawal.status = verified.status;
+    withdrawal.processed_at = verified.processed_at;
+    let snapshot = withdrawal.clone();
+    drop(withdrawals);
+
+    if snapshot.status == "paid" {
+        let mut balances = state.balances.write().await;
+        let balance = balances
+            .get_mut(&snapshot.user_id)
+            .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+        let release = snapshot.amount.min(balance.frozen);
+        balance.frozen -= release;
+        balance.updated_at = Utc::now();
+        let balance_after = balance.clone();
+        drop(balances);
+        state.ledger.write().await.push(LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: snapshot.user_id,
+            asset: "USDT".to_string(),
+            entry_type: "withdrawal_paid".to_string(),
+            amount: -snapshot.amount,
+            balance_available_after: balance_after.available,
+            balance_frozen_after: balance_after.frozen,
+            ref_type: "withdrawal".to_string(),
+            ref_id: snapshot.id,
+            idempotency_key: format!("withdrawal_paid:{}", snapshot.id),
+            created_at: Utc::now(),
+        });
+    }
+    Ok(())
+}
+
+async fn reject_withdrawal_memory(
+    state: &SharedState,
+    withdrawal_id: Uuid,
+    reason: Option<String>,
+) -> Result<(), AppError> {
+    let mut withdrawals = state.withdrawals.write().await;
+    let withdrawal = withdrawals
+        .iter_mut()
+        .find(|row| row.id == withdrawal_id)
+        .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    if withdrawal.status != "pending_review" && withdrawal.status != "confirming" {
+        return Err(AppError::conflict(
+            "WITHDRAWAL_STATUS_INVALID",
+            "only pending or confirming withdrawals can be rejected",
+        ));
+    }
+    withdrawal.status = "rejected".to_string();
+    withdrawal.rejected_at = Some(Utc::now());
+    withdrawal.reject_reason = reason;
+    let snapshot = withdrawal.clone();
+    drop(withdrawals);
+
+    let mut balances = state.balances.write().await;
+    let balance = balances
+        .get_mut(&snapshot.user_id)
+        .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    let release = snapshot.amount.min(balance.frozen);
+    balance.frozen -= release;
+    balance.available += release;
+    balance.updated_at = Utc::now();
+    let balance_after = balance.clone();
+    drop(balances);
+
+    state.ledger.write().await.push(LedgerEntry {
+        id: Uuid::now_v7(),
+        user_id: snapshot.user_id,
+        asset: "USDT".to_string(),
+        entry_type: "withdrawal_rejected".to_string(),
+        amount: snapshot.amount,
+        balance_available_after: balance_after.available,
+        balance_frozen_after: balance_after.frozen,
+        ref_type: "withdrawal".to_string(),
+        ref_id: snapshot.id,
+        idempotency_key: format!("withdrawal_rejected:{}", snapshot.id),
+        created_at: Utc::now(),
+    });
+    Ok(())
+}
+
+struct TransferLog {
+    from_address: String,
+    to_address: String,
+    amount: Decimal,
+}
+
+struct DepositReceivedLog {
+    account_id: String,
+    deposit_id: String,
+    payer: String,
+    receiver: String,
+    amount: Decimal,
+}
+
+struct RefundPaidLog {
+    refund_id: String,
+    payer: String,
+    recipient: String,
+    amount: Decimal,
+}
+
+async fn verify_bsc_contract_deposit(
+    tx_hash: &str,
+    user_id: Uuid,
+    bound_wallet: &str,
+    expected_deposit_id: &str,
+    expected_amount: Option<Decimal>,
+) -> Result<VerifiedDeposit, AppError> {
+    let rpc_url = bsc_rpc_url()?;
+    let token_contract = normalize_wallet_address(&bsc_usdt_contract())?;
+    let vault_contract = bsc_vault_contract()?;
+    let settlement_wallet = bsc_settlement_wallet()?;
+    let bound_wallet = normalize_wallet_address(bound_wallet)?;
+    let expected_account_id = account_id_topic(user_id);
+
+    let receipt: Option<RpcTransactionReceipt> =
+        rpc_call(&rpc_url, "eth_getTransactionReceipt", json!([tx_hash])).await?;
+    let Some(receipt) = receipt else {
+        return Ok(VerifiedDeposit {
+            tx_hash: tx_hash.to_string(),
+            token_contract,
+            contract_address: vault_contract.clone(),
+            deposit_id: expected_deposit_id.to_string(),
+            from_address: bound_wallet,
+            to_address: settlement_wallet,
+            amount: expected_amount.unwrap_or(Decimal::ZERO),
+            block_number: 0,
+            confirmations: 0,
+            status: "confirming".to_string(),
+            credited_at: None,
+        });
+    };
+    let block_number = receipt
+        .block_number
+        .as_deref()
+        .map(hex_to_i64)
+        .transpose()?
+        .ok_or_else(|| AppError::bad_request("DEPOSIT_UNCONFIRMED", "transaction is not mined"))?;
+    if receipt.status.as_deref() != Some("0x1") {
+        return Err(AppError::bad_request(
+            "DEPOSIT_TX_FAILED",
+            "transaction receipt is not successful",
+        ));
+    }
+    let current_block_hex: String = rpc_call(&rpc_url, "eth_blockNumber", json!([]))
+        .await?
+        .ok_or_else(|| {
+            AppError::bad_request("BSC_BLOCK_UNAVAILABLE", "BSC block number unavailable")
+        })?;
+    let current_block = hex_to_i64(&current_block_hex)?;
+    let confirmations = (current_block - block_number + 1).max(0) as i32;
+    let min_confirmations = deposit_min_confirmations();
+
+    let deposit = receipt
+        .logs
+        .iter()
+        .find_map(|log| parse_deposit_received_log(log, &vault_contract).transpose())
+        .transpose()?
+        .ok_or_else(|| {
+            AppError::bad_request("DEPOSIT_EVENT_NOT_FOUND", "DepositReceived event not found")
+        })?;
+
+    if deposit.account_id != expected_account_id {
+        return Err(AppError::bad_request(
+            "DEPOSIT_ACCOUNT_MISMATCH",
+            "deposit event account_id does not match user",
+        ));
+    }
+    if deposit.deposit_id != expected_deposit_id {
+        return Err(AppError::bad_request(
+            "DEPOSIT_ID_MISMATCH",
+            "deposit event deposit_id does not match request",
+        ));
+    }
+    if deposit.payer != bound_wallet {
+        return Err(AppError::bad_request(
+            "DEPOSIT_FROM_MISMATCH",
+            "deposit event payer does not match bound wallet",
+        ));
+    }
+    if deposit.receiver != settlement_wallet {
+        return Err(AppError::bad_request(
+            "DEPOSIT_RECEIVER_MISMATCH",
+            "deposit event receiver does not match settlement wallet",
+        ));
+    }
+    if deposit.amount < MIN_DEPOSIT_AMOUNT {
+        return Err(AppError::bad_request(
+            "DEPOSIT_AMOUNT_TOO_SMALL",
+            format!(
+                "deposit amount must be at least {}",
+                money(MIN_DEPOSIT_AMOUNT)
+            ),
+        ));
+    }
+    if let Some(expected) = expected_amount {
+        if deposit.amount < expected {
+            return Err(AppError::bad_request(
+                "DEPOSIT_AMOUNT_MISMATCH",
+                "chain deposit amount is below submitted amount",
+            ));
+        }
+    }
+
+    let mut matching_transfer = false;
+    for log in &receipt.logs {
+        if let Some(transfer) = parse_usdt_transfer_log(log, &token_contract)? {
+            if transfer.from_address == bound_wallet
+                && transfer.to_address == settlement_wallet
+                && transfer.amount == deposit.amount
+            {
+                matching_transfer = true;
+                break;
+            }
+        }
+    }
+    if !matching_transfer {
+        return Err(AppError::bad_request(
+            "DEPOSIT_TRANSFER_NOT_FOUND",
+            "matching USDT transfer from wallet to settlement wallet not found",
+        ));
+    }
+
+    Ok(VerifiedDeposit {
+        tx_hash: tx_hash.to_string(),
+        token_contract,
+        contract_address: vault_contract,
+        deposit_id: deposit.deposit_id,
+        from_address: deposit.payer,
+        to_address: deposit.receiver,
+        amount: deposit.amount,
+        block_number,
+        confirmations,
+        status: if confirmations >= min_confirmations {
+            "credited".to_string()
+        } else {
+            "confirming".to_string()
+        },
+        credited_at: if confirmations >= min_confirmations {
+            Some(Utc::now())
+        } else {
+            None
+        },
+    })
+}
+
+fn parse_usdt_transfer_log(
+    log: &RpcLog,
+    token_contract: &str,
+) -> Result<Option<TransferLog>, AppError> {
+    let address = normalize_wallet_address(&log.address)?;
+    if address != token_contract {
+        return Ok(None);
+    }
+    if log.topics.len() < 3 || !log.topics[0].eq_ignore_ascii_case(TRANSFER_TOPIC) {
+        return Ok(None);
+    }
+    let from_address = topic_to_address(&log.topics[1])?;
+    let to_address = topic_to_address(&log.topics[2])?;
+    let units = U256::from_str_radix(log.data.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::bad_request("DEPOSIT_LOG_INVALID", "invalid transfer amount"))?;
+    let amount = u256_to_decimal(units, 18)?;
+    Ok(Some(TransferLog {
+        from_address,
+        to_address,
+        amount,
+    }))
+}
+
+fn parse_deposit_received_log(
+    log: &RpcLog,
+    vault_contract: &str,
+) -> Result<Option<DepositReceivedLog>, AppError> {
+    let address = normalize_wallet_address(&log.address)?;
+    if address != vault_contract {
+        return Ok(None);
+    }
+    if log.topics.len() < 4 || !log.topics[0].eq_ignore_ascii_case(DEPOSIT_RECEIVED_TOPIC) {
+        return Ok(None);
+    }
+    let words = abi_data_words(&log.data)?;
+    if words.len() < 2 {
+        return Err(AppError::bad_request(
+            "DEPOSIT_EVENT_INVALID",
+            "DepositReceived event data is incomplete",
+        ));
+    }
+    Ok(Some(DepositReceivedLog {
+        account_id: normalize_topic(&log.topics[1])?,
+        deposit_id: normalize_topic(&log.topics[2])?,
+        payer: topic_to_address(&log.topics[3])?,
+        receiver: word_to_address(&words[0])?,
+        amount: u256_to_decimal(
+            U256::from_str_radix(&words[1], 16).map_err(|_| {
+                AppError::bad_request("DEPOSIT_EVENT_INVALID", "invalid deposit amount")
+            })?,
+            18,
+        )?,
+    }))
+}
+
+fn parse_refund_paid_log(
+    log: &RpcLog,
+    vault_contract: &str,
+) -> Result<Option<RefundPaidLog>, AppError> {
+    let address = normalize_wallet_address(&log.address)?;
+    if address != vault_contract {
+        return Ok(None);
+    }
+    if log.topics.len() < 4 || !log.topics[0].eq_ignore_ascii_case(REFUND_PAID_TOPIC) {
+        return Ok(None);
+    }
+    let words = abi_data_words(&log.data)?;
+    if words.is_empty() {
+        return Err(AppError::bad_request(
+            "REFUND_EVENT_INVALID",
+            "RefundPaid event data is incomplete",
+        ));
+    }
+    Ok(Some(RefundPaidLog {
+        refund_id: normalize_topic(&log.topics[1])?,
+        payer: topic_to_address(&log.topics[2])?,
+        recipient: topic_to_address(&log.topics[3])?,
+        amount: u256_to_decimal(
+            U256::from_str_radix(&words[0], 16).map_err(|_| {
+                AppError::bad_request("REFUND_EVENT_INVALID", "invalid refund amount")
+            })?,
+            18,
+        )?,
+    }))
+}
+
+async fn verify_bsc_refund(
+    tx_hash: &str,
+    withdrawal: &WithdrawalRecord,
+) -> Result<VerifiedRefund, AppError> {
+    let rpc_url = bsc_rpc_url()?;
+    let token_contract = normalize_wallet_address(&bsc_usdt_contract())?;
+    let vault_contract = bsc_vault_contract()?;
+    let expected_refund_id = normalize_topic(&withdrawal.refund_id)?;
+    let expected_recipient = normalize_wallet_address(&withdrawal.to_address)?;
+
+    let receipt: Option<RpcTransactionReceipt> =
+        rpc_call(&rpc_url, "eth_getTransactionReceipt", json!([tx_hash])).await?;
+    let Some(receipt) = receipt else {
+        return Ok(VerifiedRefund {
+            tx_hash: tx_hash.to_string(),
+            token_contract,
+            contract_address: vault_contract,
+            payout_wallet: withdrawal.payout_wallet.clone().unwrap_or_default(),
+            to_address: expected_recipient,
+            amount: withdrawal.amount,
+            block_number: 0,
+            confirmations: 0,
+            status: "confirming".to_string(),
+            processed_at: None,
+        });
+    };
+    let block_number = receipt
+        .block_number
+        .as_deref()
+        .map(hex_to_i64)
+        .transpose()?
+        .ok_or_else(|| AppError::bad_request("REFUND_UNCONFIRMED", "transaction is not mined"))?;
+    if receipt.status.as_deref() != Some("0x1") {
+        return Err(AppError::bad_request(
+            "REFUND_TX_FAILED",
+            "transaction receipt is not successful",
+        ));
+    }
+    let current_block_hex: String = rpc_call(&rpc_url, "eth_blockNumber", json!([]))
+        .await?
+        .ok_or_else(|| {
+            AppError::bad_request("BSC_BLOCK_UNAVAILABLE", "BSC block number unavailable")
+        })?;
+    let current_block = hex_to_i64(&current_block_hex)?;
+    let confirmations = (current_block - block_number + 1).max(0) as i32;
+    let min_confirmations = deposit_min_confirmations();
+
+    let refund = receipt
+        .logs
+        .iter()
+        .find_map(|log| parse_refund_paid_log(log, &vault_contract).transpose())
+        .transpose()?
+        .ok_or_else(|| {
+            AppError::bad_request("REFUND_EVENT_NOT_FOUND", "RefundPaid event not found")
+        })?;
+    if refund.refund_id != expected_refund_id {
+        return Err(AppError::bad_request(
+            "REFUND_ID_MISMATCH",
+            "refund event id does not match withdrawal",
+        ));
+    }
+    if refund.recipient != expected_recipient {
+        return Err(AppError::bad_request(
+            "REFUND_RECIPIENT_MISMATCH",
+            "refund event recipient does not match withdrawal",
+        ));
+    }
+    if refund.amount != withdrawal.amount {
+        return Err(AppError::bad_request(
+            "REFUND_AMOUNT_MISMATCH",
+            "refund event amount does not match withdrawal",
+        ));
+    }
+
+    let mut matching_transfer = false;
+    for log in &receipt.logs {
+        if let Some(transfer) = parse_usdt_transfer_log(log, &token_contract)? {
+            if transfer.from_address == refund.payer
+                && transfer.to_address == refund.recipient
+                && transfer.amount == refund.amount
+            {
+                matching_transfer = true;
+                break;
+            }
+        }
+    }
+    if !matching_transfer {
+        return Err(AppError::bad_request(
+            "REFUND_TRANSFER_NOT_FOUND",
+            "matching USDT transfer from payout wallet to recipient not found",
+        ));
+    }
+
+    Ok(VerifiedRefund {
+        tx_hash: tx_hash.to_string(),
+        token_contract,
+        contract_address: vault_contract,
+        payout_wallet: refund.payer,
+        to_address: refund.recipient,
+        amount: refund.amount,
+        block_number,
+        confirmations,
+        status: if confirmations >= min_confirmations {
+            "paid".to_string()
+        } else {
+            "confirming".to_string()
+        },
+        processed_at: if confirmations >= min_confirmations {
+            Some(Utc::now())
+        } else {
+            None
+        },
+    })
+}
+
+async fn rpc_call<T: DeserializeOwned>(
+    rpc_url: &str,
+    method: &str,
+    params: serde_json::Value,
+) -> Result<Option<T>, AppError> {
+    let client = reqwest::Client::new();
+    let body = json!({
+        "jsonrpc": "2.0",
+        "id": 1,
+        "method": method,
+        "params": params,
+    });
+    let response = client
+        .post(rpc_url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|err| AppError::bad_request("BSC_RPC_REQUEST_FAILED", err.to_string()))?;
+    let response: RpcResponse<T> = response
+        .json()
+        .await
+        .map_err(|err| AppError::bad_request("BSC_RPC_RESPONSE_INVALID", err.to_string()))?;
+    if let Some(error) = response.error {
+        return Err(AppError::bad_request("BSC_RPC_ERROR", error.message));
+    }
+    Ok(response.result)
+}
+
 async fn submit_order(
     State(state): State<SharedState>,
     headers: HeaderMap,
     Json(req): Json<EventContractOrderRequest>,
 ) -> Result<Json<SubmitOrderResponse>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let stake_usdt = parse_decimal(&req.stake_usdt, "stake_usdt")?;
     validate_event_stake(stake_usdt)?;
     let direction = req.direction.to_uppercase();
@@ -1290,7 +2204,7 @@ async fn submit_execution_report(
     headers: HeaderMap,
     Json(req): Json<ExecutionReportRequest>,
 ) -> Result<Json<ExecutionReportResponse>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let report_id = Uuid::now_v7();
     let stake_usdt = parse_decimal(&req.stake_usdt, "stake_usdt")?;
     let report = ExecutionReportRecord {
@@ -1332,7 +2246,7 @@ async fn settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SettlementRecord>>, AppError> {
-    let user_id = current_user(&state, &headers).await?;
+    let user_id = require_android_user(&state, &headers).await?;
     let rows = state
         .settlements
         .read()
@@ -1342,6 +2256,37 @@ async fn settlements(
         .cloned()
         .collect();
     Ok(Json(rows))
+}
+
+async fn admin_login(
+    State(state): State<SharedState>,
+    Json(req): Json<AdminLoginRequest>,
+) -> Result<Json<AdminLoginResponse>, AppError> {
+    let username = normalize_admin_username(&req.username)?;
+    let admin = if let Some(pool) = state.db.as_ref() {
+        db_admin_account_by_username(pool, &username)
+            .await?
+            .ok_or_else(|| {
+                AppError::unauthorized("ADMIN_INVALID_CREDENTIALS", "invalid admin credentials")
+            })?
+    } else {
+        state
+            .admin_users
+            .read()
+            .await
+            .get(&username)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::unauthorized("ADMIN_INVALID_CREDENTIALS", "invalid admin credentials")
+            })?
+    };
+    if admin.status != "active" || !verify_password(&admin.password_hash, &req.password) {
+        return Err(AppError::unauthorized(
+            "ADMIN_INVALID_CREDENTIALS",
+            "invalid admin credentials",
+        ));
+    }
+    Ok(Json(create_admin_session(&state, &admin).await?))
 }
 
 async fn ws_handler(
@@ -1354,8 +2299,14 @@ async fn ws_handler(
         .access_token
         .or_else(|| bearer_token(&headers))
         .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing access token"))?;
-    let user_id = authenticate_token(&state, &token).await?;
-    Ok(ws.on_upgrade(move |socket| websocket_loop(socket, state, user_id)))
+    let session = authenticate_token(&state, &token).await?;
+    if session.client_type != ClientType::Android {
+        return Err(AppError::forbidden(
+            "CLIENT_TYPE_FORBIDDEN",
+            "only android sessions can connect to signal websocket",
+        ));
+    }
+    Ok(ws.on_upgrade(move |socket| websocket_loop(socket, state, session.user_id)))
 }
 
 async fn websocket_loop(mut socket: WebSocket, state: SharedState, user_id: Uuid) {
@@ -1382,7 +2333,7 @@ async fn admin_overview(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<serde_json::Value>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         let overview = db_admin_overview(pool, state.started_at).await?;
         return Ok(Json(overview));
@@ -1403,8 +2354,7 @@ async fn admin_overview(
         "ready_pages": ready_pages,
         "orders": orders.into_iter().rev().take(20).collect::<Vec<_>>(),
         "reports": reports.into_iter().rev().take(20).collect::<Vec<_>>(),
-        "settlements": settlements.into_iter().rev().take(20).collect::<Vec<_>>(),
-        "admin_token_hint": "set ADMIN_TOKEN in production"
+        "settlements": settlements.into_iter().rev().take(20).collect::<Vec<_>>()
     })))
 }
 
@@ -1413,7 +2363,7 @@ async fn admin_emit_signal(
     headers: HeaderMap,
     Json(req): Json<EmitSignalRequest>,
 ) -> Result<Json<SignalApiResponse>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     let direction = req.direction.to_uppercase();
     if direction != "UP" && direction != "DOWN" && direction != "HOLD" {
         return Err(AppError::bad_request(
@@ -1439,33 +2389,152 @@ async fn admin_emit_signal(
     Ok(Json(signal_api_response(&signal)))
 }
 
+async fn admin_signals(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<SignalApiResponse>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let signals = match state.db.as_ref() {
+        Some(pool) => db_signal_history(pool, 200).await?,
+        None => state.signals.read().await.clone(),
+    };
+    Ok(Json(
+        signals
+            .iter()
+            .rev()
+            .take(200)
+            .map(signal_api_response)
+            .collect(),
+    ))
+}
+
 async fn admin_users(
     State(state): State<SharedState>,
     headers: HeaderMap,
-) -> Result<Json<Vec<UserRecord>>, AppError> {
-    ensure_admin(&headers)?;
+) -> Result<Json<Vec<AdminUserRecord>>, AppError> {
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_admin_users(pool).await?));
     }
-    Ok(Json(state.users.read().await.values().cloned().collect()))
+    Ok(Json(
+        state
+            .users
+            .read()
+            .await
+            .values()
+            .cloned()
+            .map(AdminUserRecord::from)
+            .collect(),
+    ))
 }
 
 async fn admin_orders(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<EventContractOrderRecord>>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_admin_orders(pool).await?));
     }
     Ok(Json(state.orders.read().await.clone()))
 }
 
+async fn admin_deposits(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<DepositRecord>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_deposits(pool).await?));
+    }
+    Ok(Json(state.deposits.read().await.clone()))
+}
+
+async fn admin_withdrawals(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<WithdrawalRecord>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_withdrawals(pool).await?));
+    }
+    Ok(Json(state.withdrawals.read().await.clone()))
+}
+
+async fn admin_confirm_withdrawal(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminConfirmWithdrawalRequest>,
+) -> Result<Json<WithdrawalRecord>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let tx_hash = normalize_tx_hash(&req.tx_hash)?;
+    let withdrawal = if let Some(pool) = state.db.as_ref() {
+        db_withdrawal_by_id(pool, req.withdrawal_id).await?
+    } else {
+        state
+            .withdrawals
+            .read()
+            .await
+            .iter()
+            .find(|row| row.id == req.withdrawal_id)
+            .cloned()
+            .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?
+    };
+    let verified = verify_bsc_refund(&tx_hash, &withdrawal).await?;
+    if let Some(pool) = state.db.as_ref() {
+        db_confirm_withdrawal(pool, req.withdrawal_id, &verified).await?;
+        return Ok(Json(db_withdrawal_by_id(pool, req.withdrawal_id).await?));
+    }
+    confirm_withdrawal_memory(&state, req.withdrawal_id, verified).await?;
+    let row = state
+        .withdrawals
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == req.withdrawal_id)
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    Ok(Json(row))
+}
+
+async fn admin_reject_withdrawal(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<AdminRejectWithdrawalRequest>,
+) -> Result<Json<WithdrawalRecord>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        db_reject_withdrawal(pool, req.withdrawal_id, req.reason).await?;
+        return Ok(Json(db_withdrawal_by_id(pool, req.withdrawal_id).await?));
+    }
+    reject_withdrawal_memory(&state, req.withdrawal_id, req.reason).await?;
+    let row = state
+        .withdrawals
+        .read()
+        .await
+        .iter()
+        .find(|row| row.id == req.withdrawal_id)
+        .cloned()
+        .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    Ok(Json(row))
+}
+
+async fn admin_ledger(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<LedgerEntry>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_admin_ledger(pool).await?));
+    }
+    Ok(Json(state.ledger.read().await.clone()))
+}
+
 async fn admin_reports(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<ExecutionReportRecord>>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_admin_reports(pool).await?));
     }
@@ -1477,7 +2546,7 @@ async fn admin_settle_execution_report(
     headers: HeaderMap,
     Json(req): Json<AdminSettleExecutionReportRequest>,
 ) -> Result<Json<ExecutionReportResponse>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         db_admin_settle_execution_report(pool, req.report_id).await?;
         return Ok(Json(ExecutionReportResponse {
@@ -1520,7 +2589,7 @@ async fn admin_settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SettlementRecord>>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_admin_settlements(pool).await?));
     }
@@ -1531,7 +2600,7 @@ async fn admin_page_states(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<HashMap<Uuid, AutomationPageState>>, AppError> {
-    ensure_admin(&headers)?;
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
         return Ok(Json(db_admin_page_states(pool).await?));
     }
@@ -1579,6 +2648,7 @@ async fn create_session(
     state: &SharedState,
     user_id: Uuid,
     device: &str,
+    client_type: ClientType,
 ) -> Result<AuthResponse, AppError> {
     let access_token = new_token("access");
     let refresh_token = new_token("refresh");
@@ -1588,14 +2658,15 @@ async fn create_session(
         sqlx::query(
             r#"
             insert into auth_sessions
-              (access_token, user_id, device_fingerprint, refresh_token, expires_at)
-            values ($1, $2, $3, $4, $5)
+              (access_token, user_id, device_fingerprint, refresh_token, client_type, expires_at)
+            values ($1, $2, $3, $4, $5, $6)
             "#,
         )
         .bind(&access_token)
         .bind(user_id)
         .bind(device)
         .bind(&refresh_token)
+        .bind(client_type.as_str())
         .bind(expires_at)
         .execute(pool)
         .await
@@ -1607,6 +2678,7 @@ async fn create_session(
             user_id,
             device_fingerprint: device.to_string(),
             refresh_token: refresh_token.clone(),
+            client_type,
             expires_at,
         },
     );
@@ -1617,10 +2689,62 @@ async fn create_session(
     })
 }
 
-async fn current_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, AppError> {
-    let token = bearer_token(headers)
-        .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing bearer token"))?;
-    authenticate_token(state, &token).await
+async fn create_admin_session(
+    state: &SharedState,
+    admin: &AdminAccountRecord,
+) -> Result<AdminLoginResponse, AppError> {
+    let access_token = new_token("admin");
+    let expires_in = 86_400;
+    let expires_at = Utc::now() + Duration::seconds(expires_in);
+    if let Some(pool) = state.db.as_ref() {
+        let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into admin_sessions (access_token, admin_user_id, expires_at)
+            values ($1, $2, $3)
+            "#,
+        )
+        .bind(&access_token)
+        .bind(admin.id)
+        .bind(expires_at)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            update admin_users
+            set last_login_at = $2, updated_at = $2
+            where id = $1
+            "#,
+        )
+        .bind(admin.id)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into admin_audit_logs (id, admin_user_id, action, target_type, target_id)
+            values ($1, $2, 'admin.login', 'admin_user', $3)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(admin.id)
+        .bind(admin.id.to_string())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+    }
+    state
+        .admin_sessions
+        .write()
+        .await
+        .insert(access_token.clone(), AdminSessionRecord { expires_at });
+    Ok(AdminLoginResponse {
+        access_token,
+        expires_in,
+    })
 }
 
 async fn load_user_wallet_address(state: &SharedState, user_id: Uuid) -> Result<String, AppError> {
@@ -1636,7 +2760,40 @@ async fn load_user_wallet_address(state: &SharedState, user_id: Uuid) -> Result<
     ))
 }
 
-async fn authenticate_token(state: &SharedState, token: &str) -> Result<Uuid, AppError> {
+async fn current_session(
+    state: &SharedState,
+    headers: &HeaderMap,
+) -> Result<SessionRecord, AppError> {
+    let token = bearer_token(headers)
+        .ok_or_else(|| AppError::unauthorized("AUTH_MISSING_TOKEN", "missing bearer token"))?;
+    authenticate_token(state, &token).await
+}
+
+async fn require_client(
+    state: &SharedState,
+    headers: &HeaderMap,
+    allowed: &[ClientType],
+) -> Result<Uuid, AppError> {
+    let session = current_session(state, headers).await?;
+    if allowed.contains(&session.client_type) {
+        Ok(session.user_id)
+    } else {
+        Err(AppError::forbidden(
+            "CLIENT_TYPE_FORBIDDEN",
+            "token is not allowed to call this endpoint",
+        ))
+    }
+}
+
+async fn require_dapp_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    require_client(state, headers, &[ClientType::Dapp]).await
+}
+
+async fn require_android_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, AppError> {
+    require_client(state, headers, &[ClientType::Android]).await
+}
+
+async fn authenticate_token(state: &SharedState, token: &str) -> Result<SessionRecord, AppError> {
     let session = match state.sessions.read().await.get(token).cloned() {
         Some(session) => session,
         None => {
@@ -1658,7 +2815,7 @@ async fn authenticate_token(state: &SharedState, token: &str) -> Result<Uuid, Ap
             "token expired",
         ));
     }
-    Ok(session.user_id)
+    Ok(session)
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -1671,28 +2828,40 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn ensure_admin(headers: &HeaderMap) -> Result<(), AppError> {
-    let expected = env::var("ADMIN_TOKEN").map_err(|_| {
-        AppError::internal(
-            "ADMIN_TOKEN_MISSING",
-            "ADMIN_TOKEN must be set before using admin endpoints",
-        )
-    })?;
+async fn ensure_admin(
+    state: &SharedState,
+    headers: &HeaderMap,
+) -> Result<AdminSessionRecord, AppError> {
     let supplied = headers
         .get("x-admin-token")
         .and_then(|value| value.to_str().ok())
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
-        .or_else(|| bearer_token(headers));
-    if supplied.as_deref() == Some(expected.as_str()) {
-        Ok(())
-    } else {
-        Err(AppError::forbidden(
-            "ADMIN_FORBIDDEN",
-            "invalid admin token",
-        ))
+        .or_else(|| bearer_token(headers))
+        .ok_or_else(|| AppError::forbidden("ADMIN_FORBIDDEN", "missing admin token"))?;
+    let session = match state.admin_sessions.read().await.get(&supplied).cloned() {
+        Some(session) => session,
+        None => {
+            if let Some(pool) = state.db.as_ref() {
+                db_admin_session_by_access_token(pool, &supplied)
+                    .await?
+                    .ok_or_else(|| AppError::forbidden("ADMIN_FORBIDDEN", "invalid admin token"))?
+            } else {
+                return Err(AppError::forbidden(
+                    "ADMIN_FORBIDDEN",
+                    "invalid admin token",
+                ));
+            }
+        }
+    };
+    if session.expires_at < Utc::now() {
+        return Err(AppError::unauthorized(
+            "ADMIN_SESSION_EXPIRED",
+            "admin session expired",
+        ));
     }
+    Ok(session)
 }
 
 fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
@@ -1711,6 +2880,26 @@ fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
         ));
     }
     Ok(())
+}
+
+fn normalize_admin_username(username: &str) -> Result<String, AppError> {
+    let username = username.trim();
+    if username.len() < 3 || username.len() > 64 {
+        return Err(AppError::bad_request(
+            "ADMIN_USERNAME_INVALID",
+            "admin username length is invalid",
+        ));
+    }
+    if !username
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '-' || ch == '.')
+    {
+        return Err(AppError::bad_request(
+            "ADMIN_USERNAME_INVALID",
+            "admin username contains invalid characters",
+        ));
+    }
+    Ok(username.to_string())
 }
 
 fn validate_trading_settings(settings: &TradingSettings) -> Result<(), AppError> {
@@ -2317,6 +3506,55 @@ async fn db_user_wallet_address(pool: &PgPool, user_id: Uuid) -> Result<String, 
         .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
 }
 
+async fn db_admin_account_by_username(
+    pool: &PgPool,
+    username: &str,
+) -> Result<Option<AdminAccountRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, password_hash, status
+        from admin_users
+        where username = $1
+        "#,
+    )
+    .bind(username)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(admin_account_from_row))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_session_by_access_token(
+    pool: &PgPool,
+    access_token: &str,
+) -> Result<Option<AdminSessionRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select s.expires_at
+        from admin_sessions s
+        join admin_users u on u.id = s.admin_user_id
+        where s.access_token = $1 and u.status = 'active'
+        "#,
+    )
+    .bind(access_token)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| AdminSessionRecord {
+            expires_at: row.get("expires_at"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+fn admin_account_from_row(row: sqlx::postgres::PgRow) -> AdminAccountRecord {
+    AdminAccountRecord {
+        id: row.get("id"),
+        password_hash: row.get("password_hash"),
+        status: row.get("status"),
+    }
+}
+
 async fn db_enforce_register_rate_limit(pool: &PgPool, account: &str) -> Result<(), AppError> {
     let key = normalize_account(account);
     let now = Utc::now();
@@ -2408,10 +3646,10 @@ async fn db_session_by_token(
 ) -> Result<Option<SessionRecord>, AppError> {
     let sql = match column {
         "access_token" => {
-            "select user_id, device_fingerprint, refresh_token, expires_at from auth_sessions where access_token = $1"
+            "select user_id, device_fingerprint, refresh_token, client_type, expires_at from auth_sessions where access_token = $1"
         }
         "refresh_token" => {
-            "select user_id, device_fingerprint, refresh_token, expires_at from auth_sessions where refresh_token = $1"
+            "select user_id, device_fingerprint, refresh_token, client_type, expires_at from auth_sessions where refresh_token = $1"
         }
         _ => return Ok(None),
     };
@@ -2424,6 +3662,8 @@ async fn db_session_by_token(
                 user_id: row.get("user_id"),
                 device_fingerprint: row.get("device_fingerprint"),
                 refresh_token: row.get("refresh_token"),
+                client_type: client_type_from_str(row.get::<String, _>("client_type").as_str())
+                    .unwrap_or(ClientType::Android),
                 expires_at: row.get("expires_at"),
             })
         })
@@ -2791,8 +4031,10 @@ async fn insert_deposit_tx(
     sqlx::query(
         r#"
         insert into deposits
-          (id, user_id, chain, asset, tx_hash, amount, status, credited_at, created_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+          (id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
+           from_address, to_address, amount, block_number, confirmations, status, credited_at,
+           created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
         on conflict (tx_hash) do nothing
         "#,
     )
@@ -2800,15 +4042,150 @@ async fn insert_deposit_tx(
     .bind(deposit.user_id)
     .bind(&deposit.chain)
     .bind(&deposit.asset)
+    .bind(&deposit.token_contract)
+    .bind(&deposit.contract_address)
+    .bind(&deposit.deposit_id)
     .bind(&deposit.tx_hash)
+    .bind(&deposit.from_address)
+    .bind(&deposit.to_address)
     .bind(deposit.amount)
+    .bind(deposit.block_number)
+    .bind(deposit.confirmations)
     .bind(&deposit.status)
-    .bind(Option::<DateTime<Utc>>::None)
+    .bind(deposit.credited_at)
     .bind(deposit.created_at)
     .execute(&mut **tx)
     .await
     .map(|_| ())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let existing = sqlx::query(
+        r#"
+        select id, user_id, amount, status
+        from deposits
+        where tx_hash = $1
+        for update
+        "#,
+    )
+    .bind(&deposit.tx_hash)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    if let Some(row) = existing {
+        let existing_id: Uuid = row.get("id");
+        let existing_user_id: Uuid = row.get("user_id");
+        let existing_amount: Decimal = row.get("amount");
+        let existing_status: String = row.get("status");
+        if existing_user_id != deposit.user_id || existing_amount != deposit.amount {
+            return Err(AppError::conflict(
+                "DEPOSIT_ALREADY_SUBMITTED",
+                "deposit transaction belongs to a different deposit",
+            ));
+        }
+        sqlx::query(
+            r#"
+            update deposits
+            set confirmations = $2,
+                status = $3,
+                credited_at = coalesce(credited_at, $4),
+                block_number = case when $5 > 0 then $5 else block_number end
+            where tx_hash = $1
+            "#,
+        )
+        .bind(&deposit.tx_hash)
+        .bind(deposit.confirmations)
+        .bind(&deposit.status)
+        .bind(deposit.credited_at)
+        .bind(deposit.block_number)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        if existing_status != "credited" && deposit.status == "credited" {
+            db_apply_deposit_credit_tx(
+                &mut tx,
+                deposit.user_id,
+                existing_id,
+                &deposit.tx_hash,
+                deposit.amount,
+            )
+            .await?;
+        }
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+        return Ok(());
+    }
+
+    insert_deposit_tx(&mut tx, deposit).await?;
+    if deposit.status == "credited" {
+        db_apply_deposit_credit_tx(
+            &mut tx,
+            deposit.user_id,
+            deposit.id,
+            &deposit.tx_hash,
+            deposit.amount,
+        )
+        .await?;
+    }
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
+async fn db_apply_deposit_credit_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    user_id: Uuid,
+    deposit_id: Uuid,
+    tx_hash: &str,
+    amount: Decimal,
+) -> Result<(), AppError> {
+    let balance_row = sqlx::query(
+        r#"
+        select user_id, asset, available, frozen, updated_at
+        from balances
+        where user_id = $1
+        for update
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(&mut **tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let available: Decimal = balance_row.get("available");
+    let frozen: Decimal = balance_row.get("frozen");
+    let after_available = available + amount;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(after_available)
+    .bind(frozen)
+    .bind(now)
+    .execute(&mut **tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    insert_ledger_tx(
+        tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id,
+            asset: "USDT".to_string(),
+            entry_type: "deposit_credit".to_string(),
+            amount,
+            balance_available_after: after_available,
+            balance_frozen_after: frozen,
+            ref_type: "deposit".to_string(),
+            ref_id: deposit_id,
+            idempotency_key: format!("deposit:{tx_hash}"),
+            created_at: now,
+        },
+    )
+    .await
 }
 
 async fn upsert_wallet_binding(
@@ -2868,7 +4245,9 @@ async fn db_deposits_for_user(
 ) -> Result<Vec<DepositRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, user_id, chain, asset, tx_hash, amount, status, created_at
+        select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
+               from_address, to_address, amount, block_number, confirmations, status,
+               credited_at, created_at
         from deposits
         where user_id = $1
         order by created_at desc
@@ -2877,21 +4256,446 @@ async fn db_deposits_for_user(
     .bind(user_id)
     .fetch_all(pool)
     .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| DepositRecord {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                chain: row.get("chain"),
-                asset: row.get("asset"),
-                tx_hash: row.get("tx_hash"),
-                amount: row.get("amount"),
-                status: row.get("status"),
-                created_at: row.get("created_at"),
-            })
-            .collect()
-    })
+    .map(|rows| rows.into_iter().map(deposit_from_row).collect())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_deposits(pool: &PgPool) -> Result<Vec<DepositRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
+               from_address, to_address, amount, block_number, confirmations, status,
+               credited_at, created_at
+        from deposits
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(deposit_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn deposit_from_row(row: sqlx::postgres::PgRow) -> DepositRecord {
+    DepositRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        chain: row.get("chain"),
+        asset: row.get("asset"),
+        token_contract: row.get("token_contract"),
+        contract_address: row.get("contract_address"),
+        deposit_id: row.get("deposit_id"),
+        tx_hash: row.get("tx_hash"),
+        from_address: row.get("from_address"),
+        to_address: row.get("to_address"),
+        amount: row.get("amount"),
+        block_number: row.get("block_number"),
+        confirmations: row.get("confirmations"),
+        status: row.get("status"),
+        credited_at: row.get("credited_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+async fn db_admin_ledger(pool: &PgPool) -> Result<Vec<LedgerEntry>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, asset, entry_type, amount, balance_available_after,
+               balance_frozen_after, ref_type, ref_id, idempotency_key, created_at
+        from ledger_entries
+        order by created_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(ledger_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_confirm_withdrawal(
+    pool: &PgPool,
+    withdrawal_id: Uuid,
+    verified: &VerifiedRefund,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let row = sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, tx_hash, refund_id,
+               payout_wallet, to_address, amount, block_number, confirmations, status,
+               requested_at, processed_at, rejected_at, reject_reason
+        from withdrawals
+        where id = $1
+        for update
+        "#,
+    )
+    .bind(withdrawal_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    let mut withdrawal = withdrawal_from_row(row);
+    if withdrawal.status != "pending_review" && withdrawal.status != "confirming" {
+        return Err(AppError::conflict(
+            "WITHDRAWAL_STATUS_INVALID",
+            "only pending or confirming withdrawals can be confirmed",
+        ));
+    }
+    withdrawal.tx_hash = Some(verified.tx_hash.clone());
+    withdrawal.token_contract = verified.token_contract.clone();
+    withdrawal.contract_address = verified.contract_address.clone();
+    withdrawal.payout_wallet = Some(verified.payout_wallet.clone());
+    withdrawal.to_address = verified.to_address.clone();
+    withdrawal.amount = verified.amount;
+    withdrawal.block_number = Some(verified.block_number);
+    withdrawal.confirmations = verified.confirmations;
+    withdrawal.status = verified.status.clone();
+    withdrawal.processed_at = verified.processed_at;
+    sqlx::query(
+        r#"
+        update withdrawals
+        set tx_hash = $2, token_contract = $3, contract_address = $4, payout_wallet = $5,
+            to_address = $6, amount = $7, block_number = $8, confirmations = $9,
+            status = $10, processed_at = $11
+        where id = $1
+        "#,
+    )
+    .bind(withdrawal.id)
+    .bind(&withdrawal.tx_hash)
+    .bind(&withdrawal.token_contract)
+    .bind(&withdrawal.contract_address)
+    .bind(&withdrawal.payout_wallet)
+    .bind(&withdrawal.to_address)
+    .bind(withdrawal.amount)
+    .bind(withdrawal.block_number)
+    .bind(withdrawal.confirmations)
+    .bind(&withdrawal.status)
+    .bind(withdrawal.processed_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    if withdrawal.status == "paid" {
+        let balance_row = sqlx::query(
+            r#"
+            select available, frozen
+            from balances
+            where user_id = $1
+            for update
+            "#,
+        )
+        .bind(withdrawal.user_id)
+        .fetch_one(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        let available: Decimal = balance_row.get("available");
+        let mut frozen: Decimal = balance_row.get("frozen");
+        let release = withdrawal.amount.min(frozen);
+        frozen -= release;
+        sqlx::query(
+            r#"
+            update balances
+            set available = $2, frozen = $3, updated_at = $4
+            where user_id = $1
+            "#,
+        )
+        .bind(withdrawal.user_id)
+        .bind(available)
+        .bind(frozen)
+        .bind(Utc::now())
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        insert_ledger_tx(
+            &mut tx,
+            LedgerEntry {
+                id: Uuid::now_v7(),
+                user_id: withdrawal.user_id,
+                asset: "USDT".to_string(),
+                entry_type: "withdrawal_paid".to_string(),
+                amount: -withdrawal.amount,
+                balance_available_after: available,
+                balance_frozen_after: frozen,
+                ref_type: "withdrawal".to_string(),
+                ref_id: withdrawal.id,
+                idempotency_key: format!("withdrawal_paid:{}", withdrawal.id),
+                created_at: Utc::now(),
+            },
+        )
+        .await?;
+    }
+
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
+async fn db_reject_withdrawal(
+    pool: &PgPool,
+    withdrawal_id: Uuid,
+    reason: Option<String>,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let row = sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, tx_hash, refund_id,
+               payout_wallet, to_address, amount, block_number, confirmations, status,
+               requested_at, processed_at, rejected_at, reject_reason
+        from withdrawals
+        where id = $1
+        for update
+        "#,
+    )
+    .bind(withdrawal_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))?;
+    let mut withdrawal = withdrawal_from_row(row);
+    if withdrawal.status != "pending_review" && withdrawal.status != "confirming" {
+        return Err(AppError::conflict(
+            "WITHDRAWAL_STATUS_INVALID",
+            "only pending or confirming withdrawals can be rejected",
+        ));
+    }
+    withdrawal.status = "rejected".to_string();
+    withdrawal.rejected_at = Some(Utc::now());
+    withdrawal.reject_reason = reason;
+    sqlx::query(
+        r#"
+        update withdrawals
+        set status = 'rejected', rejected_at = $2, reject_reason = $3
+        where id = $1
+        "#,
+    )
+    .bind(withdrawal.id)
+    .bind(withdrawal.rejected_at)
+    .bind(&withdrawal.reject_reason)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let balance_row = sqlx::query(
+        r#"
+        select available, frozen
+        from balances
+        where user_id = $1
+        for update
+        "#,
+    )
+    .bind(withdrawal.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let mut available: Decimal = balance_row.get("available");
+    let mut frozen: Decimal = balance_row.get("frozen");
+    let release = withdrawal.amount.min(frozen);
+    frozen -= release;
+    available += release;
+    sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        "#,
+    )
+    .bind(withdrawal.user_id)
+    .bind(available)
+    .bind(frozen)
+    .bind(Utc::now())
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    insert_ledger_tx(
+        &mut tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: withdrawal.user_id,
+            asset: "USDT".to_string(),
+            entry_type: "withdrawal_rejected".to_string(),
+            amount: withdrawal.amount,
+            balance_available_after: available,
+            balance_frozen_after: frozen,
+            ref_type: "withdrawal".to_string(),
+            ref_id: withdrawal.id,
+            idempotency_key: format!("withdrawal_rejected:{}", withdrawal.id),
+            created_at: Utc::now(),
+        },
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
+async fn db_create_withdrawal(
+    pool: &PgPool,
+    withdrawal: &WithdrawalRecord,
+) -> Result<(), AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let balance_row = sqlx::query(
+        r#"
+        select available, frozen
+        from balances
+        where user_id = $1
+        for update
+        "#,
+    )
+    .bind(withdrawal.user_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    let available: Decimal = balance_row.get("available");
+    let frozen: Decimal = balance_row.get("frozen");
+    if available < withdrawal.amount {
+        return Err(AppError::bad_request(
+            "BALANCE_INSUFFICIENT",
+            "available balance is below withdrawal amount",
+        ));
+    }
+    sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        "#,
+    )
+    .bind(withdrawal.user_id)
+    .bind(available - withdrawal.amount)
+    .bind(frozen + withdrawal.amount)
+    .bind(withdrawal.requested_at)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    insert_ledger_tx(
+        &mut tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: withdrawal.user_id,
+            asset: "USDT".to_string(),
+            entry_type: "withdrawal_reserve".to_string(),
+            amount: -withdrawal.amount,
+            balance_available_after: available - withdrawal.amount,
+            balance_frozen_after: frozen + withdrawal.amount,
+            ref_type: "withdrawal".to_string(),
+            ref_id: withdrawal.id,
+            idempotency_key: format!("withdrawal_reserve:{}", withdrawal.id),
+            created_at: withdrawal.requested_at,
+        },
+    )
+    .await?;
+    sqlx::query(
+        r#"
+        insert into withdrawals
+          (id, user_id, chain, asset, token_contract, contract_address, tx_hash, refund_id,
+           payout_wallet, to_address, amount, block_number, confirmations, status,
+           requested_at, processed_at, rejected_at, reject_reason)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        on conflict (refund_id) do nothing
+        "#,
+    )
+    .bind(withdrawal.id)
+    .bind(withdrawal.user_id)
+    .bind(&withdrawal.chain)
+    .bind(&withdrawal.asset)
+    .bind(&withdrawal.token_contract)
+    .bind(&withdrawal.contract_address)
+    .bind(&withdrawal.tx_hash)
+    .bind(&withdrawal.refund_id)
+    .bind(&withdrawal.payout_wallet)
+    .bind(&withdrawal.to_address)
+    .bind(withdrawal.amount)
+    .bind(withdrawal.block_number)
+    .bind(withdrawal.confirmations)
+    .bind(&withdrawal.status)
+    .bind(withdrawal.requested_at)
+    .bind(withdrawal.processed_at)
+    .bind(withdrawal.rejected_at)
+    .bind(&withdrawal.reject_reason)
+    .execute(&mut *tx)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)
+}
+
+async fn db_withdrawals_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<WithdrawalRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, tx_hash,
+               refund_id, payout_wallet, to_address, amount, block_number, confirmations,
+               status, requested_at, processed_at, rejected_at, reject_reason
+        from withdrawals
+        where user_id = $1
+        order by requested_at desc
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(withdrawal_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_withdrawals(pool: &PgPool) -> Result<Vec<WithdrawalRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, tx_hash,
+               refund_id, payout_wallet, to_address, amount, block_number, confirmations,
+               status, requested_at, processed_at, rejected_at, reject_reason
+        from withdrawals
+        order by requested_at desc
+        limit 200
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(withdrawal_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_withdrawal_by_id(
+    pool: &PgPool,
+    withdrawal_id: Uuid,
+) -> Result<WithdrawalRecord, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, tx_hash,
+               refund_id, payout_wallet, to_address, amount, block_number, confirmations,
+               status, requested_at, processed_at, rejected_at, reject_reason
+        from withdrawals
+        where id = $1
+        "#,
+    )
+    .bind(withdrawal_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .map(withdrawal_from_row)
+    .ok_or_else(|| AppError::bad_request("WITHDRAWAL_NOT_FOUND", "withdrawal not found"))
+}
+
+fn withdrawal_from_row(row: sqlx::postgres::PgRow) -> WithdrawalRecord {
+    WithdrawalRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        chain: row.get("chain"),
+        asset: row.get("asset"),
+        token_contract: row.get("token_contract"),
+        contract_address: row.get("contract_address"),
+        tx_hash: row.get("tx_hash"),
+        refund_id: row.get("refund_id"),
+        payout_wallet: row.get("payout_wallet"),
+        to_address: row.get("to_address"),
+        amount: row.get("amount"),
+        block_number: row.get("block_number"),
+        confirmations: row.get("confirmations"),
+        status: row.get("status"),
+        requested_at: row.get("requested_at"),
+        processed_at: row.get("processed_at"),
+        rejected_at: row.get("rejected_at"),
+        reject_reason: row.get("reject_reason"),
+    }
 }
 
 async fn db_reserve_signal_fee(
@@ -3379,8 +5183,7 @@ async fn db_admin_overview(
         "ready_pages": ready_pages,
         "orders": orders.into_iter().take(20).collect::<Vec<_>>(),
         "reports": reports.into_iter().take(20).collect::<Vec<_>>(),
-        "settlements": settlements.into_iter().take(20).collect::<Vec<_>>(),
-        "admin_token_hint": "set ADMIN_TOKEN in production"
+        "settlements": settlements.into_iter().take(20).collect::<Vec<_>>()
     }))
 }
 
@@ -3459,7 +5262,7 @@ async fn db_ready_pages(pool: &PgPool) -> Result<i64, AppError> {
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_admin_users(pool: &PgPool) -> Result<Vec<UserRecord>, AppError> {
+async fn db_admin_users(pool: &PgPool) -> Result<Vec<AdminUserRecord>, AppError> {
     sqlx::query(
         r#"
         select id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at
@@ -3470,7 +5273,12 @@ async fn db_admin_users(pool: &PgPool) -> Result<Vec<UserRecord>, AppError> {
     )
     .fetch_all(pool)
     .await
-    .map(|rows| rows.into_iter().map(user_from_row).collect())
+    .map(|rows| {
+        rows.into_iter()
+            .map(user_from_row)
+            .map(AdminUserRecord::from)
+            .collect()
+    })
     .map_err(AppError::from_sqlx)
 }
 
@@ -3670,6 +5478,30 @@ fn account_from_auth(req: &AuthRequest) -> Result<String, AppError> {
     normalize_wallet_address(&req.wallet_address)
 }
 
+fn client_type_from_auth(req: &AuthRequest) -> Result<ClientType, AppError> {
+    match req
+        .client_type
+        .as_deref()
+        .map(str::trim)
+        .unwrap_or("android")
+    {
+        "android" => Ok(ClientType::Android),
+        "dapp" => Ok(ClientType::Dapp),
+        _ => Err(AppError::bad_request(
+            "CLIENT_TYPE_INVALID",
+            "client_type must be android or dapp",
+        )),
+    }
+}
+
+fn client_type_from_str(value: &str) -> Option<ClientType> {
+    match value.trim() {
+        "android" => Some(ClientType::Android),
+        "dapp" => Some(ClientType::Dapp),
+        _ => None,
+    }
+}
+
 fn normalize_account(account: &str) -> String {
     account.trim().to_ascii_lowercase()
 }
@@ -3697,6 +5529,146 @@ fn normalize_wallet_address(address: &str) -> Result<String, AppError> {
         ));
     }
     Ok(normalized)
+}
+
+fn normalize_tx_hash(tx_hash: &str) -> Result<String, AppError> {
+    let normalized = normalize_account(tx_hash);
+    if normalized.len() != 66 || !normalized.starts_with("0x") {
+        return Err(AppError::bad_request(
+            "TX_HASH_INVALID",
+            "tx_hash must be a 0x-prefixed 32-byte hash",
+        ));
+    }
+    if !normalized[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "TX_HASH_INVALID",
+            "tx_hash contains invalid characters",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn bsc_usdt_contract() -> String {
+    env::var("BSC_USDT_CONTRACT").unwrap_or_else(|_| DEFAULT_BSC_USDT_CONTRACT.to_string())
+}
+
+fn bsc_rpc_url() -> Result<String, AppError> {
+    env::var("BSC_RPC_URL").map_err(|_| {
+        AppError::bad_request(
+            "BSC_RPC_URL_MISSING",
+            "BSC_RPC_URL must be set before BSC transaction verification",
+        )
+    })
+}
+
+fn bsc_vault_contract() -> Result<String, AppError> {
+    normalize_wallet_address(&env::var("BSC_VAULT_CONTRACT").map_err(|_| {
+        AppError::bad_request(
+            "BSC_VAULT_CONTRACT_MISSING",
+            "BSC_VAULT_CONTRACT must be set before contract deposit or refund verification",
+        )
+    })?)
+}
+
+fn bsc_settlement_wallet() -> Result<String, AppError> {
+    normalize_wallet_address(&env::var("BSC_SETTLEMENT_WALLET").map_err(|_| {
+        AppError::bad_request(
+            "BSC_SETTLEMENT_WALLET_MISSING",
+            "BSC_SETTLEMENT_WALLET must be set",
+        )
+    })?)
+}
+
+fn deposit_min_confirmations() -> i32 {
+    env::var("BSC_MIN_CONFIRMATIONS")
+        .ok()
+        .and_then(|value| value.parse::<i32>().ok())
+        .filter(|value| *value >= 0)
+        .unwrap_or(15)
+}
+
+fn hex_to_i64(value: &str) -> Result<i64, AppError> {
+    i64::from_str_radix(value.trim_start_matches("0x"), 16)
+        .map_err(|_| AppError::bad_request("HEX_INVALID", "invalid hex number"))
+}
+
+fn topic_to_address(topic: &str) -> Result<String, AppError> {
+    let topic = topic.trim_start_matches("0x");
+    if topic.len() != 64 || !topic.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "DEPOSIT_LOG_INVALID",
+            "invalid transfer topic",
+        ));
+    }
+    normalize_wallet_address(&format!("0x{}", &topic[24..]))
+}
+
+fn normalize_topic(topic: &str) -> Result<String, AppError> {
+    let normalized = normalize_account(topic);
+    if normalized.len() != 66 || !normalized.starts_with("0x") {
+        return Err(AppError::bad_request(
+            "EVENT_TOPIC_INVALID",
+            "event topic must be a 0x-prefixed 32-byte value",
+        ));
+    }
+    if !normalized[2..].chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "EVENT_TOPIC_INVALID",
+            "event topic contains invalid characters",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn abi_data_words(data: &str) -> Result<Vec<String>, AppError> {
+    let data = data.trim_start_matches("0x");
+    if !data.len().is_multiple_of(64) || !data.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "EVENT_DATA_INVALID",
+            "event data is not valid ABI encoded data",
+        ));
+    }
+    Ok(data
+        .as_bytes()
+        .chunks(64)
+        .map(|chunk| String::from_utf8_lossy(chunk).to_string())
+        .collect())
+}
+
+fn word_to_address(word: &str) -> Result<String, AppError> {
+    if word.len() != 64 || !word.chars().all(|ch| ch.is_ascii_hexdigit()) {
+        return Err(AppError::bad_request(
+            "EVENT_DATA_INVALID",
+            "address word is invalid",
+        ));
+    }
+    normalize_wallet_address(&format!("0x{}", &word[24..]))
+}
+
+fn account_id_topic(user_id: Uuid) -> String {
+    format!("0x{:0>64}", hex::encode(user_id.as_bytes()))
+}
+
+fn new_bytes32_id() -> String {
+    format!("0x{:0>64}", hex::encode(Uuid::now_v7().as_bytes()))
+}
+
+fn bytes32_from_uuid(id: Uuid) -> String {
+    format!("0x{:0>64}", hex::encode(id.as_bytes()))
+}
+
+fn u256_to_decimal(value: U256, decimals: u32) -> Result<Decimal, AppError> {
+    let text = value.to_string();
+    let decimals = decimals as usize;
+    let decimal_text = if text.len() <= decimals {
+        format!("0.{:0>width$}", text, width = decimals)
+    } else {
+        let split = text.len() - decimals;
+        format!("{}.{}", &text[..split], &text[split..])
+    };
+    Decimal::from_str(decimal_text.trim_end_matches('0').trim_end_matches('.')).map_err(|_| {
+        AppError::bad_request("DEPOSIT_AMOUNT_INVALID", "transfer amount is too large")
+    })
 }
 
 fn recover_wallet_address(message: &str, signature: &str) -> Result<String, AppError> {

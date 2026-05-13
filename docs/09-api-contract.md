@@ -82,7 +82,10 @@ Response:
   "chain": "bsc",
   "asset": "USDT",
   "token_contract": "0x55d398326f99059fF775485246999027B3197955",
-  "platform_receiver": "0x...",
+  "vault_contract": "0x...",
+  "settlement_wallet": "0x...",
+  "account_id": "0x...",
+  "deposit_id": "0x...",
   "bound_wallet": "0x...",
   "min_amount": "10.0"
 }
@@ -93,11 +96,34 @@ Response:
 ```json
 {
   "tx_hash": "0x...",
-  "amount": "10"
+  "amount": "10",
+  "deposit_id": "0x..."
 }
 ```
 
-The DApp should first ask the wallet to send a BSC USDT contract transfer to `platform_receiver`, then submit the returned transaction hash. The submitted amount is only an expected amount for review; backend crediting must verify the actual chain transfer event.
+The DApp must ask the wallet to approve USDT for `vault_contract`, then call `EventSignalVault.deposit(account_id, deposit_id, amount)`. The backend calls `BSC_RPC_URL`, verifies `DepositReceived`, validates the matching USDT `Transfer`, checks amount and confirmations, then credits balance and ledger only when status is `credited`.
+
+Response:
+
+```json
+{
+  "id": "018f...",
+  "chain": "bsc",
+  "asset": "USDT",
+  "token_contract": "0x55d398326f99059ff775485246999027b3197955",
+  "contract_address": "0x...",
+  "deposit_id": "0x...",
+  "tx_hash": "0x...",
+  "from_address": "0x...",
+  "to_address": "0x...",
+  "amount": "10.00000000",
+  "block_number": 123,
+  "confirmations": 15,
+  "status": "credited",
+  "credited_at": "2026-05-13T00:00:00Z",
+  "created_at": "2026-05-13T00:00:00Z"
+}
+```
 
 ### GET /v1/deposits
 
@@ -345,6 +371,30 @@ Response:
   "status": "pending_review"
 }
 ```
+
+## Admin
+
+Admin endpoints use a separate administrator login. User wallet credentials cannot access the admin console.
+
+### POST /v1/admin/login
+
+```json
+{
+  "username": "admin",
+  "password": "admin-password"
+}
+```
+
+Response:
+
+```json
+{
+  "access_token": "admin-token",
+  "expires_in": 86400
+}
+```
+
+Use the returned token as `x-admin-token` on admin-only endpoints.
 
 ### POST /v1/admin/execution-reports/settle
 

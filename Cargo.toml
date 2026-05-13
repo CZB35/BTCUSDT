@@ -11,6 +11,7 @@ axum = { version = "0.7", features = ["ws"] }
 base64 = "0.22"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
 ethers-core = "2"
 futures-util = "0.3"
 hex = "0.4"

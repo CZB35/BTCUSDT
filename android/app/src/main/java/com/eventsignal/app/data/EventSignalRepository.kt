@@ -40,11 +40,7 @@ class EventSignalRepository(context: Context) {
     fun login(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         api.login(walletAddress, password, deviceFingerprint)
 
-    fun baseUrl(): String = api.baseUrl
+    fun dappUrl(): String = "${api.baseUrl}/dapp/?return_uri=eventsignal://wallet"
 
     fun accessToken(): String? = api.accessToken
-
-    fun saveConnection(baseUrl: String, accessToken: String) {
-        api.saveConnection(baseUrl, accessToken)
-    }
 }

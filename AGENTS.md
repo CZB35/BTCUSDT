@@ -26,4 +26,4 @@ Use concise imperative commits such as `Add settlement persistence` or Conventio
 
 ## Security & Configuration Tips
 
-Do not commit secrets, database URLs, private keys, JWT secrets, admin tokens, or generated state files. Service mode reads `DATABASE_URL`, `ADMIN_TOKEN`, `CORS_ALLOWED_ORIGINS`, `JWT_SECRET`, `APP_ENCRYPTION_KEY`, and optionally `BSC_RPC_URL`; keep local values in your shell or an ignored environment file. Treat Binance, BSC, wallet, and accounting changes as high-risk and document assumptions in `docs/` when behavior changes.
+Do not commit secrets, database URLs, private keys, JWT secrets, or generated state files. Service mode reads `DATABASE_URL`, `CORS_ALLOWED_ORIGINS`, `JWT_SECRET`, `APP_ENCRYPTION_KEY`, and BSC verification variables such as `BSC_RPC_URL`. Admin users and sessions live in database tables. The admin frontend reads `VITE_API_BASE_URL`; Android reads `EVENT_SIGNAL_API_BASE_URL` at build time. Keep local values in your shell or ignored environment files. Treat Binance, BSC, wallet, and accounting changes as high-risk and document assumptions in `docs/` when behavior changes.
