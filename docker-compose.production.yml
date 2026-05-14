@@ -4,6 +4,8 @@ services:
       context: .
       args:
         VITE_API_BASE_URL: ${PUBLIC_API_BASE_URL:-}
+        VITE_REOWN_PROJECT_ID: ${VITE_REOWN_PROJECT_ID:-}
+        VITE_BSC_VAULT_CONTRACT: ${BSC_VAULT_CONTRACT:-}
     image: event-signal-api:production
     restart: unless-stopped
     env_file:

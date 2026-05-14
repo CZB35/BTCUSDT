@@ -44,6 +44,10 @@ const DEFAULT_SYMBOL: &str = "BTCUSDT";
 const DEFAULT_PERIOD_SECONDS: i32 = 600;
 const DEFAULT_PAYOUT_RATIO: Decimal = dec!(0.80);
 const PROFIT_SHARE_RATE: Decimal = dec!(0.30);
+const DEPOSIT_FEE_RATE: Decimal = dec!(0.25);
+const FIRST_DEPOSIT_MIN_AMOUNT: Decimal = dec!(100);
+const DIRECT_REFERRAL_RATE: Decimal = dec!(0.09);
+const INDIRECT_REFERRAL_RATE: Decimal = dec!(0.03);
 const DEFAULT_STAKE_PERCENT: Decimal = dec!(0.05);
 const MIN_EVENT_STAKE: Decimal = dec!(5);
 const MAX_EVENT_STAKE: Decimal = dec!(250);
@@ -191,12 +195,15 @@ fn router(state: SharedState) -> Router {
         .route("/v1/exchange/binance", post(save_binance_credentials))
         .route("/v1/balance", get(balance))
         .route("/v1/ledger", get(ledger))
+        .route("/v1/referrals/summary", get(referral_summary))
         .route("/v1/deposits/instructions", get(deposit_instructions))
         .route("/v1/deposits/submit-tx", post(submit_deposit_tx))
         .route("/v1/deposits", get(deposits))
         .route("/v1/withdrawals", get(withdrawals).post(create_withdrawal))
         .route("/v1/event-contract-orders", post(submit_order))
+        .route("/v1/event-contract-orders", get(event_contract_orders))
         .route("/v1/execution-reports", post(submit_execution_report))
+        .route("/v1/execution-reports", get(execution_reports))
         .route("/v1/settlements", get(settlements))
         .route("/v1/ws", get(ws_handler))
         .route("/v1/admin/login", post(admin_login))
@@ -371,6 +378,9 @@ struct AppState {
     admin_users: RwLock<HashMap<String, AdminAccountRecord>>,
     admin_sessions: RwLock<HashMap<String, AdminSessionRecord>>,
     user_by_wallet: RwLock<HashMap<String, Uuid>>,
+    referral_codes: RwLock<HashMap<String, Uuid>>,
+    referral_links: RwLock<HashMap<Uuid, ReferralLinkRecord>>,
+    referral_rewards: RwLock<Vec<ReferralRewardRecord>>,
     wallet_nonces: RwLock<HashMap<Uuid, WalletBindChallenge>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
     rate_limits: RwLock<HashMap<String, RegisterRateLimit>>,
@@ -400,6 +410,9 @@ impl AppState {
             admin_users: RwLock::new(HashMap::new()),
             admin_sessions: RwLock::new(HashMap::new()),
             user_by_wallet: RwLock::new(HashMap::new()),
+            referral_codes: RwLock::new(HashMap::new()),
+            referral_links: RwLock::new(HashMap::new()),
+            referral_rewards: RwLock::new(Vec::new()),
             wallet_nonces: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
@@ -557,6 +570,10 @@ struct PlatformTradingSettings {
     stake_percent: Decimal,
     min_stake_usdt: Decimal,
     max_single_stake_usdt: Decimal,
+    first_deposit_min_usdt: Decimal,
+    deposit_fee_rate: Decimal,
+    direct_referral_rate: Decimal,
+    indirect_referral_rate: Decimal,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -566,6 +583,10 @@ impl Default for PlatformTradingSettings {
             stake_percent: DEFAULT_STAKE_PERCENT,
             min_stake_usdt: MIN_EVENT_STAKE,
             max_single_stake_usdt: MAX_EVENT_STAKE,
+            first_deposit_min_usdt: FIRST_DEPOSIT_MIN_AMOUNT,
+            deposit_fee_rate: DEPOSIT_FEE_RATE,
+            direct_referral_rate: DIRECT_REFERRAL_RATE,
+            indirect_referral_rate: INDIRECT_REFERRAL_RATE,
             updated_at: None,
         }
     }
@@ -731,6 +752,30 @@ struct LedgerEntry {
 }
 
 #[derive(Clone, Serialize)]
+struct ReferralLinkRecord {
+    user_id: Uuid,
+    parent_user_id: Option<Uuid>,
+    grandparent_user_id: Option<Uuid>,
+    referral_code: String,
+    invited_by_code: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct ReferralRewardRecord {
+    id: Uuid,
+    settlement_id: Uuid,
+    source_user_id: Uuid,
+    recipient_user_id: Uuid,
+    level: i32,
+    rate: Decimal,
+    base_profit: Decimal,
+    amount: Decimal,
+    status: String,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
 struct DepositRecord {
     id: Uuid,
     user_id: Uuid,
@@ -743,6 +788,8 @@ struct DepositRecord {
     from_address: String,
     to_address: String,
     amount: Decimal,
+    credited_amount: Decimal,
+    platform_fee: Decimal,
     block_number: i64,
     confirmations: i32,
     status: String,
@@ -991,6 +1038,7 @@ struct AuthRequest {
     password: String,
     device_fingerprint: String,
     client_type: Option<String>,
+    referral_code: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1252,6 +1300,13 @@ async fn register(
 
     let now = Utc::now();
     let user_id = Uuid::now_v7();
+    let referral_code = referral_code_for_user(user_id);
+    let invited_by_code = req
+        .referral_code
+        .as_deref()
+        .map(normalize_referral_code)
+        .transpose()?
+        .filter(|code| !code.is_empty());
     let user = UserRecord {
         id: user_id,
         wallet_address: account.clone(),
@@ -1263,6 +1318,14 @@ async fn register(
     };
 
     if let Some(pool) = state.db.as_ref() {
+        let (parent_user_id, grandparent_user_id) =
+            db_referral_parents_for_code(pool, invited_by_code.as_deref()).await?;
+        if parent_user_id == Some(user_id) {
+            return Err(AppError::bad_request(
+                "REFERRAL_SELF_INVALID",
+                "referral code cannot belong to the registering user",
+            ));
+        }
         let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
         sqlx::query(
             r#"
@@ -1324,11 +1387,45 @@ async fn register(
         .execute(&mut *tx)
         .await
         .map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            insert into referral_links
+              (user_id, parent_user_id, grandparent_user_id, referral_code, invited_by_code, created_at)
+            values ($1, $2, $3, $4, $5, $6)
+            "#,
+        )
+        .bind(user_id)
+        .bind(parent_user_id)
+        .bind(grandparent_user_id)
+        .bind(&referral_code)
+        .bind(&invited_by_code)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
         tx.commit().await.map_err(AppError::from_sqlx)?;
     }
 
     state.users.write().await.insert(user_id, user);
     state.user_by_wallet.write().await.insert(account, user_id);
+    let (parent_user_id, grandparent_user_id) =
+        memory_referral_parents_for_code(&state, invited_by_code.as_deref()).await;
+    state
+        .referral_codes
+        .write()
+        .await
+        .insert(referral_code.clone(), user_id);
+    state.referral_links.write().await.insert(
+        user_id,
+        ReferralLinkRecord {
+            user_id,
+            parent_user_id,
+            grandparent_user_id,
+            referral_code,
+            invited_by_code,
+            created_at: now,
+        },
+    );
     state
         .automation_settings
         .write()
@@ -1937,6 +2034,7 @@ async fn deposit_instructions(
             .get(&user_id)
             .map(|user| user.wallet_address.clone())
     };
+    let platform_settings = load_platform_settings(&state).await;
     Ok(Json(json!({
         "chain": "bsc",
         "asset": "USDT",
@@ -1946,7 +2044,10 @@ async fn deposit_instructions(
         "account_id": account_id_topic(user_id),
         "deposit_id": new_bytes32_id(),
         "bound_wallet": bound_wallet,
-        "min_amount": money(MIN_DEPOSIT_AMOUNT)
+        "min_amount": money(MIN_DEPOSIT_AMOUNT),
+        "first_deposit_min_amount": money(platform_settings.first_deposit_min_usdt),
+        "deposit_fee_rate": decimal(platform_settings.deposit_fee_rate),
+        "credited_rate": decimal(Decimal::ONE - platform_settings.deposit_fee_rate)
     })))
 }
 
@@ -1956,6 +2057,8 @@ async fn submit_deposit_tx(
     Json(req): Json<DepositTxRequest>,
 ) -> Result<Json<DepositRecord>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
+    let platform_settings = load_platform_settings(&state).await;
+    let has_credited_deposit = user_has_credited_deposit(&state, user_id).await?;
     let expected_amount = req
         .amount
         .as_deref()
@@ -1973,6 +2076,17 @@ async fn submit_deposit_tx(
     )
     .await?;
     let now = Utc::now();
+    if !has_credited_deposit && verified.amount < platform_settings.first_deposit_min_usdt {
+        return Err(AppError::bad_request(
+            "FIRST_DEPOSIT_TOO_SMALL",
+            format!(
+                "first deposit must be at least {} USDT to activate the account",
+                money(platform_settings.first_deposit_min_usdt)
+            ),
+        ));
+    }
+    let platform_fee = verified.amount * platform_settings.deposit_fee_rate;
+    let credited_amount = verified.amount - platform_fee;
     let deposit = DepositRecord {
         id: Uuid::now_v7(),
         user_id,
@@ -1985,6 +2099,8 @@ async fn submit_deposit_tx(
         from_address: verified.from_address,
         to_address: verified.to_address,
         amount: verified.amount,
+        credited_amount,
+        platform_fee,
         block_number: verified.block_number,
         confirmations: verified.confirmations,
         status: verified.status,
@@ -1997,6 +2113,25 @@ async fn submit_deposit_tx(
         credit_deposit_memory(&state, &deposit).await?;
     }
     Ok(Json(deposit))
+}
+
+async fn user_has_credited_deposit(state: &SharedState, user_id: Uuid) -> Result<bool, AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        return sqlx::query(
+            "select 1 from deposits where user_id = $1 and status = 'credited' limit 1",
+        )
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.is_some())
+        .map_err(AppError::from_sqlx);
+    }
+    Ok(state
+        .deposits
+        .read()
+        .await
+        .iter()
+        .any(|deposit| deposit.user_id == user_id && deposit.status == "credited"))
 }
 
 async fn deposits(
@@ -2013,6 +2148,90 @@ async fn deposits(
         .await
         .iter()
         .filter(|deposit| deposit.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn referral_summary(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_referral_summary(pool, user_id).await?));
+    }
+    let link = state.referral_links.read().await.get(&user_id).cloned();
+    let rewards = state
+        .referral_rewards
+        .read()
+        .await
+        .iter()
+        .filter(|reward| reward.recipient_user_id == user_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    let direct_count = state
+        .referral_links
+        .read()
+        .await
+        .values()
+        .filter(|row| row.parent_user_id == Some(user_id))
+        .count();
+    let indirect_count = state
+        .referral_links
+        .read()
+        .await
+        .values()
+        .filter(|row| row.grandparent_user_id == Some(user_id))
+        .count();
+    let total_reward = rewards
+        .iter()
+        .fold(Decimal::ZERO, |total, reward| total + reward.amount);
+    Ok(Json(json!({
+        "referral_code": link.as_ref().map(|row| row.referral_code.clone()).unwrap_or_else(|| referral_code_for_user(user_id)),
+        "invited_by_code": link.as_ref().and_then(|row| row.invited_by_code.clone()),
+        "direct_count": direct_count,
+        "indirect_count": indirect_count,
+        "direct_rate": decimal(DIRECT_REFERRAL_RATE),
+        "indirect_rate": decimal(INDIRECT_REFERRAL_RATE),
+        "total_reward": money(total_reward),
+        "rewards": rewards,
+    })))
+}
+
+async fn event_contract_orders(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<EventContractOrderRecord>>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_orders_for_user(pool, user_id).await?));
+    }
+    let rows = state
+        .orders
+        .read()
+        .await
+        .iter()
+        .filter(|order| order.user_id == user_id)
+        .cloned()
+        .collect();
+    Ok(Json(rows))
+}
+
+async fn execution_reports(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ExecutionReportRecord>>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_reports_for_user(pool, user_id).await?));
+    }
+    let rows = state
+        .reports
+        .read()
+        .await
+        .iter()
+        .filter(|report| report.user_id == user_id)
         .cloned()
         .collect();
     Ok(Json(rows))
@@ -2120,7 +2339,7 @@ async fn credit_deposit_memory(
         .get_mut(&deposit.user_id)
         .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
     if deposit.status == "credited" {
-        balance.available += deposit.amount;
+        balance.available += deposit.credited_amount;
         balance.updated_at = Utc::now();
     }
     let balance_after = balance.clone();
@@ -2133,7 +2352,7 @@ async fn credit_deposit_memory(
             user_id: deposit.user_id,
             asset: "USDT".to_string(),
             entry_type: "deposit_credit".to_string(),
-            amount: deposit.amount,
+            amount: deposit.credited_amount,
             balance_available_after: balance_after.available,
             balance_frozen_after: balance_after.frozen,
             ref_type: "deposit".to_string(),
@@ -3134,7 +3353,10 @@ async fn settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<SettlementRecord>>, AppError> {
-    let user_id = require_android_user(&state, &headers).await?;
+    let user_id = require_dapp_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_settlements_for_user(pool, user_id).await?));
+    }
     let rows = state
         .settlements
         .read()
@@ -3823,6 +4045,9 @@ fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
             "device fingerprint is required",
         ));
     }
+    if let Some(code) = req.referral_code.as_deref() {
+        normalize_referral_code(code)?;
+    }
     Ok(())
 }
 
@@ -3864,6 +4089,24 @@ fn validate_platform_trading_settings(settings: &PlatformTradingSettings) -> Res
             "PLATFORM_SETTING_OUT_OF_RANGE",
             "max_single_stake_usdt must be between 5 and 250",
         ));
+    }
+    if settings.first_deposit_min_usdt < MIN_DEPOSIT_AMOUNT {
+        return Err(AppError::bad_request(
+            "PLATFORM_SETTING_OUT_OF_RANGE",
+            "first_deposit_min_usdt must be at least the deposit minimum",
+        ));
+    }
+    for (name, value) in [
+        ("deposit_fee_rate", settings.deposit_fee_rate),
+        ("direct_referral_rate", settings.direct_referral_rate),
+        ("indirect_referral_rate", settings.indirect_referral_rate),
+    ] {
+        if value < Decimal::ZERO || value > dec!(0.50) {
+            return Err(AppError::bad_request(
+                "PLATFORM_SETTING_OUT_OF_RANGE",
+                format!("{name} must be between 0 and 0.50"),
+            ));
+        }
     }
     if settings.min_stake_usdt > settings.max_single_stake_usdt {
         return Err(AppError::bad_request(
@@ -3931,6 +4174,15 @@ async fn load_trading_settings(state: &SharedState, user_id: Uuid) -> TradingSet
         .get(&user_id)
         .cloned()
         .unwrap_or_default()
+}
+
+async fn load_platform_settings(state: &SharedState) -> PlatformTradingSettings {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(settings) = db_load_platform_trading_settings(pool).await {
+            return settings;
+        }
+    }
+    PlatformTradingSettings::default()
 }
 
 async fn load_balance(state: &SharedState, user_id: Uuid) -> BalanceRecord {
@@ -4641,6 +4893,82 @@ async fn settle_execution_report(
         idempotency_key: format!("settlement:{}", report.id),
         created_at: Utc::now(),
     });
+    if result == "WIN" && gross_profit > Decimal::ZERO {
+        let settings = load_platform_settings(state).await;
+        apply_referral_rewards_memory(&state, &settlement, gross_profit, &settings).await?;
+    }
+    Ok(())
+}
+
+async fn apply_referral_rewards_memory(
+    state: &SharedState,
+    settlement: &SettlementRecord,
+    base_profit: Decimal,
+    settings: &PlatformTradingSettings,
+) -> Result<(), AppError> {
+    let link = state
+        .referral_links
+        .read()
+        .await
+        .get(&settlement.user_id)
+        .cloned();
+    let Some(link) = link else {
+        return Ok(());
+    };
+    let recipients = [
+        (link.parent_user_id, 1, settings.direct_referral_rate),
+        (link.grandparent_user_id, 2, settings.indirect_referral_rate),
+    ];
+    for (recipient_user_id, level, rate) in recipients {
+        let Some(recipient_user_id) = recipient_user_id else {
+            continue;
+        };
+        if recipient_user_id == settlement.user_id {
+            continue;
+        }
+        let amount = base_profit * rate;
+        if amount <= Decimal::ZERO {
+            continue;
+        }
+        let reward = ReferralRewardRecord {
+            id: Uuid::now_v7(),
+            settlement_id: settlement.id,
+            source_user_id: settlement.user_id,
+            recipient_user_id,
+            level,
+            rate,
+            base_profit,
+            amount,
+            status: "credited".to_string(),
+            created_at: settlement.created_at,
+        };
+        let mut balances = state.balances.write().await;
+        let balance = balances
+            .get_mut(&recipient_user_id)
+            .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+        balance.available += amount;
+        balance.updated_at = settlement.created_at;
+        let balance_after = balance.clone();
+        drop(balances);
+        state.referral_rewards.write().await.push(reward.clone());
+        state.ledger.write().await.push(LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: recipient_user_id,
+            asset: "USDT".to_string(),
+            entry_type: if level == 1 {
+                "direct_referral_reward".to_string()
+            } else {
+                "indirect_referral_reward".to_string()
+            },
+            amount,
+            balance_available_after: balance_after.available,
+            balance_frozen_after: balance_after.frozen,
+            ref_type: "referral_reward".to_string(),
+            ref_id: reward.id,
+            idempotency_key: format!("referral:{}:{}:{}", settlement.id, recipient_user_id, level),
+            created_at: settlement.created_at,
+        });
+    }
     Ok(())
 }
 
@@ -4865,7 +5193,9 @@ async fn db_load_platform_trading_settings(
 ) -> Result<PlatformTradingSettings, AppError> {
     sqlx::query(
         r#"
-        select stake_percent, min_stake_usdt, max_single_stake_usdt, updated_at
+        select stake_percent, min_stake_usdt, max_single_stake_usdt,
+               first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
+               indirect_referral_rate, updated_at
         from platform_trading_settings
         where id = true
         "#,
@@ -4877,6 +5207,40 @@ async fn db_load_platform_trading_settings(
             stake_percent: row.get("stake_percent"),
             min_stake_usdt: row.get("min_stake_usdt"),
             max_single_stake_usdt: row.get("max_single_stake_usdt"),
+            first_deposit_min_usdt: row.get("first_deposit_min_usdt"),
+            deposit_fee_rate: row.get("deposit_fee_rate"),
+            direct_referral_rate: row.get("direct_referral_rate"),
+            indirect_referral_rate: row.get("indirect_referral_rate"),
+            updated_at: Some(row.get("updated_at")),
+        })
+        .unwrap_or_default()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_platform_settings_tx(
+    tx: &mut Transaction<'_, Postgres>,
+) -> Result<PlatformTradingSettings, AppError> {
+    sqlx::query(
+        r#"
+        select stake_percent, min_stake_usdt, max_single_stake_usdt,
+               first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
+               indirect_referral_rate, updated_at
+        from platform_trading_settings
+        where id = true
+        "#,
+    )
+    .fetch_optional(&mut **tx)
+    .await
+    .map(|row| {
+        row.map(|row| PlatformTradingSettings {
+            stake_percent: row.get("stake_percent"),
+            min_stake_usdt: row.get("min_stake_usdt"),
+            max_single_stake_usdt: row.get("max_single_stake_usdt"),
+            first_deposit_min_usdt: row.get("first_deposit_min_usdt"),
+            deposit_fee_rate: row.get("deposit_fee_rate"),
+            direct_referral_rate: row.get("direct_referral_rate"),
+            indirect_referral_rate: row.get("indirect_referral_rate"),
             updated_at: Some(row.get("updated_at")),
         })
         .unwrap_or_default()
@@ -4891,18 +5255,28 @@ async fn db_save_platform_trading_settings(
     sqlx::query(
         r#"
         insert into platform_trading_settings
-          (id, stake_percent, min_stake_usdt, max_single_stake_usdt, updated_at)
-        values (true, $1, $2, $3, $4)
+          (id, stake_percent, min_stake_usdt, max_single_stake_usdt,
+           first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
+           indirect_referral_rate, updated_at)
+        values (true, $1, $2, $3, $4, $5, $6, $7, $8)
         on conflict (id) do update set
           stake_percent = excluded.stake_percent,
           min_stake_usdt = excluded.min_stake_usdt,
           max_single_stake_usdt = excluded.max_single_stake_usdt,
+          first_deposit_min_usdt = excluded.first_deposit_min_usdt,
+          deposit_fee_rate = excluded.deposit_fee_rate,
+          direct_referral_rate = excluded.direct_referral_rate,
+          indirect_referral_rate = excluded.indirect_referral_rate,
           updated_at = excluded.updated_at
         "#,
     )
     .bind(settings.stake_percent)
     .bind(settings.min_stake_usdt)
     .bind(settings.max_single_stake_usdt)
+    .bind(settings.first_deposit_min_usdt)
+    .bind(settings.deposit_fee_rate)
+    .bind(settings.direct_referral_rate)
+    .bind(settings.indirect_referral_rate)
     .bind(Utc::now())
     .execute(pool)
     .await
@@ -5546,9 +5920,9 @@ async fn insert_deposit_tx(
         r#"
         insert into deposits
           (id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
-           from_address, to_address, amount, block_number, confirmations, status, credited_at,
-           created_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+           from_address, to_address, amount, credited_amount, platform_fee, block_number,
+           confirmations, status, credited_at, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
         on conflict (tx_hash) do nothing
         "#,
     )
@@ -5563,6 +5937,8 @@ async fn insert_deposit_tx(
     .bind(&deposit.from_address)
     .bind(&deposit.to_address)
     .bind(deposit.amount)
+    .bind(deposit.credited_amount)
+    .bind(deposit.platform_fee)
     .bind(deposit.block_number)
     .bind(deposit.confirmations)
     .bind(&deposit.status)
@@ -5606,7 +5982,9 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
             set confirmations = $2,
                 status = $3,
                 credited_at = coalesce(credited_at, $4),
-                block_number = case when $5 > 0 then $5 else block_number end
+                block_number = case when $5 > 0 then $5 else block_number end,
+                credited_amount = $6,
+                platform_fee = $7
             where tx_hash = $1
             "#,
         )
@@ -5615,18 +5993,13 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
         .bind(&deposit.status)
         .bind(deposit.credited_at)
         .bind(deposit.block_number)
+        .bind(deposit.credited_amount)
+        .bind(deposit.platform_fee)
         .execute(&mut *tx)
         .await
         .map_err(AppError::from_sqlx)?;
         if existing_status != "credited" && deposit.status == "credited" {
-            db_apply_deposit_credit_tx(
-                &mut tx,
-                deposit.user_id,
-                existing_id,
-                &deposit.tx_hash,
-                deposit.amount,
-            )
-            .await?;
+            db_apply_deposit_credit_tx(&mut tx, deposit, existing_id).await?;
         }
         tx.commit().await.map_err(AppError::from_sqlx)?;
         return Ok(());
@@ -5634,24 +6007,15 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
 
     insert_deposit_tx(&mut tx, deposit).await?;
     if deposit.status == "credited" {
-        db_apply_deposit_credit_tx(
-            &mut tx,
-            deposit.user_id,
-            deposit.id,
-            &deposit.tx_hash,
-            deposit.amount,
-        )
-        .await?;
+        db_apply_deposit_credit_tx(&mut tx, deposit, deposit.id).await?;
     }
     tx.commit().await.map_err(AppError::from_sqlx)
 }
 
 async fn db_apply_deposit_credit_tx(
     tx: &mut Transaction<'_, Postgres>,
-    user_id: Uuid,
+    deposit: &DepositRecord,
     deposit_id: Uuid,
-    tx_hash: &str,
-    amount: Decimal,
 ) -> Result<(), AppError> {
     let balance_row = sqlx::query(
         r#"
@@ -5661,13 +6025,13 @@ async fn db_apply_deposit_credit_tx(
         for update
         "#,
     )
-    .bind(user_id)
+    .bind(deposit.user_id)
     .fetch_one(&mut **tx)
     .await
     .map_err(AppError::from_sqlx)?;
     let available: Decimal = balance_row.get("available");
     let frozen: Decimal = balance_row.get("frozen");
-    let after_available = available + amount;
+    let after_available = available + deposit.credited_amount;
     let now = Utc::now();
     sqlx::query(
         r#"
@@ -5676,7 +6040,7 @@ async fn db_apply_deposit_credit_tx(
         where user_id = $1
         "#,
     )
-    .bind(user_id)
+    .bind(deposit.user_id)
     .bind(after_available)
     .bind(frozen)
     .bind(now)
@@ -5687,15 +6051,15 @@ async fn db_apply_deposit_credit_tx(
         tx,
         LedgerEntry {
             id: Uuid::now_v7(),
-            user_id,
+            user_id: deposit.user_id,
             asset: "USDT".to_string(),
             entry_type: "deposit_credit".to_string(),
-            amount,
+            amount: deposit.credited_amount,
             balance_available_after: after_available,
             balance_frozen_after: frozen,
             ref_type: "deposit".to_string(),
             ref_id: deposit_id,
-            idempotency_key: format!("deposit:{tx_hash}"),
+            idempotency_key: format!("deposit:{}", deposit.tx_hash),
             created_at: now,
         },
     )
@@ -5753,6 +6117,145 @@ async fn db_bound_wallet(
     .map_err(AppError::from_sqlx)
 }
 
+async fn db_referral_parents_for_code(
+    pool: &PgPool,
+    invited_by_code: Option<&str>,
+) -> Result<(Option<Uuid>, Option<Uuid>), AppError> {
+    let Some(code) = invited_by_code else {
+        return Ok((None, None));
+    };
+    let code = normalize_referral_code(code)?;
+    if code.is_empty() {
+        return Ok((None, None));
+    }
+    let parent = sqlx::query(
+        r#"
+        select user_id, parent_user_id
+        from referral_links
+        where referral_code = $1
+        "#,
+    )
+    .bind(&code)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .ok_or_else(|| AppError::bad_request("REFERRAL_CODE_NOT_FOUND", "referral code not found"))?;
+    Ok((parent.get("user_id"), parent.get("parent_user_id")))
+}
+
+async fn memory_referral_parents_for_code(
+    state: &SharedState,
+    invited_by_code: Option<&str>,
+) -> (Option<Uuid>, Option<Uuid>) {
+    let Some(code) = invited_by_code else {
+        return (None, None);
+    };
+    let Ok(code) = normalize_referral_code(code) else {
+        return (None, None);
+    };
+    let parent_user_id = state.referral_codes.read().await.get(&code).cloned();
+    let grandparent_user_id = match parent_user_id {
+        Some(parent_id) => state
+            .referral_links
+            .read()
+            .await
+            .get(&parent_id)
+            .and_then(|link| link.parent_user_id),
+        None => None,
+    };
+    (parent_user_id, grandparent_user_id)
+}
+
+async fn db_referral_summary(pool: &PgPool, user_id: Uuid) -> Result<serde_json::Value, AppError> {
+    let link = sqlx::query(
+        r#"
+        select user_id, parent_user_id, grandparent_user_id, referral_code, invited_by_code, created_at
+        from referral_links
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .map(referral_link_from_row);
+    let direct_count: i64 =
+        sqlx::query("select count(*) as count from referral_links where parent_user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .map(|row| row.get("count"))
+            .map_err(AppError::from_sqlx)?;
+    let indirect_count: i64 =
+        sqlx::query("select count(*) as count from referral_links where grandparent_user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .map(|row| row.get("count"))
+            .map_err(AppError::from_sqlx)?;
+    let rewards = db_referral_rewards_for_user(pool, user_id).await?;
+    let total_reward = rewards
+        .iter()
+        .fold(Decimal::ZERO, |total, reward| total + reward.amount);
+    Ok(json!({
+        "referral_code": link.as_ref().map(|row| row.referral_code.clone()).unwrap_or_else(|| referral_code_for_user(user_id)),
+        "invited_by_code": link.as_ref().and_then(|row| row.invited_by_code.clone()),
+        "direct_count": direct_count,
+        "indirect_count": indirect_count,
+        "direct_rate": decimal(DIRECT_REFERRAL_RATE),
+        "indirect_rate": decimal(INDIRECT_REFERRAL_RATE),
+        "total_reward": money(total_reward),
+        "rewards": rewards,
+    }))
+}
+
+async fn db_referral_rewards_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<ReferralRewardRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, settlement_id, source_user_id, recipient_user_id, level,
+               rate, base_profit, amount, status, created_at
+        from referral_rewards
+        where recipient_user_id = $1
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(referral_reward_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn referral_link_from_row(row: sqlx::postgres::PgRow) -> ReferralLinkRecord {
+    ReferralLinkRecord {
+        user_id: row.get("user_id"),
+        parent_user_id: row.get("parent_user_id"),
+        grandparent_user_id: row.get("grandparent_user_id"),
+        referral_code: row.get("referral_code"),
+        invited_by_code: row.get("invited_by_code"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn referral_reward_from_row(row: sqlx::postgres::PgRow) -> ReferralRewardRecord {
+    ReferralRewardRecord {
+        id: row.get("id"),
+        settlement_id: row.get("settlement_id"),
+        source_user_id: row.get("source_user_id"),
+        recipient_user_id: row.get("recipient_user_id"),
+        level: row.get("level"),
+        rate: row.get("rate"),
+        base_profit: row.get("base_profit"),
+        amount: row.get("amount"),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+    }
+}
+
 async fn db_deposits_for_user(
     pool: &PgPool,
     user_id: Uuid,
@@ -5760,8 +6263,8 @@ async fn db_deposits_for_user(
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
-               from_address, to_address, amount, block_number, confirmations, status,
-               credited_at, created_at
+               from_address, to_address, amount, credited_amount, platform_fee, block_number,
+               confirmations, status, credited_at, created_at
         from deposits
         where user_id = $1
         order by created_at desc
@@ -5778,8 +6281,8 @@ async fn db_admin_deposits(pool: &PgPool) -> Result<Vec<DepositRecord>, AppError
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
-               from_address, to_address, amount, block_number, confirmations, status,
-               credited_at, created_at
+               from_address, to_address, amount, credited_amount, platform_fee, block_number,
+               confirmations, status, credited_at, created_at
         from deposits
         order by created_at desc
         limit 200
@@ -5804,6 +6307,8 @@ fn deposit_from_row(row: sqlx::postgres::PgRow) -> DepositRecord {
         from_address: row.get("from_address"),
         to_address: row.get("to_address"),
         amount: row.get("amount"),
+        credited_amount: row.get("credited_amount"),
+        platform_fee: row.get("platform_fee"),
         block_number: row.get("block_number"),
         confirmations: row.get("confirmations"),
         status: row.get("status"),
@@ -6835,6 +7340,48 @@ async fn db_insert_exchange_execution_report_and_settle(
     payout_event: Option<&BinanceIncomeEventRecord>,
 ) -> Result<bool, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let existing = sqlx::query(
+        r#"
+        select id, report_status
+        from execution_reports
+        where user_id = $1 and client_report_id = $2
+        "#,
+    )
+    .bind(report.user_id)
+    .bind(&report.client_report_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    if let Some(existing) = existing {
+        let existing_report_id: Uuid = existing.get("id");
+        let status: String = existing.get("report_status");
+        if status != "settled" {
+            let report_row = sqlx::query(
+                r#"
+                select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
+                       period_seconds, direction, stake_usdt, entry_price, expiry_price,
+                       payout_ratio, gross_profit, result, automation_profile,
+                       automation_confidence, action_trace_id, report_status, reported_at, created_at
+                from execution_reports
+                where id = $1
+                for update
+                "#,
+            )
+            .bind(existing_report_id)
+            .fetch_one(&mut *tx)
+            .await
+            .map_err(AppError::from_sqlx)?;
+            let existing_report = execution_report_from_row(report_row);
+            db_settle_execution_report_tx(&mut tx, &existing_report).await?;
+            sqlx::query("update execution_reports set report_status = 'settled' where id = $1")
+                .bind(existing_report.id)
+                .execute(&mut *tx)
+                .await
+                .map_err(AppError::from_sqlx)?;
+        }
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+        return Ok(false);
+    }
     let payout_event_id = match payout_event {
         Some(event) => Some(db_upsert_income_event(&mut tx, event).await?),
         None => None,
@@ -7121,6 +7668,126 @@ async fn db_settle_execution_report_tx(
         },
     )
     .await?;
+    if result == "WIN" && gross_profit > Decimal::ZERO {
+        let settings = db_platform_settings_tx(tx).await?;
+        db_apply_referral_rewards_tx(tx, &settlement, gross_profit, &settings).await?;
+    }
+    Ok(())
+}
+
+async fn db_apply_referral_rewards_tx(
+    tx: &mut Transaction<'_, Postgres>,
+    settlement: &SettlementRecord,
+    base_profit: Decimal,
+    settings: &PlatformTradingSettings,
+) -> Result<(), AppError> {
+    let link = sqlx::query(
+        r#"
+        select parent_user_id, grandparent_user_id
+        from referral_links
+        where user_id = $1
+        "#,
+    )
+    .bind(settlement.user_id)
+    .fetch_optional(&mut **tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let Some(link) = link else {
+        return Ok(());
+    };
+    let direct: Option<Uuid> = link.get("parent_user_id");
+    let indirect: Option<Uuid> = link.get("grandparent_user_id");
+    let recipients = [
+        (direct, 1, settings.direct_referral_rate),
+        (indirect, 2, settings.indirect_referral_rate),
+    ];
+    for (recipient_user_id, level, rate) in recipients {
+        let Some(recipient_user_id) = recipient_user_id else {
+            continue;
+        };
+        if recipient_user_id == settlement.user_id {
+            continue;
+        }
+        let amount = base_profit * rate;
+        if amount <= Decimal::ZERO {
+            continue;
+        }
+        let reward_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            insert into referral_rewards
+              (id, settlement_id, source_user_id, recipient_user_id, level, rate,
+               base_profit, amount, status, created_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, 'credited', $9)
+            on conflict (settlement_id, recipient_user_id, level) do nothing
+            "#,
+        )
+        .bind(reward_id)
+        .bind(settlement.id)
+        .bind(settlement.user_id)
+        .bind(recipient_user_id)
+        .bind(level)
+        .bind(rate)
+        .bind(base_profit)
+        .bind(amount)
+        .bind(settlement.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+
+        let balance_row = sqlx::query(
+            r#"
+            select available, frozen
+            from balances
+            where user_id = $1
+            for update
+            "#,
+        )
+        .bind(recipient_user_id)
+        .fetch_one(&mut **tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        let after_available: Decimal = balance_row.get::<Decimal, _>("available") + amount;
+        let frozen: Decimal = balance_row.get("frozen");
+        sqlx::query(
+            r#"
+            update balances
+            set available = $2, frozen = $3, updated_at = $4
+            where user_id = $1
+            "#,
+        )
+        .bind(recipient_user_id)
+        .bind(after_available)
+        .bind(frozen)
+        .bind(settlement.created_at)
+        .execute(&mut **tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        insert_ledger_tx(
+            tx,
+            LedgerEntry {
+                id: Uuid::now_v7(),
+                user_id: recipient_user_id,
+                asset: "USDT".to_string(),
+                entry_type: if level == 1 {
+                    "direct_referral_reward".to_string()
+                } else {
+                    "indirect_referral_reward".to_string()
+                },
+                amount,
+                balance_available_after: after_available,
+                balance_frozen_after: frozen,
+                ref_type: "referral_reward".to_string(),
+                ref_id: reward_id,
+                idempotency_key: format!(
+                    "referral:{}:{}:{}",
+                    settlement.id, recipient_user_id, level
+                ),
+                created_at: settlement.created_at,
+            },
+        )
+        .await?;
+    }
     Ok(())
 }
 
@@ -7253,30 +7920,53 @@ async fn db_admin_orders(pool: &PgPool) -> Result<Vec<EventContractOrderRecord>,
     )
     .fetch_all(pool)
     .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| EventContractOrderRecord {
-                id: row.get("id"),
-                user_id: row.get("user_id"),
-                reservation_id: row.get("reservation_id"),
-                signal_id: row.get("signal_ref"),
-                client_order_id: row.get("client_order_id"),
-                source: row.get("source"),
-                symbol: row.get("symbol"),
-                period_seconds: row.get("period_seconds"),
-                direction: row.get("direction"),
-                stake_usdt: row.get("stake_usdt"),
-                automation_profile: row.get("automation_profile"),
-                automation_confidence: row.get("automation_confidence"),
-                action_trace_id: row.get("action_trace_id"),
-                raw_audit: row.get("raw_audit"),
-                order_status: row.get("order_status"),
-                reported_at: row.get("reported_at"),
-                created_at: row.get("created_at"),
-            })
-            .collect()
-    })
+    .map(|rows| rows.into_iter().map(order_from_row).collect())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_orders_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
+               period_seconds, direction, stake_usdt, automation_profile,
+               automation_confidence, action_trace_id, raw_audit, order_status,
+               reported_at, created_at
+        from event_contract_orders
+        where user_id = $1
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(order_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn order_from_row(row: sqlx::postgres::PgRow) -> EventContractOrderRecord {
+    EventContractOrderRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        reservation_id: row.get("reservation_id"),
+        signal_id: row.get("signal_ref"),
+        client_order_id: row.get("client_order_id"),
+        source: row.get("source"),
+        symbol: row.get("symbol"),
+        period_seconds: row.get("period_seconds"),
+        direction: row.get("direction"),
+        stake_usdt: row.get("stake_usdt"),
+        automation_profile: row.get("automation_profile"),
+        automation_confidence: row.get("automation_confidence"),
+        action_trace_id: row.get("action_trace_id"),
+        raw_audit: row.get("raw_audit"),
+        order_status: row.get("order_status"),
+        reported_at: row.get("reported_at"),
+        created_at: row.get("created_at"),
+    }
 }
 
 async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, AppError> {
@@ -7291,6 +7981,29 @@ async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, A
         limit 200
         "#,
     )
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(execution_report_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_reports_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<ExecutionReportRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
+               period_seconds, direction, stake_usdt, entry_price, expiry_price,
+               payout_ratio, gross_profit, result, automation_profile,
+               automation_confidence, action_trace_id, report_status, reported_at, created_at
+        from execution_reports
+        where user_id = $1
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(user_id)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(execution_report_from_row).collect())
@@ -7334,22 +8047,43 @@ async fn db_admin_settlements(pool: &PgPool) -> Result<Vec<SettlementRecord>, Ap
     )
     .fetch_all(pool)
     .await
-    .map(|rows| {
-        rows.into_iter()
-            .map(|row| SettlementRecord {
-                id: row.get("id"),
-                execution_report_id: row.get("execution_report_id"),
-                user_id: row.get("user_id"),
-                gross_profit: row.get("gross_profit"),
-                profit_share_fee: row.get("profit_share_fee"),
-                loss_rebate: row.get("loss_rebate"),
-                user_net_profit: row.get("user_net_profit"),
-                status: row.get("status"),
-                created_at: row.get("created_at"),
-            })
-            .collect()
-    })
+    .map(|rows| rows.into_iter().map(settlement_from_row).collect())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_settlements_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Vec<SettlementRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, execution_report_id, user_id, gross_profit, profit_share_fee,
+               loss_rebate, user_net_profit, status, created_at
+        from settlements
+        where user_id = $1
+        order by created_at desc
+        limit 100
+        "#,
+    )
+    .bind(user_id)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(settlement_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+fn settlement_from_row(row: sqlx::postgres::PgRow) -> SettlementRecord {
+    SettlementRecord {
+        id: row.get("id"),
+        execution_report_id: row.get("execution_report_id"),
+        user_id: row.get("user_id"),
+        gross_profit: row.get("gross_profit"),
+        profit_share_fee: row.get("profit_share_fee"),
+        loss_rebate: row.get("loss_rebate"),
+        user_net_profit: row.get("user_net_profit"),
+        status: row.get("status"),
+        created_at: row.get("created_at"),
+    }
 }
 
 async fn db_admin_page_states(
@@ -7461,6 +8195,33 @@ fn client_type_from_str(value: &str) -> Option<ClientType> {
 
 fn normalize_account(account: &str) -> String {
     account.trim().to_ascii_lowercase()
+}
+
+fn normalize_referral_code(code: &str) -> Result<String, AppError> {
+    let normalized = code.trim().to_ascii_uppercase();
+    if normalized.is_empty() {
+        return Ok(String::new());
+    }
+    if normalized.len() < 6 || normalized.len() > 24 {
+        return Err(AppError::bad_request(
+            "REFERRAL_CODE_INVALID",
+            "referral code length must be between 6 and 24",
+        ));
+    }
+    if !normalized
+        .chars()
+        .all(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit())
+    {
+        return Err(AppError::bad_request(
+            "REFERRAL_CODE_INVALID",
+            "referral code must contain only letters and digits",
+        ));
+    }
+    Ok(normalized)
+}
+
+fn referral_code_for_user(user_id: Uuid) -> String {
+    format!("ES{}", &user_id.simple().to_string()[..10]).to_ascii_uppercase()
 }
 
 fn normalize_chain(chain: Option<&str>) -> String {

@@ -1,5 +1,5 @@
 import { StrictMode, useEffect, useState } from "react";
-import type { FormEvent, ReactNode } from "react";
+import type { FormEvent, MouseEvent, ReactNode } from "react";
 import { createRoot } from "react-dom/client";
 import {
   Activity,
@@ -19,6 +19,7 @@ import {
   Users,
   Zap
 } from "lucide-react";
+import { BrowserProvider, Contract, parseUnits } from "ethers";
 import "./styles.css";
 
 type AdminView =
@@ -125,6 +126,8 @@ type DepositRecord = {
   from_address: string;
   to_address: string;
   amount: string;
+  credited_amount: string;
+  platform_fee: string;
   block_number: number;
   confirmations: number;
   status: string;
@@ -183,6 +186,10 @@ type PlatformTradingSettings = {
   stake_percent: string;
   min_stake_usdt: string;
   max_single_stake_usdt: string;
+  first_deposit_min_usdt: string;
+  deposit_fee_rate: string;
+  direct_referral_rate: string;
+  indirect_referral_rate: string;
   updated_at?: string | null;
 };
 
@@ -201,9 +208,19 @@ type ExchangeWorkerSlot = {
   created_at: string;
 };
 
+type TableRow = {
+  id: string;
+  cells: ReactNode[];
+  details?: Record<string, ReactNode>;
+};
+
 const TOKEN_KEY = "event_signal_admin_token";
 const ADMIN_USER_KEY = "event_signal_admin_user";
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
+const BSC_USDT = "0x55d398326f99059fF775485246999027B3197955";
+const BSC_VAULT = (import.meta.env.VITE_BSC_VAULT_CONTRACT || "").trim();
+const erc20Abi = ["function approve(address spender,uint256 value) external returns (bool)"];
+const vaultAbi = ["function payRefund(address recipient,uint256 amount,bytes32 refundId) external"];
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || "");
@@ -229,7 +246,11 @@ function App() {
   const [tradingSettings, setTradingSettings] = useState<PlatformTradingSettings>({
     stake_percent: "0.05",
     min_stake_usdt: "5",
-    max_single_stake_usdt: "250"
+    max_single_stake_usdt: "250",
+    first_deposit_min_usdt: "100",
+    deposit_fee_rate: "0.25",
+    direct_referral_rate: "0.09",
+    indirect_referral_rate: "0.03"
   });
   const [direction, setDirection] = useState<"UP" | "DOWN">("DOWN");
   const [confidence, setConfidence] = useState("1");
@@ -456,6 +477,41 @@ function App() {
     setStatus("鎻愮幇宸插鐞?");
   }
 
+  async function payWithdrawalOnChain(withdrawal: WithdrawalRecord) {
+    if (!window.ethereum) {
+      setStatus("未检测到钱包");
+      return;
+    }
+    if (!BSC_VAULT) {
+      setStatus("缺少 BSC_VAULT_CONTRACT");
+      return;
+    }
+    const provider = new BrowserProvider(window.ethereum);
+    await provider.send("wallet_switchEthereumChain", [{ chainId: "0x38" }]);
+    const signer = await provider.getSigner();
+    const usdt = new Contract(BSC_USDT, erc20Abi, signer);
+    const vault = new Contract(BSC_VAULT, vaultAbi, signer);
+    const value = parseUnits(withdrawal.amount, 18);
+    setStatus("正在授权退款");
+    await (await usdt.approve(BSC_VAULT, value)).wait();
+    setStatus("正在执行退款");
+    const tx = await vault.payRefund(withdrawal.to_address, value, withdrawal.refund_id);
+    setStatus(`退款已发送 ${tx.hash.slice(0, 10)}...`);
+    await tx.wait();
+    setStatus("链上确认完成，正在回写后台");
+    const res = await fetch(`${API_BASE}/v1/admin/withdrawals/confirm`, {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify({ withdrawal_id: withdrawal.id, tx_hash: tx.hash })
+    });
+    if (!res.ok) {
+      setStatus(`后台确认失败 ${res.status}`);
+      return;
+    }
+    await loadAll();
+    setStatus("退款已确认");
+  }
+
   async function rejectWithdrawal(withdrawalId: string) {
     const reason = window.prompt("请输入驳回原因（可留空）") ?? "";
     setStatus("姝ｅ湪椹辨帀鎻愮幇");
@@ -603,7 +659,14 @@ function App() {
         )}
         {view === "users" && <UsersPage users={users} pageStates={pageStates} />}
         {view === "deposits" && <DepositsPage deposits={deposits} ledger={ledger} />}
-        {view === "withdrawals" && <WithdrawalsPage withdrawals={withdrawals} onConfirm={confirmWithdrawal} onReject={rejectWithdrawal} />}
+        {view === "withdrawals" && (
+          <WithdrawalsPage
+            withdrawals={withdrawals}
+            onConfirm={confirmWithdrawal}
+            onReject={rejectWithdrawal}
+            onChain={(row) => payWithdrawalOnChain(row).catch((err) => setStatus(String(err)))}
+          />
+        )}
         {view === "orders" && <OrdersPage orders={orders} reports={reports} onSettle={settleReport} />}
         {view === "settlements" && <SettlementsPage settlements={settlements} />}
       </main>
@@ -720,17 +783,32 @@ function SignalsPage({
             <p>展示最近 200 条后台信号。</p>
           </div>
         </div>
-        <Table
+        <DataTable
           columns={["时间", "交易对", "方向", "金额", "置信度", "预扣", "状态"]}
-          rows={signals.map((signal) => [
-            shortTime(signal.cycle_end),
-            signal.symbol,
-            <ToneText tone={directionTone(signal.direction)}>{labelDirection(signal.direction)}</ToneText>,
-            `${signal.suggested_stake || "-"} USDT`,
-            percent(signal.confidence),
-            `${signal.fee_reserve_usdt || "-"} USDT`,
-            signal.authorization_status || "-"
-          ])}
+          rows={signals.map((signal) => ({
+            id: signal.id,
+            cells: [
+              shortTime(signal.cycle_end),
+              signal.symbol,
+              <ToneText tone={directionTone(signal.direction)}>{labelDirection(signal.direction)}</ToneText>,
+              `${signal.suggested_stake || "-"} USDT`,
+              percent(signal.confidence),
+              `${signal.fee_reserve_usdt || "-"} USDT`,
+              signal.authorization_status || "-"
+            ],
+            details: {
+              信号ID: signal.signal_id || signal.id,
+              交易对: signal.symbol,
+              方向: labelDirection(signal.direction),
+              建议金额: `${signal.suggested_stake || "-"} USDT`,
+              预扣金额: `${signal.fee_reserve_usdt || "-"} USDT`,
+              置信度: percent(signal.confidence),
+              授权状态: signal.authorization_status || "-",
+              是否授权: yesNo(Boolean(signal.trade_authorized)),
+              模型版本: signal.model_version || "-",
+              周期结束: shortTime(signal.cycle_end)
+            }
+          }))}
         />
       </section>
     </>
@@ -788,6 +866,42 @@ function SettingsPage({
         <label>
           更新时间
           <input value={shortTime(settings.updated_at)} readOnly />
+        </label>
+      </div>
+      <div className="form-row">
+        <label>
+          首充激活金额 USDT
+          <input
+            value={draft.first_deposit_min_usdt}
+            onChange={(event) => setDraft({ ...draft, first_deposit_min_usdt: event.target.value })}
+            placeholder="100"
+          />
+        </label>
+        <label>
+          充值手续费比例
+          <input
+            value={draft.deposit_fee_rate}
+            onChange={(event) => setDraft({ ...draft, deposit_fee_rate: event.target.value })}
+            placeholder="0.25"
+          />
+        </label>
+      </div>
+      <div className="form-row">
+        <label>
+          直推返佣比例
+          <input
+            value={draft.direct_referral_rate}
+            onChange={(event) => setDraft({ ...draft, direct_referral_rate: event.target.value })}
+            placeholder="0.09"
+          />
+        </label>
+        <label>
+          间推返佣比例
+          <input
+            value={draft.indirect_referral_rate}
+            onChange={(event) => setDraft({ ...draft, indirect_referral_rate: event.target.value })}
+            placeholder="0.03"
+          />
         </label>
       </div>
       <button className="primary" onClick={() => onSave(draft)}>
@@ -879,42 +993,60 @@ function ExchangeWorkersPage({
         </button>
       </div>
 
-      <Table
+      <DataTable
         columns={["名称", "分片", "出口 IP", "状态", "最后启动", "错误", "操作"]}
-        rows={workers.map((worker) => [
-          worker.name,
-          `${worker.shard_index}/${worker.shard_total}`,
-          worker.bind_local_ip || "默认出口",
-          <StatusPill active={worker.enabled && worker.status === "running"}>{worker.enabled ? worker.status : "stopped"}</StatusPill>,
-          shortTime(worker.last_started_at),
-          worker.last_error ? shortId(worker.last_error, 18) : "-",
-          <div className="row-actions">
-            <button className="table-action" onClick={() => onToggle(worker.id, !worker.enabled)}>
-              <Power size={14} />
-              {worker.enabled ? "停用" : "启用"}
-            </button>
-            <button
-              className="table-action secondary-action"
-              onClick={() =>
-                onSave({
-                  id: worker.id,
-                  name: worker.name,
-                  shard_total: worker.shard_total,
-                  shard_index: worker.shard_index,
-                  bind_local_ip: worker.bind_local_ip || "",
-                  enabled: worker.enabled
-                })
-              }
-            >
-              <SquarePen size={14} />
-              保存
-            </button>
-            <button className="table-action secondary-action" onClick={() => onDelete(worker.id)}>
-              <Trash2 size={14} />
-              删除
-            </button>
-          </div>
-        ])}
+        rows={workers.map((worker) => ({
+          id: worker.id,
+          cells: [
+            worker.name,
+            `${worker.shard_index}/${worker.shard_total}`,
+            worker.bind_local_ip || "默认出口",
+            <StatusPill active={worker.enabled && worker.status === "running"}>{worker.enabled ? worker.status : "stopped"}</StatusPill>,
+            shortTime(worker.last_started_at),
+            worker.last_error ? shortId(worker.last_error, 18) : "-",
+            <div className="row-actions">
+              <button className="table-action" onClick={(event) => stopRowClick(event, () => onToggle(worker.id, !worker.enabled))}>
+                <Power size={14} />
+                {worker.enabled ? "停用" : "启用"}
+              </button>
+              <button
+                className="table-action secondary-action"
+                onClick={(event) =>
+                  stopRowClick(event, () =>
+                    onSave({
+                      id: worker.id,
+                      name: worker.name,
+                      shard_total: worker.shard_total,
+                      shard_index: worker.shard_index,
+                      bind_local_ip: worker.bind_local_ip || "",
+                      enabled: worker.enabled
+                    })
+                  )
+                }
+              >
+                <SquarePen size={14} />
+                保存
+              </button>
+              <button className="table-action secondary-action" onClick={(event) => stopRowClick(event, () => onDelete(worker.id))}>
+                <Trash2 size={14} />
+                删除
+              </button>
+            </div>
+          ],
+          details: {
+            WorkerID: worker.id,
+            名称: worker.name,
+            分片: `${worker.shard_index}/${worker.shard_total}`,
+            出口IP: worker.bind_local_ip || "默认出口",
+            启用: yesNo(worker.enabled),
+            状态: worker.status,
+            最后启动: shortTime(worker.last_started_at),
+            最后停止: shortTime(worker.last_stopped_at),
+            错误: worker.last_error || "-",
+            更新时间: shortTime(worker.updated_at),
+            创建时间: shortTime(worker.created_at)
+          }
+        }))}
       />
     </section>
   );
@@ -930,15 +1062,26 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
             <p>钱包地址账号、登录设备和账号状态。</p>
           </div>
         </div>
-        <Table
+        <DataTable
           columns={["注册时间", "钱包地址", "状态", "当前设备", "更新时间"]}
-          rows={users.map((user) => [
-            shortTime(user.created_at),
-            shortId(user.wallet_address, 10),
-            user.status,
-            user.active_device_fingerprint ? shortId(user.active_device_fingerprint, 14) : "-",
-            shortTime(user.updated_at)
-          ])}
+          rows={users.map((user) => ({
+            id: user.id,
+            cells: [
+              shortTime(user.created_at),
+              shortId(user.wallet_address, 10),
+              user.status,
+              user.active_device_fingerprint ? shortId(user.active_device_fingerprint, 14) : "-",
+              shortTime(user.updated_at)
+            ],
+            details: {
+              用户ID: user.id,
+              钱包地址: user.wallet_address,
+              状态: user.status,
+              当前设备: user.active_device_fingerprint || "-",
+              注册时间: shortTime(user.created_at),
+              更新时间: shortTime(user.updated_at)
+            }
+          }))}
         />
       </section>
 
@@ -949,33 +1092,40 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
             <p>Android 上报的事件合约页面识别状态。</p>
           </div>
         </div>
-        <Table
+        <DataTable
           columns={["用户", "页面", "识别", "金额框", "上涨", "下跌", "包名", "更新时间"]}
-          rows={pageStates.map((state) => [
-            shortId(state.user_id, 8),
-            state.screen_name,
-            <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
-            yesNo(state.amount_field_found),
-            yesNo(state.up_button_found),
-            yesNo(state.down_button_found),
-            state.package_name,
-            shortTime(state.updated_at)
-          ])}
+          rows={pageStates.map((state) => ({
+            id: `${state.user_id}-${state.updated_at}`,
+            cells: [
+              shortId(state.user_id, 8),
+              state.screen_name,
+              <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
+              yesNo(state.amount_field_found),
+              yesNo(state.up_button_found),
+              yesNo(state.down_button_found),
+              state.package_name,
+              shortTime(state.updated_at)
+            ],
+            details: {
+              用户ID: state.user_id,
+              页面: state.screen_name,
+              识别通过: yesNo(state.page_ready),
+              置信度: percent(state.confidence),
+              金额框: yesNo(state.amount_field_found),
+              上涨按钮: yesNo(state.up_button_found),
+              下跌按钮: yesNo(state.down_button_found),
+              包名: state.package_name,
+              观察时间: shortTime(state.observed_at),
+              更新时间: shortTime(state.updated_at)
+            }
+          }))}
         />
       </section>
     </>
   );
 }
 
-function OrdersPage({
-  orders,
-  reports,
-  onSettle
-}: {
-  orders: OrderRecord[];
-  reports: ReportRecord[];
-  onSettle: (reportId: string) => void;
-}) {
+function OrdersPage({ orders, reports, onSettle }: { orders: OrderRecord[]; reports: ReportRecord[]; onSettle: (reportId: string) => void }) {
   return (
     <>
       <section className="panel">
@@ -985,17 +1135,33 @@ function OrdersPage({
             <p>Android 点击确认后上报的订单记录。</p>
           </div>
         </div>
-        <Table
+        <DataTable
           columns={["时间", "用户", "方向", "金额", "来源", "状态", "信号"]}
-          rows={orders.map((order) => [
-            shortTime(order.created_at),
-            shortId(order.user_id, 8),
-            <ToneText tone={directionTone(order.direction)}>{labelDirection(order.direction)}</ToneText>,
-            `${order.stake_usdt} USDT`,
-            order.source,
-            order.order_status,
-            shortId(order.signal_id, 8)
-          ])}
+          rows={orders.map((order) => ({
+            id: order.id,
+            cells: [
+              shortTime(order.created_at),
+              shortId(order.user_id, 8),
+              <ToneText tone={directionTone(order.direction)}>{labelDirection(order.direction)}</ToneText>,
+              `${order.stake_usdt} USDT`,
+              order.source,
+              order.order_status,
+              shortId(order.signal_id, 8)
+            ],
+            details: {
+              订单ID: order.id,
+              用户ID: order.user_id,
+              信号ID: order.signal_id,
+              客户端订单: order.client_order_id,
+              交易对: order.symbol,
+              方向: labelDirection(order.direction),
+              下单金额: `${order.stake_usdt} USDT`,
+              来源: order.source,
+              自动化置信度: order.automation_confidence || "-",
+              状态: order.order_status,
+              创建时间: shortTime(order.created_at)
+            }
+          }))}
         />
       </section>
 
@@ -1014,18 +1180,39 @@ function DepositsPage({ deposits, ledger }: { deposits: DepositRecord[]; ledger:
             <p>链上 USDT 转账校验后才会显示 credited 并入账。</p>
           </div>
         </div>
-        <Table
-          columns={["时间", "用户", "金额", "状态", "确认数", "From", "To", "Tx"]}
-          rows={deposits.map((deposit) => [
-            shortTime(deposit.created_at),
-            shortId(deposit.user_id, 8),
-            `${deposit.amount} ${deposit.asset}`,
-            <StatusPill active={deposit.status === "credited"}>{deposit.status}</StatusPill>,
-            deposit.confirmations,
-            shortId(deposit.from_address, 8),
-            shortId(deposit.to_address, 8),
-            shortId(deposit.tx_hash, 8)
-          ])}
+        <DataTable
+          columns={["时间", "用户", "充值", "到账", "手续费", "状态", "确认数", "Tx"]}
+          rows={deposits.map((deposit) => ({
+            id: deposit.id,
+            cells: [
+              shortTime(deposit.created_at),
+              shortId(deposit.user_id, 8),
+              `${deposit.amount} ${deposit.asset}`,
+              `${deposit.credited_amount} ${deposit.asset}`,
+              `${deposit.platform_fee} ${deposit.asset}`,
+              <StatusPill active={deposit.status === "credited"}>{deposit.status}</StatusPill>,
+              deposit.confirmations,
+              shortId(deposit.tx_hash, 8)
+            ],
+            details: {
+              充值ID: deposit.id,
+              用户ID: deposit.user_id,
+              链: deposit.chain,
+              资产: deposit.asset,
+              充值金额: `${deposit.amount} ${deposit.asset}`,
+              到账金额: `${deposit.credited_amount} ${deposit.asset}`,
+              平台手续费: `${deposit.platform_fee} ${deposit.asset}`,
+              状态: deposit.status,
+              确认数: deposit.confirmations,
+              区块高度: deposit.block_number,
+              From: deposit.from_address,
+              To: deposit.to_address,
+              合约地址: deposit.contract_address,
+              交易哈希: deposit.tx_hash,
+              入账时间: shortTime(deposit.credited_at),
+              创建时间: shortTime(deposit.created_at)
+            }
+          }))}
         />
       </section>
 
@@ -1036,17 +1223,32 @@ function DepositsPage({ deposits, ledger }: { deposits: DepositRecord[]; ledger:
             <p>所有余额变化都需要对应 ledger 记录。</p>
           </div>
         </div>
-        <Table
+        <DataTable
           columns={["时间", "用户", "类型", "金额", "可用余额", "冻结余额", "引用"]}
-          rows={ledger.map((row) => [
-            shortTime(row.created_at),
-            shortId(row.user_id, 8),
-            row.entry_type,
-            row.amount,
-            row.balance_available_after,
-            row.balance_frozen_after,
-            `${row.ref_type}:${shortId(row.ref_id, 6)}`
-          ])}
+          rows={ledger.map((row) => ({
+            id: row.id,
+            cells: [
+              shortTime(row.created_at),
+              shortId(row.user_id, 8),
+              row.entry_type,
+              row.amount,
+              row.balance_available_after,
+              row.balance_frozen_after,
+              `${row.ref_type}:${shortId(row.ref_id, 6)}`
+            ],
+            details: {
+              流水ID: row.id,
+              用户ID: row.user_id,
+              资产: row.asset,
+              类型: row.entry_type,
+              变动金额: row.amount,
+              可用余额: row.balance_available_after,
+              冻结余额: row.balance_frozen_after,
+              引用类型: row.ref_type,
+              引用ID: row.ref_id,
+              创建时间: shortTime(row.created_at)
+            }
+          }))}
         />
       </section>
     </>
@@ -1056,11 +1258,13 @@ function DepositsPage({ deposits, ledger }: { deposits: DepositRecord[]; ledger:
 function WithdrawalsPage({
   withdrawals,
   onConfirm,
-  onReject
+  onReject,
+  onChain
 }: {
   withdrawals: WithdrawalRecord[];
   onConfirm: (withdrawalId: string) => void;
   onReject: (withdrawalId: string) => void;
+  onChain: (withdrawal: WithdrawalRecord) => void;
 }) {
   return (
     <section className="panel">
@@ -1070,25 +1274,46 @@ function WithdrawalsPage({
           <p>用户申请后先冻结余额，管理员确认链上退款后再释放。</p>
         </div>
       </div>
-      <Table
+      <DataTable
         columns={["时间", "用户", "金额", "状态", "退款ID", "目标地址", "交易哈希", "操作"]}
-        rows={withdrawals.map((row) => [
-          shortTime(row.requested_at),
-          shortId(row.user_id, 8),
-          `${row.amount} ${row.asset}`,
-          <StatusPill active={row.status === "paid"}>{row.status}</StatusPill>,
-          shortId(row.refund_id, 8),
-          shortId(row.to_address, 8),
-          row.tx_hash ? shortId(row.tx_hash, 8) : "-",
-          row.status === "pending_review" || row.status === "confirming" ? (
-            <div className="row-actions">
-              <button className="table-action" onClick={() => onConfirm(row.id)}>确认</button>
-              <button className="table-action secondary-action" onClick={() => onReject(row.id)}>驳回</button>
-            </div>
-          ) : (
-            <span>-</span>
-          )
-        ])}
+        rows={withdrawals.map((row) => ({
+          id: row.id,
+          cells: [
+            shortTime(row.requested_at),
+            shortId(row.user_id, 8),
+            `${row.amount} ${row.asset}`,
+            <StatusPill active={row.status === "paid"}>{row.status}</StatusPill>,
+            shortId(row.refund_id, 8),
+            shortId(row.to_address, 8),
+            row.tx_hash ? shortId(row.tx_hash, 8) : "-",
+            row.status === "pending_review" || row.status === "confirming" ? (
+              <div className="row-actions">
+                <button className="table-action" onClick={(event) => stopRowClick(event, () => onChain(row))}>链上退款</button>
+                <button className="table-action" onClick={(event) => stopRowClick(event, () => onConfirm(row.id))}>确认</button>
+                <button className="table-action secondary-action" onClick={(event) => stopRowClick(event, () => onReject(row.id))}>驳回</button>
+              </div>
+            ) : (
+              <span>-</span>
+            )
+          ],
+          details: {
+            提现ID: row.id,
+            用户ID: row.user_id,
+            链: row.chain,
+            资产: row.asset,
+            金额: `${row.amount} ${row.asset}`,
+            状态: row.status,
+            退款ID: row.refund_id,
+            付款钱包: row.payout_wallet || "-",
+            目标地址: row.to_address,
+            交易哈希: row.tx_hash || "-",
+            确认数: row.confirmations,
+            请求时间: shortTime(row.requested_at),
+            处理时间: shortTime(row.processed_at),
+            驳回时间: shortTime(row.rejected_at),
+            驳回原因: row.reject_reason || "-"
+          }
+        }))}
       />
     </section>
   );
@@ -1111,20 +1336,34 @@ function ReportsTable({
           <p>执行结果需人工确认后才会扣费或返还。</p>
         </div>
       </div>
-      <Table
+      <DataTable
         columns={["时间", "用户", "方向", "金额", "结果", "毛盈利", "状态", "操作"]}
-        rows={reports.map((report) => [
-          shortTime(report.created_at),
-          shortId(report.user_id, 8),
-          <ToneText tone={directionTone(report.direction)}>{labelDirection(report.direction)}</ToneText>,
-          `${report.stake_usdt} USDT`,
-          resultLabel(report.result),
-          report.gross_profit || "-",
-          <StatusPill active={report.report_status === "settled"}>{report.report_status}</StatusPill>,
-          report.report_status === "pending_review"
-            ? <button className="table-action" onClick={() => onSettle(report.id)}>确认结算</button>
-            : <span>-</span>
-        ])}
+        rows={reports.map((report) => ({
+          id: report.id,
+          cells: [
+            shortTime(report.created_at),
+            shortId(report.user_id, 8),
+            <ToneText tone={directionTone(report.direction)}>{labelDirection(report.direction)}</ToneText>,
+            `${report.stake_usdt} USDT`,
+            resultLabel(report.result),
+            report.gross_profit || "-",
+            <StatusPill active={report.report_status === "settled"}>{report.report_status}</StatusPill>,
+            report.report_status === "pending_review"
+              ? <button className="table-action" onClick={(event) => stopRowClick(event, () => onSettle(report.id))}>确认结算</button>
+              : <span>-</span>
+          ],
+          details: {
+            回报ID: report.id,
+            用户ID: report.user_id,
+            信号ID: report.signal_id,
+            方向: labelDirection(report.direction),
+            下单金额: `${report.stake_usdt} USDT`,
+            结果: resultLabel(report.result),
+            毛盈利: report.gross_profit || "-",
+            状态: report.report_status,
+            创建时间: shortTime(report.created_at)
+          }
+        }))}
       />
     </section>
   );
@@ -1139,17 +1378,31 @@ function SettlementsPage({ settlements }: { settlements: SettlementRecord[] }) {
           <p>赢单从盈利扣 30%，输单按本金的 30% 返还到平台余额。</p>
         </div>
       </div>
-      <Table
+      <DataTable
         columns={["时间", "用户", "毛盈利", "平台扣费", "亏损返还", "用户净额", "状态"]}
-        rows={settlements.map((row) => [
-          shortTime(row.created_at),
-          shortId(row.user_id, 8),
-          row.gross_profit,
-          row.profit_share_fee,
-          row.loss_rebate,
-          row.user_net_profit,
-          row.status
-        ])}
+        rows={settlements.map((row) => ({
+          id: row.id,
+          cells: [
+            shortTime(row.created_at),
+            shortId(row.user_id, 8),
+            row.gross_profit,
+            row.profit_share_fee,
+            row.loss_rebate,
+            row.user_net_profit,
+            row.status
+          ],
+          details: {
+            结算ID: row.id,
+            用户ID: row.user_id,
+            回报ID: row.execution_report_id,
+            毛盈利: row.gross_profit,
+            平台扣费: row.profit_share_fee,
+            亏损返还: row.loss_rebate,
+            用户净额: row.user_net_profit,
+            状态: row.status,
+            创建时间: shortTime(row.created_at)
+          }
+        }))}
       />
     </section>
   );
@@ -1199,21 +1452,73 @@ function Stat({ icon, label, value }: { icon: ReactNode; label: string; value: n
   );
 }
 
-function Table({ columns, rows }: { columns: string[]; rows: ReactNode[][] }) {
+function DataTable({ columns, rows, pageSize = 10 }: { columns: string[]; rows: TableRow[]; pageSize?: number }) {
+  const [page, setPage] = useState(0);
+  const [selected, setSelected] = useState<TableRow | null>(null);
+  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const safePage = Math.min(page, totalPages - 1);
+  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+
+  useEffect(() => {
+    if (page > totalPages - 1) setPage(totalPages - 1);
+  }, [page, totalPages]);
+
   return (
-    <div className="table-wrap">
-      <table>
-        <thead>
-          <tr>{columns.map((col) => <th key={col}>{col}</th>)}</tr>
-        </thead>
-        <tbody>
-          {rows.length === 0 ? (
-            <tr><td colSpan={columns.length}>暂无记录</td></tr>
-          ) : rows.map((row, index) => (
-            <tr key={index}>{row.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}</tr>
+    <>
+      <div className="table-wrap">
+        <table>
+          <thead>
+            <tr>{columns.map((col) => <th key={col}>{col}</th>)}</tr>
+          </thead>
+          <tbody>
+            {visibleRows.length === 0 ? (
+              <tr><td colSpan={columns.length}>暂无记录</td></tr>
+            ) : visibleRows.map((row) => (
+              <tr className={row.details ? "clickable-row" : ""} key={row.id} onClick={() => row.details && setSelected(row)}>
+                {row.cells.map((cell, cellIndex) => <td key={cellIndex}>{cell}</td>)}
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
+      {rows.length > pageSize && (
+        <div className="pagination">
+          <span>共 {rows.length} 条，第 {safePage + 1}/{totalPages} 页</span>
+          <div className="row-actions">
+            <button className="table-action secondary-action" disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button>
+            <button className="table-action secondary-action" disabled={safePage >= totalPages - 1} onClick={() => setPage((value) => Math.min(totalPages - 1, value + 1))}>下一页</button>
+          </div>
+        </div>
+      )}
+      {selected?.details && <DetailsDrawer row={selected} onClose={() => setSelected(null)} />}
+    </>
+  );
+}
+
+function Table({ columns, rows }: { columns: string[]; rows: ReactNode[][] }) {
+  return <DataTable columns={columns} rows={rows.map((cells, index) => ({ id: String(index), cells }))} />;
+}
+
+function DetailsDrawer({ row, onClose }: { row: TableRow; onClose: () => void }) {
+  return (
+    <div className="drawer-backdrop" onClick={onClose}>
+      <aside className="drawer" onClick={(event) => event.stopPropagation()}>
+        <div className="drawer-title">
+          <div>
+            <h2>记录详情</h2>
+            <p>{row.id}</p>
+          </div>
+          <button className="table-action secondary-action" onClick={onClose}>关闭</button>
+        </div>
+        <dl className="detail-list">
+          {Object.entries(row.details || {}).map(([label, value]) => (
+            <div key={label}>
+              <dt>{label}</dt>
+              <dd>{value}</dd>
+            </div>
           ))}
-        </tbody>
-      </table>
+        </dl>
+      </aside>
     </div>
   );
 }
@@ -1224,6 +1529,11 @@ function StatusPill({ active, children }: { active: boolean; children: ReactNode
 
 function ToneText({ tone, children }: { tone: string; children: ReactNode }) {
   return <span className={tone}>{children}</span>;
+}
+
+function stopRowClick(event: MouseEvent, action: () => void) {
+  event.stopPropagation();
+  action();
 }
 
 function viewTitle(view: AdminView) {

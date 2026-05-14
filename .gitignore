@@ -21,6 +21,13 @@ admin/.env
 admin/.env.local
 admin/.env.*.local
 
+dapp/node_modules/
+dapp/dist/
+dapp/tsconfig.tsbuildinfo
+dapp/.env
+dapp/.env.local
+dapp/.env.*.local
+
 logs/
 
 contracts/cache/
