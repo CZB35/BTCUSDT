@@ -6,7 +6,10 @@ import com.eventsignal.app.domain.AutomationPageStateRequest
 import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.AuthResponse
 import com.eventsignal.app.domain.EventContractOrderRequest
+import com.eventsignal.app.domain.ExchangeCredentialResponse
+import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.ExecutionReportRequest
+import com.eventsignal.app.domain.SignalDeliveryAckRequest
 import com.eventsignal.app.domain.SignalSnapshot
 
 class EventSignalRepository(context: Context) {
@@ -19,6 +22,12 @@ class EventSignalRepository(context: Context) {
     fun loadAutomationSettings(): Result<AutomationSettings> =
         api.getAutomationSettings().onSuccess(stateStore::saveSettings)
 
+    fun loadExchangeStatus(): Result<ExchangeCredentialStatus> =
+        api.getExchangeStatus()
+
+    fun saveExchangeCredentials(apiKey: String, apiSecret: String): Result<ExchangeCredentialResponse> =
+        api.saveExchangeCredentials(apiKey, apiSecret)
+
     fun saveAutomationSettings(settings: AutomationSettings): Result<AutomationSettings> =
         api.saveAutomationSettings(settings).onSuccess(stateStore::saveSettings)
 
@@ -30,6 +39,9 @@ class EventSignalRepository(context: Context) {
 
     fun submitEventContractOrder(order: EventContractOrderRequest): Result<Unit> =
         api.submitEventContractOrder(order)
+
+    fun ackSignalDelivery(ack: SignalDeliveryAckRequest): Result<Unit> =
+        api.ackSignalDelivery(ack)
 
     fun websocketRequest() =
         api.websocketRequest()

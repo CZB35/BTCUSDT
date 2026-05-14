@@ -29,6 +29,9 @@ class AutomationStateStore(context: Context) {
         private var cachedLastStatus: String? = null
 
         @Volatile
+        private var cachedConnectionState: String? = null
+
+        @Volatile
         private var lastDebugDiskWriteAtMs: Long = 0
 
         @Volatile
@@ -88,6 +91,19 @@ class AutomationStateStore(context: Context) {
 
     fun loadLastStatus(): String =
         cachedLastStatus ?: (prefs.getString("last_status", "-") ?: "-").also { cachedLastStatus = it }
+
+    fun saveConnectionState(state: String) {
+        cachedConnectionState = state
+        prefs.edit()
+            .putString("connection_state", state)
+            .putLong("connection_state_at_ms", System.currentTimeMillis())
+            .apply()
+    }
+
+    fun loadConnectionState(): String =
+        cachedConnectionState ?: (prefs.getString("connection_state", "unknown") ?: "unknown").also {
+            cachedConnectionState = it
+        }
 
     fun saveDebugState(state: AutomationDebugState) {
         val now = System.currentTimeMillis()

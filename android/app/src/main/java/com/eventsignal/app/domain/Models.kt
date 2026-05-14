@@ -49,8 +49,55 @@ data class AuthResponse(
 )
 
 @Serializable
+data class ExchangeCredentialStatus(
+    val provider: String = "binance_futures",
+    val connected: Boolean = false,
+    @SerialName("can_read_account")
+    val canReadAccount: Boolean = false,
+    @SerialName("verification_status")
+    val verificationStatus: String = "missing",
+    @SerialName("balance_available_usdt")
+    val balanceAvailableUsdt: String? = null,
+    @SerialName("balance_wallet_usdt")
+    val balanceWalletUsdt: String? = null,
+    @SerialName("balance_updated_at")
+    val balanceUpdatedAt: String? = null,
+    @SerialName("last_verified_at")
+    val lastVerifiedAt: String? = null,
+    @SerialName("last_error")
+    val lastError: String? = null,
+)
+
+@Serializable
+data class ExchangeCredentialRequest(
+    @SerialName("api_key")
+    val apiKey: String,
+    @SerialName("api_secret")
+    val apiSecret: String,
+)
+
+@Serializable
+data class ExchangeCredentialResponse(
+    val provider: String,
+    val connected: Boolean,
+    @SerialName("can_read_account")
+    val canReadAccount: Boolean,
+    @SerialName("verification_status")
+    val verificationStatus: String,
+    @SerialName("balance_available_usdt")
+    val balanceAvailableUsdt: String,
+    @SerialName("balance_wallet_usdt")
+    val balanceWalletUsdt: String,
+    @SerialName("last_verified_at")
+    val lastVerifiedAt: String? = null,
+    val message: String,
+)
+
+@Serializable
 data class SignalSnapshot(
     val id: String? = null,
+    @SerialName("delivery_id")
+    val deliveryId: String? = null,
     val symbol: String = "BTCUSDT",
     val direction: String = "HOLD",
     val confidence: String = "-",
@@ -135,6 +182,22 @@ data class EventContractOrderRequest(
     val rawAudit: Map<String, String>? = null,
     @SerialName("reported_at")
     val reportedAt: String,
+)
+
+@Serializable
+data class SignalDeliveryAckRequest(
+    @SerialName("delivery_id")
+    val deliveryId: String,
+    @SerialName("signal_id")
+    val signalId: String,
+    @SerialName("reservation_id")
+    val reservationId: String? = null,
+    @SerialName("received_at")
+    val receivedAt: String,
+    @SerialName("app_version")
+    val appVersion: String? = null,
+    @SerialName("page_state")
+    val pageState: Map<String, String>? = null,
 )
 
 @Serializable

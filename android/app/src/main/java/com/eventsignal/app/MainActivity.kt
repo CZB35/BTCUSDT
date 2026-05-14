@@ -63,6 +63,7 @@ import com.eventsignal.app.automation.AutomationDebugState
 import com.eventsignal.app.automation.AutomationStateStore
 import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.domain.AutomationSettings
+import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.SignalSnapshot
 import com.eventsignal.app.service.AutomationForegroundService
 import com.eventsignal.app.service.AutomationRuntime
@@ -125,15 +126,26 @@ private fun MainScreen(repository: EventSignalRepository) {
     var accessToken by remember { mutableStateOf(repository.accessToken().orEmpty()) }
     var walletAddress by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
+    var exchangeStatus by remember { mutableStateOf(ExchangeCredentialStatus()) }
+    var binanceApiKey by remember { mutableStateOf("") }
+    var binanceApiSecret by remember { mutableStateOf("") }
     val walletDeepLink = (context as? Activity)?.intent?.data?.getQueryParameter("address").orEmpty()
 
     suspend fun refresh() {
-        val (nextSignal, nextSettings) = withContext(Dispatchers.IO) {
-            repository.loadLatestSignal().getOrDefault(SignalSnapshot.empty()) to
-                repository.loadAutomationSettings().getOrDefault(stateStore.loadSettings())
+        val (nextSignal, nextSettings, nextExchangeStatus) = withContext(Dispatchers.IO) {
+            Triple(
+                repository.loadLatestSignal().getOrDefault(SignalSnapshot.empty()),
+                repository.loadAutomationSettings().getOrDefault(stateStore.loadSettings()),
+                if (repository.accessToken().isNullOrBlank()) {
+                    ExchangeCredentialStatus()
+                } else {
+                    repository.loadExchangeStatus().getOrDefault(ExchangeCredentialStatus())
+                },
+            )
         }
         signal = nextSignal
         automationSettings = nextSettings
+        exchangeStatus = nextExchangeStatus
         debugState = stateStore.loadDebugState()
     }
 
@@ -245,6 +257,40 @@ private fun MainScreen(repository: EventSignalRepository) {
                         }
                     },
                 )
+                ExchangeCard(
+                    status = exchangeStatus,
+                    apiKey = binanceApiKey,
+                    apiSecret = binanceApiSecret,
+                    onApiKeyChange = { binanceApiKey = it },
+                    onApiSecretChange = { binanceApiSecret = it },
+                    onBind = {
+                        scope.launch {
+                            if (accessToken.isBlank()) {
+                                status = "请先登录账号"
+                                return@launch
+                            }
+                            status = "正在验证币安只读 API"
+                            val result = withContext(Dispatchers.IO) {
+                                repository.saveExchangeCredentials(binanceApiKey, binanceApiSecret)
+                            }
+                            result.onSuccess {
+                                exchangeStatus = exchangeStatus.copy(
+                                    connected = it.connected,
+                                    canReadAccount = it.canReadAccount,
+                                    verificationStatus = it.verificationStatus,
+                                    balanceAvailableUsdt = it.balanceAvailableUsdt,
+                                    balanceWalletUsdt = it.balanceWalletUsdt,
+                                    lastVerifiedAt = it.lastVerifiedAt,
+                                    lastError = null,
+                                )
+                                binanceApiSecret = ""
+                                status = "币安 U 本位合约账户已绑定"
+                            }.onFailure {
+                                status = "绑定失败：${it.message ?: it.javaClass.simpleName}"
+                            }
+                        }
+                    },
+                )
                 SignalCard(signal)
                 AutomationCard(
                     settings = automationSettings,
@@ -342,6 +388,64 @@ private fun AuthCard(
             modifier = Modifier.fillMaxWidth(),
         )
         Text(status, style = MaterialTheme.typography.bodySmall, color = MutedText)
+    }
+}
+
+@Composable
+private fun ExchangeCard(
+    status: ExchangeCredentialStatus,
+    apiKey: String,
+    apiSecret: String,
+    onApiKeyChange: (String) -> Unit,
+    onApiSecretChange: (String) -> Unit,
+    onBind: () -> Unit,
+) {
+    AppCard {
+        SectionHeader(
+            title = "币安只读 API",
+            subtitle = "用于读取 U 本位合约账户余额和事件合约流水，不需要开通交易权限",
+        )
+        Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
+            StatusChip(
+                "连接：${exchangeConnectionLabel(status)}",
+                status.connected && status.canReadAccount,
+                Modifier.weight(1f),
+            )
+            StatusChip(
+                "可用：${status.balanceAvailableUsdt ?: "-"} USDT",
+                status.balanceAvailableUsdt != null,
+                Modifier.weight(1f),
+            )
+        }
+        OutlinedTextField(
+            value = apiKey,
+            onValueChange = onApiKeyChange,
+            label = { Text("API Key") },
+            singleLine = true,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        OutlinedTextField(
+            value = apiSecret,
+            onValueChange = onApiSecretChange,
+            label = { Text("API Secret") },
+            singleLine = true,
+            visualTransformation = PasswordVisualTransformation(),
+            modifier = Modifier.fillMaxWidth(),
+        )
+        PrimaryButton(
+            text = "绑定并验证",
+            modifier = Modifier.fillMaxWidth(),
+            enabled = apiKey.isNotBlank() && apiSecret.isNotBlank(),
+            onClick = onBind,
+        )
+        Text(
+            "余额来源：币安 U 本位合约账户。后台按比例计算下单金额，最低 5U，最高 250U。",
+            style = MaterialTheme.typography.bodySmall,
+            color = MutedText,
+        )
+        status.lastError?.takeIf { it.isNotBlank() }?.let {
+            Text("最近错误：$it", style = MaterialTheme.typography.bodySmall, color = TradingDown)
+        }
     }
 }
 
@@ -571,6 +675,16 @@ private fun authorizationLabel(status: String?, authorized: Boolean): String =
         authorized -> "已通过"
         status.isNullOrBlank() -> "未授权"
         status == "page_not_ready" -> "页面未就绪"
-        status == "insufficient_balance" -> "余额不足"
+        status == "fee_reserve_insufficient" -> "预扣余额不足"
+        status == "exchange_balance_missing" -> "未绑定币安余额"
+        status == "exchange_balance_insufficient" -> "U 本位余额不足"
         else -> status
+    }
+
+private fun exchangeConnectionLabel(status: ExchangeCredentialStatus): String =
+    when {
+        status.connected && status.canReadAccount -> "已验证"
+        status.verificationStatus == "missing" -> "未绑定"
+        status.verificationStatus.isNotBlank() -> status.verificationStatus
+        else -> "未绑定"
     }

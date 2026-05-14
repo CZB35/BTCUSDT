@@ -2,6 +2,7 @@ target/
 
 .env
 .env.local
+.env.production
 
 .signal-state*/
 .futures-signal-state*/

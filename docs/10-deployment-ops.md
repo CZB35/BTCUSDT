@@ -39,6 +39,33 @@ Recommended first release:
 - PostgreSQL managed service if budget allows.
 - Redis managed service if budget allows.
 
+## Docker Production Runbook
+
+Create a production environment file from the template and keep it off Git:
+
+```powershell
+Copy-Item .env.production.example .env.production
+```
+
+Create a dedicated database and least-privilege app role:
+
+```powershell
+.\scripts\create-production-database.ps1 `
+  -AdminUrl "postgres://admin:password@host:5432/postgres" `
+  -DatabaseName event_signal_prod `
+  -AppUser event_signal_app `
+  -AppPassword "change_me"
+```
+
+Run migrations and start the API container:
+
+```powershell
+.\scripts\run-production-migrations.ps1
+docker compose --env-file .env.production -f docker-compose.production.yml up -d api
+```
+
+The same image can run one-off migration mode with `event-signal-prototype --migrate-only`. The API serves `/v1`, `/admin`, and `/dapp` from one container for the first production cut.
+
 ## Observability
 
 Metrics:

@@ -32,3 +32,16 @@ The product scope is:
 Use Jetpack Compose instead of Flutter for the first version because this product is Android-only and depends heavily on native Android capabilities: overlay windows, foreground services, notifications, permissions, app lifecycle, and vendor battery policies.
 
 Use Rust for the backend because the platform needs high-concurrency signal delivery, async workers, chain event processing, strict accounting, and reliable long-running services.
+
+## Production Deployment
+
+The backend applies SQL migrations automatically when `DATABASE_URL` is set. For production, create a dedicated PostgreSQL database and app user first, then run migrations through Docker:
+
+```powershell
+Copy-Item .env.production.example .env.production
+.\scripts\create-production-database.ps1 -AdminUrl "postgres://admin:password@host:5432/postgres" -DatabaseName event_signal_prod -AppUser event_signal_app -AppPassword "change_me"
+.\scripts\run-production-migrations.ps1
+docker compose --env-file .env.production -f docker-compose.production.yml up -d api
+```
+
+The production container serves the API on `/v1`, the admin frontend on `/admin`, and the recharge DApp on `/dapp`.

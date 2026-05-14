@@ -7,7 +7,11 @@ import com.eventsignal.app.domain.AuthResponse
 import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.AutomationPageStateRequest
 import com.eventsignal.app.domain.EventContractOrderRequest
+import com.eventsignal.app.domain.ExchangeCredentialRequest
+import com.eventsignal.app.domain.ExchangeCredentialResponse
+import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.ExecutionReportRequest
+import com.eventsignal.app.domain.SignalDeliveryAckRequest
 import com.eventsignal.app.domain.SignalSnapshot
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -72,6 +76,28 @@ class ApiClient(context: Context) {
         }
     }
 
+    fun getExchangeStatus(): Result<ExchangeCredentialStatus> = runCatching {
+        val request = authedRequest("/v1/exchange/binance").get().build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("exchange status failed: ${response.code}")
+            json.decodeFromString<ExchangeCredentialStatus>(response.body?.string().orEmpty())
+        }
+    }
+
+    fun saveExchangeCredentials(apiKey: String, apiSecret: String): Result<ExchangeCredentialResponse> = runCatching {
+        val body = json.encodeToString(
+            ExchangeCredentialRequest(
+                apiKey = apiKey.trim(),
+                apiSecret = apiSecret.trim(),
+            ),
+        ).toRequestBody(mediaType)
+        val request = authedRequest("/v1/exchange/binance").post(body).build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("exchange bind failed: ${response.code}")
+            json.decodeFromString<ExchangeCredentialResponse>(response.body?.string().orEmpty())
+        }
+    }
+
     fun saveAutomationSettings(settings: AutomationSettings): Result<AutomationSettings> = runCatching {
         val body = json.encodeToString(settings).toRequestBody(mediaType)
         val request = authedRequest("/v1/user-settings/automation").put(body).build()
@@ -102,6 +128,14 @@ class ApiClient(context: Context) {
         val request = authedRequest("/v1/event-contract-orders").post(body).build()
         http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) error("event contract order failed: ${response.code}")
+        }
+    }
+
+    fun ackSignalDelivery(ack: SignalDeliveryAckRequest): Result<Unit> = runCatching {
+        val body = json.encodeToString(ack).toRequestBody(mediaType)
+        val request = authedRequest("/v1/signals/deliveries/ack").post(body).build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("signal delivery ack failed: ${response.code}")
         }
     }
 

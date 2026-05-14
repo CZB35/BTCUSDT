@@ -1,5 +1,12 @@
-use std::{collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc};
+use std::{
+    collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc,
+    time::Duration as StdDuration,
+};
 
+use aes_gcm::{
+    aead::{Aead, KeyInit},
+    Aes256Gcm, Nonce,
+};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
     Argon2,
@@ -14,18 +21,24 @@ use axum::{
     routing::{get, post, put},
     Json, Router,
 };
+use base64::{engine::general_purpose, Engine as _};
 use chrono::{DateTime, Duration, Utc};
 use clap::Parser;
 use ethers_core::types::{Address, Signature, U256};
+use hmac::{Hmac, Mac};
+use rand_core::RngCore;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::sync::{broadcast, RwLock};
+use tokio::task::JoinHandle;
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
+
+type HmacSha256 = Hmac<sha2::Sha256>;
 
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
 const DEFAULT_PERIOD_SECONDS: i32 = 600;
@@ -36,6 +49,17 @@ const MIN_EVENT_STAKE: Decimal = dec!(5);
 const MAX_EVENT_STAKE: Decimal = dec!(250);
 const PAGE_GATE_TTL_SECONDS: i64 = 3;
 const MIN_DEPOSIT_AMOUNT: Decimal = dec!(10);
+const BINANCE_PROVIDER: &str = "binance_futures";
+const BINANCE_FAPI_BASE_URL: &str = "https://fapi.binance.com";
+const BINANCE_RECV_WINDOW: i64 = 5000;
+const BINANCE_INCOME_LOOKBACK_MINUTES: i64 = 20;
+const BINANCE_SETTLEMENT_GRACE_SECONDS: i64 = 90;
+const BINANCE_BALANCE_REFRESH_SECONDS: i64 = 30;
+const BINANCE_BALANCE_REFRESH_LIMIT: i64 = 30;
+const BINANCE_ORDER_CONFIRM_LIMIT: i64 = 5;
+const BINANCE_SETTLEMENT_SYNC_LIMIT: i64 = 3;
+const DEFAULT_EXCHANGE_WORKER_SHARD_TOTAL: i32 = 1;
+const DEFAULT_EXCHANGE_WORKER_SHARD_INDEX: i32 = 0;
 const DEFAULT_BSC_USDT_CONTRACT: &str = "0x55d398326f99059fF775485246999027B3197955";
 const TRANSFER_TOPIC: &str = "0xddf252ad1be2c89b69c2b068fc378daa952ba7f163c4a11628f55a4df523b3ef";
 const DEPOSIT_RECEIVED_TOPIC: &str =
@@ -49,6 +73,12 @@ struct Cli {
     serve: bool,
     #[arg(long)]
     once: bool,
+    #[arg(long)]
+    migrate_only: bool,
+    #[arg(long)]
+    exchange_worker: bool,
+    #[arg(long)]
+    print_binance_egress_ip: bool,
     #[arg(long, default_value = "127.0.0.1:8787")]
     listen: SocketAddr,
     #[arg(long, env = "DATABASE_URL")]
@@ -68,6 +98,20 @@ async fn main() -> anyhow::Result<()> {
         return Ok(());
     }
 
+    if cli.print_binance_egress_ip {
+        let client = binance_http_client()
+            .map_err(|err| anyhow::anyhow!("{}: {}", err.code, err.message))?;
+        let ip = client
+            .get("https://api.ipify.org")
+            .send()
+            .await?
+            .error_for_status()?
+            .text()
+            .await?;
+        println!("{}", ip.trim());
+        return Ok(());
+    }
+
     let db = match &cli.database_url {
         Some(database_url) => {
             let pool = PgPoolOptions::new()
@@ -81,8 +125,33 @@ async fn main() -> anyhow::Result<()> {
         None => None,
     };
 
+    if cli.migrate_only {
+        if db.is_none() {
+            anyhow::bail!("--migrate-only requires DATABASE_URL");
+        }
+        return Ok(());
+    }
+
+    if cli.exchange_worker {
+        let Some(pool) = db else {
+            anyhow::bail!("--exchange-worker requires DATABASE_URL");
+        };
+        let config = ExchangeWorkerConfig::from_env();
+        println!(
+            "exchange worker started: shard {}/{} bind_local_ip={}",
+            config.shard_index,
+            config.shard_total,
+            env::var("BINANCE_BIND_LOCAL_IP").unwrap_or_else(|_| "-".to_string())
+        );
+        run_exchange_sync_worker(pool, config, None).await;
+        return Ok(());
+    }
+
     let state = AppState::new(db);
     bootstrap_memory_admin(&state).await;
+    start_exchange_sync_workers(&state)
+        .await
+        .map_err(|err| anyhow::anyhow!("{}: {}", err.code, err.message))?;
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     println!("event-signal service listening on http://{}", cli.listen);
@@ -109,6 +178,7 @@ fn router(state: SharedState) -> Router {
         .route("/v1/stats", get(stats))
         .route("/v1/signals/latest", get(latest_signal))
         .route("/v1/signals/history", get(signal_history))
+        .route("/v1/signals/deliveries/ack", post(ack_signal_delivery))
         .route("/v1/user-settings/trading", get(get_trading_settings))
         .route("/v1/user-settings/trading", put(save_trading_settings))
         .route("/v1/user-settings/automation", get(get_automation_settings))
@@ -117,6 +187,8 @@ fn router(state: SharedState) -> Router {
             put(save_automation_settings),
         )
         .route("/v1/automation/page-state", post(save_page_state))
+        .route("/v1/exchange/binance", get(exchange_status))
+        .route("/v1/exchange/binance", post(save_binance_credentials))
         .route("/v1/balance", get(balance))
         .route("/v1/ledger", get(ledger))
         .route("/v1/deposits/instructions", get(deposit_instructions))
@@ -129,6 +201,24 @@ fn router(state: SharedState) -> Router {
         .route("/v1/ws", get(ws_handler))
         .route("/v1/admin/login", post(admin_login))
         .route("/v1/admin/overview", get(admin_overview))
+        .route("/v1/admin/trading-settings", get(admin_trading_settings))
+        .route(
+            "/v1/admin/trading-settings",
+            put(admin_save_trading_settings),
+        )
+        .route("/v1/admin/exchange-workers", get(admin_exchange_workers))
+        .route(
+            "/v1/admin/exchange-workers",
+            post(admin_save_exchange_worker),
+        )
+        .route(
+            "/v1/admin/exchange-workers/toggle",
+            post(admin_toggle_exchange_worker),
+        )
+        .route(
+            "/v1/admin/exchange-workers/delete",
+            post(admin_delete_exchange_worker),
+        )
         .route("/v1/admin/signals", get(admin_signals))
         .route("/v1/admin/signals/emit", post(admin_emit_signal))
         .route("/v1/admin/users", get(admin_users))
@@ -150,7 +240,9 @@ fn router(state: SharedState) -> Router {
             post(admin_settle_execution_report),
         )
         .route("/v1/admin/settlements", get(admin_settlements))
+        .route("/v1/admin/exchange/sync", post(admin_sync_exchange))
         .route("/v1/admin/page-states", get(admin_page_states))
+        .nest_service("/admin", ServeDir::new("admin/dist"))
         .nest_service("/dapp", ServeDir::new("dapp"))
         .layer(cors_layer())
         .with_state(state)
@@ -169,6 +261,85 @@ async fn bootstrap_memory_admin(state: &SharedState) {
             status: "active".to_string(),
         },
     );
+}
+
+async fn start_exchange_sync_workers(state: &SharedState) -> Result<(), AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        let slots = db_exchange_worker_slots(pool).await?;
+        let enabled_slots = slots
+            .into_iter()
+            .filter(|slot| slot.enabled)
+            .collect::<Vec<_>>();
+        if !enabled_slots.is_empty() {
+            for slot in enabled_slots {
+                sync_exchange_worker_runtime(state, &slot).await?;
+            }
+            return Ok(());
+        }
+    }
+    start_exchange_sync_worker(state);
+    Ok(())
+}
+
+fn start_exchange_sync_worker(state: &SharedState) {
+    let Some(pool) = state.db.clone() else {
+        return;
+    };
+    let config = ExchangeWorkerConfig::from_env();
+    tokio::spawn(async move {
+        run_exchange_sync_worker(pool, config, None).await;
+    });
+}
+
+async fn run_exchange_sync_worker(
+    pool: PgPool,
+    config: ExchangeWorkerConfig,
+    slot_id: Option<Uuid>,
+) {
+    let mut interval = tokio::time::interval(StdDuration::from_secs(15));
+    loop {
+        interval.tick().await;
+        if let Err(err) = sync_exchange_orders(&pool, &config).await {
+            if let Some(slot_id) = slot_id {
+                let _ = db_mark_exchange_worker_error(&pool, slot_id, &err.message).await;
+            }
+            eprintln!("exchange sync failed: {}", err.message);
+        }
+    }
+}
+
+async fn sync_exchange_worker_runtime(
+    state: &SharedState,
+    slot: &ExchangeWorkerSlot,
+) -> Result<(), AppError> {
+    stop_exchange_worker_runtime(state, slot.id).await;
+    if !slot.enabled {
+        return Ok(());
+    }
+    let Some(pool) = state.db.clone() else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange worker requires PostgreSQL",
+        ));
+    };
+    let bind_local_ip = parse_optional_ip(slot.bind_local_ip.as_deref(), "bind_local_ip")?;
+    let config = ExchangeWorkerConfig {
+        shard_total: slot.shard_total,
+        shard_index: slot.shard_index,
+        bind_local_ip,
+    };
+    let slot_id = slot.id;
+    let handle = tokio::spawn(async move {
+        run_exchange_sync_worker(pool, config, Some(slot_id)).await;
+    });
+    state.exchange_workers.write().await.insert(slot_id, handle);
+    Ok(())
+}
+
+async fn stop_exchange_worker_runtime(state: &SharedState, slot_id: Uuid) {
+    if let Some(handle) = state.exchange_workers.write().await.remove(&slot_id) {
+        handle.abort();
+    }
 }
 
 fn cors_layer() -> CorsLayer {
@@ -215,6 +386,7 @@ struct AppState {
     deposits: RwLock<Vec<DepositRecord>>,
     withdrawals: RwLock<Vec<WithdrawalRecord>>,
     reservations: RwLock<HashMap<Uuid, SignalReservation>>,
+    exchange_workers: RwLock<HashMap<Uuid, JoinHandle<()>>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
 }
@@ -243,6 +415,7 @@ impl AppState {
             deposits: RwLock::new(Vec::new()),
             withdrawals: RwLock::new(Vec::new()),
             reservations: RwLock::new(HashMap::new()),
+            exchange_workers: RwLock::new(HashMap::new()),
             signal_tx,
             started_at: Utc::now(),
         })
@@ -353,6 +526,19 @@ struct TradingSettings {
     floating_window_enabled: bool,
 }
 
+impl From<&PlatformTradingSettings> for TradingSettings {
+    fn from(settings: &PlatformTradingSettings) -> Self {
+        Self {
+            stake_percent: settings.stake_percent,
+            min_stake_usdt: settings.min_stake_usdt,
+            max_single_stake_usdt: Some(settings.max_single_stake_usdt),
+            min_confidence: None,
+            signal_alert_enabled: true,
+            floating_window_enabled: true,
+        }
+    }
+}
+
 impl Default for TradingSettings {
     fn default() -> Self {
         Self {
@@ -362,6 +548,25 @@ impl Default for TradingSettings {
             min_confidence: None,
             signal_alert_enabled: true,
             floating_window_enabled: true,
+        }
+    }
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PlatformTradingSettings {
+    stake_percent: Decimal,
+    min_stake_usdt: Decimal,
+    max_single_stake_usdt: Decimal,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+impl Default for PlatformTradingSettings {
+    fn default() -> Self {
+        Self {
+            stake_percent: DEFAULT_STAKE_PERCENT,
+            min_stake_usdt: MIN_EVENT_STAKE,
+            max_single_stake_usdt: MAX_EVENT_STAKE,
+            updated_at: None,
         }
     }
 }
@@ -582,6 +787,127 @@ struct WithdrawalRecord {
     reject_reason: Option<String>,
 }
 
+#[derive(Clone, Serialize)]
+struct ExchangeCredentialStatus {
+    provider: String,
+    connected: bool,
+    can_read_account: bool,
+    verification_status: String,
+    balance_available_usdt: Option<String>,
+    balance_wallet_usdt: Option<String>,
+    balance_updated_at: Option<DateTime<Utc>>,
+    last_verified_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone)]
+struct ExchangeCredentialRecord {
+    user_id: Uuid,
+    api_key: String,
+    api_secret_ciphertext: String,
+}
+
+#[derive(Clone)]
+struct BinanceAccountSnapshot {
+    wallet_balance_usdt: Decimal,
+    available_balance_usdt: Decimal,
+}
+
+#[derive(Clone)]
+struct ExchangeWorkerConfig {
+    shard_total: i32,
+    shard_index: i32,
+    bind_local_ip: Option<std::net::IpAddr>,
+}
+
+impl ExchangeWorkerConfig {
+    fn from_env() -> Self {
+        let shard_total = env_i32("WORKER_SHARD_TOTAL", DEFAULT_EXCHANGE_WORKER_SHARD_TOTAL, 1);
+        let shard_index = env_i32("WORKER_SHARD_INDEX", DEFAULT_EXCHANGE_WORKER_SHARD_INDEX, 0);
+        Self {
+            shard_total,
+            shard_index: shard_index.rem_euclid(shard_total),
+            bind_local_ip: binance_bind_local_ip().unwrap_or(None),
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct ExchangeWorkerSlot {
+    id: Uuid,
+    name: String,
+    shard_total: i32,
+    shard_index: i32,
+    bind_local_ip: Option<String>,
+    enabled: bool,
+    status: String,
+    last_started_at: Option<DateTime<Utc>>,
+    last_stopped_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    updated_at: DateTime<Utc>,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct SaveExchangeWorkerSlotRequest {
+    id: Option<Uuid>,
+    name: Option<String>,
+    shard_total: i32,
+    shard_index: i32,
+    bind_local_ip: Option<String>,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct ToggleExchangeWorkerSlotRequest {
+    id: Uuid,
+    enabled: bool,
+}
+
+#[derive(Deserialize)]
+struct DeleteExchangeWorkerSlotRequest {
+    id: Uuid,
+}
+
+#[derive(Clone, Serialize)]
+struct BinanceIncomeEventRecord {
+    id: Uuid,
+    user_id: Uuid,
+    provider: String,
+    external_ref: String,
+    income_type: String,
+    income: Decimal,
+    asset: String,
+    event_time: DateTime<Utc>,
+    tran_id: Option<String>,
+    trade_id: Option<String>,
+    raw: serde_json::Value,
+    created_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Serialize)]
+struct SignalDeliveryRecord {
+    id: Uuid,
+    signal_id: Uuid,
+    user_id: Uuid,
+    reservation_id: Option<Uuid>,
+    ws_connection_id: Uuid,
+    delivery_status: String,
+    authorization_status: String,
+    trade_authorized: bool,
+    stake_usdt: Decimal,
+    fee_reserve_usdt: Decimal,
+    sent_at: DateTime<Utc>,
+    received_at: Option<DateTime<Utc>>,
+    client_received_at: Option<DateTime<Utc>>,
+    page_state: Option<serde_json::Value>,
+    app_version: Option<String>,
+    last_error: Option<String>,
+    created_at: DateTime<Utc>,
+    updated_at: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 struct VerifiedRefund {
     tx_hash: String,
@@ -620,6 +946,43 @@ struct RpcLog {
     address: String,
     topics: Vec<String>,
     data: String,
+}
+
+#[derive(Deserialize)]
+struct BinanceTimeResponse {
+    #[serde(rename = "serverTime")]
+    server_time: i64,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceAccountResponse {
+    total_wallet_balance: String,
+    #[serde(default)]
+    assets: Vec<BinanceAccountAsset>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceAccountAsset {
+    asset: String,
+    wallet_balance: String,
+    available_balance: String,
+}
+
+#[derive(Clone, Deserialize, Serialize)]
+struct BinanceIncomeResponse {
+    symbol: Option<String>,
+    #[serde(rename = "incomeType")]
+    income_type: String,
+    income: String,
+    asset: String,
+    time: i64,
+    info: Option<String>,
+    #[serde(rename = "tranId")]
+    tran_id: Option<serde_json::Value>,
+    #[serde(rename = "tradeId")]
+    trade_id: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -675,6 +1038,43 @@ struct PageStateRequest {
     up_button_found: bool,
     down_button_found: bool,
     observed_at: DateTime<Utc>,
+}
+
+#[derive(Deserialize)]
+struct SignalDeliveryAckRequest {
+    delivery_id: Uuid,
+    signal_id: Uuid,
+    reservation_id: Option<Uuid>,
+    received_at: DateTime<Utc>,
+    app_version: Option<String>,
+    page_state: Option<serde_json::Value>,
+}
+
+#[derive(Deserialize)]
+struct ExchangeCredentialRequest {
+    api_key: String,
+    api_secret: String,
+}
+
+#[derive(Serialize)]
+struct ExchangeCredentialResponse {
+    provider: String,
+    connected: bool,
+    can_read_account: bool,
+    verification_status: String,
+    balance_available_usdt: String,
+    balance_wallet_usdt: String,
+    last_verified_at: Option<DateTime<Utc>>,
+    message: String,
+}
+
+#[derive(Serialize)]
+struct ExchangeSyncResponse {
+    refreshed_balances: usize,
+    checked_orders: usize,
+    confirmed_orders: usize,
+    settled_reports: usize,
+    pending_settlements: usize,
 }
 
 #[derive(Deserialize)]
@@ -801,6 +1201,12 @@ struct SignalApiResponse {
     authorization_status: String,
     balance_available_after_reserve: String,
     model_version: String,
+}
+
+#[derive(Serialize)]
+struct SignalDeliveryAckResponse {
+    delivery_id: String,
+    status: String,
 }
 
 #[derive(Serialize)]
@@ -1268,19 +1674,101 @@ async fn get_trading_settings(
 async fn save_trading_settings(
     State(state): State<SharedState>,
     headers: HeaderMap,
-    Json(req): Json<TradingSettings>,
+    Json(_req): Json<TradingSettings>,
 ) -> Result<Json<TradingSettings>, AppError> {
-    let user_id = require_android_user(&state, &headers).await?;
-    validate_trading_settings(&req)?;
+    require_android_user(&state, &headers).await?;
+    Err(AppError::forbidden(
+        "TRADING_SETTINGS_ADMIN_ONLY",
+        "trading stake settings are controlled by the backend administrator",
+    ))
+}
+
+async fn admin_trading_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<PlatformTradingSettings>, AppError> {
+    ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        db_save_trading_settings(pool, user_id, &req).await?;
+        return Ok(Json(db_load_platform_trading_settings(pool).await?));
     }
-    state
-        .trading_settings
-        .write()
-        .await
-        .insert(user_id, req.clone());
+    Ok(Json(PlatformTradingSettings::default()))
+}
+
+async fn admin_save_trading_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<PlatformTradingSettings>,
+) -> Result<Json<PlatformTradingSettings>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    validate_platform_trading_settings(&req)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_save_platform_trading_settings(pool, &req).await?;
+        return Ok(Json(db_load_platform_trading_settings(pool).await?));
+    }
     Ok(Json(req))
+}
+
+async fn admin_exchange_workers(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<ExchangeWorkerSlot>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let Some(pool) = state.db.as_ref() else {
+        return Ok(Json(Vec::new()));
+    };
+    Ok(Json(db_exchange_worker_slots(pool).await?))
+}
+
+async fn admin_save_exchange_worker(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<SaveExchangeWorkerSlotRequest>,
+) -> Result<Json<Vec<ExchangeWorkerSlot>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    validate_exchange_worker_request(&req)?;
+    let Some(pool) = state.db.as_ref() else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange worker configuration requires PostgreSQL",
+        ));
+    };
+    let slot = db_save_exchange_worker_slot(pool, &req).await?;
+    sync_exchange_worker_runtime(&state, &slot).await?;
+    Ok(Json(db_exchange_worker_slots(pool).await?))
+}
+
+async fn admin_toggle_exchange_worker(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ToggleExchangeWorkerSlotRequest>,
+) -> Result<Json<Vec<ExchangeWorkerSlot>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let Some(pool) = state.db.as_ref() else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange worker configuration requires PostgreSQL",
+        ));
+    };
+    let slot = db_set_exchange_worker_enabled(pool, req.id, req.enabled).await?;
+    sync_exchange_worker_runtime(&state, &slot).await?;
+    Ok(Json(db_exchange_worker_slots(pool).await?))
+}
+
+async fn admin_delete_exchange_worker(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<DeleteExchangeWorkerSlotRequest>,
+) -> Result<Json<Vec<ExchangeWorkerSlot>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let Some(pool) = state.db.as_ref() else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange worker configuration requires PostgreSQL",
+        ));
+    };
+    stop_exchange_worker_runtime(&state, req.id).await;
+    db_delete_exchange_worker_slot(pool, req.id).await?;
+    Ok(Json(db_exchange_worker_slots(pool).await?))
 }
 
 async fn get_automation_settings(
@@ -1332,6 +1820,73 @@ async fn save_page_state(
     }
     state.page_states.write().await.insert(user_id, page_state);
     Ok(Json(json!({ "ok": true })))
+}
+
+async fn ack_signal_delivery(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<SignalDeliveryAckRequest>,
+) -> Result<Json<SignalDeliveryAckResponse>, AppError> {
+    let user_id = require_android_user(&state, &headers).await?;
+    if let Some(reservation_id) = req.reservation_id {
+        if reservation_id.is_nil() {
+            return Err(AppError::bad_request(
+                "RESERVATION_ID_INVALID",
+                "reservation_id cannot be nil",
+            ));
+        }
+    }
+    if let Some(pool) = state.db.as_ref() {
+        db_ack_signal_delivery(pool, user_id, &req).await?;
+    }
+    Ok(Json(SignalDeliveryAckResponse {
+        delivery_id: req.delivery_id.to_string(),
+        status: "received".to_string(),
+    }))
+}
+
+async fn exchange_status(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<ExchangeCredentialStatus>, AppError> {
+    let user_id = require_android_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        let status = db_exchange_credential_status(pool, user_id).await?;
+        return Ok(Json(status.unwrap_or_else(default_exchange_status)));
+    }
+    Ok(Json(default_exchange_status()))
+}
+
+async fn save_binance_credentials(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ExchangeCredentialRequest>,
+) -> Result<Json<ExchangeCredentialResponse>, AppError> {
+    let user_id = require_android_user(&state, &headers).await?;
+    let api_key = normalize_api_key(&req.api_key)?;
+    let api_secret = normalize_api_secret(&req.api_secret)?;
+    let snapshot = binance_account_access(&api_key, &api_secret).await?;
+    let now = Utc::now();
+    let ciphertext = encrypt_secret(&api_secret)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_upsert_exchange_credentials(pool, user_id, &api_key, &ciphertext, &snapshot, now)
+            .await?;
+    } else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange credential storage requires PostgreSQL",
+        ));
+    }
+    Ok(Json(ExchangeCredentialResponse {
+        provider: BINANCE_PROVIDER.to_string(),
+        connected: true,
+        can_read_account: true,
+        verification_status: "verified".to_string(),
+        balance_available_usdt: money(snapshot.available_balance_usdt),
+        balance_wallet_usdt: money(snapshot.wallet_balance_usdt),
+        last_verified_at: Some(now),
+        message: "binance futures read access verified".to_string(),
+    }))
 }
 
 async fn balance(
@@ -2099,6 +2654,323 @@ async fn verify_bsc_refund(
     })
 }
 
+fn default_exchange_status() -> ExchangeCredentialStatus {
+    ExchangeCredentialStatus {
+        provider: BINANCE_PROVIDER.to_string(),
+        connected: false,
+        can_read_account: false,
+        verification_status: "missing".to_string(),
+        balance_available_usdt: None,
+        balance_wallet_usdt: None,
+        balance_updated_at: None,
+        last_verified_at: None,
+        last_error: None,
+        updated_at: None,
+    }
+}
+
+fn binance_base_url() -> String {
+    env::var("BINANCE_FAPI_BASE_URL")
+        .unwrap_or_else(|_| BINANCE_FAPI_BASE_URL.to_string())
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn env_i32(name: &str, default: i32, min: i32) -> i32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i32>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn binance_bind_local_ip() -> Result<Option<std::net::IpAddr>, AppError> {
+    let Ok(value) = env::var("BINANCE_BIND_LOCAL_IP") else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
+        AppError::bad_request(
+            "BINANCE_BIND_LOCAL_IP_INVALID",
+            "BINANCE_BIND_LOCAL_IP must be a local IPv4 or IPv6 address",
+        )
+    })
+}
+
+fn parse_optional_ip(
+    value: Option<&str>,
+    field: &str,
+) -> Result<Option<std::net::IpAddr>, AppError> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        return Ok(None);
+    }
+    value.parse::<std::net::IpAddr>().map(Some).map_err(|_| {
+        AppError::bad_request(
+            "IP_ADDRESS_INVALID",
+            format!("{field} must be a local IPv4 or IPv6 address"),
+        )
+    })
+}
+
+fn binance_http_client() -> Result<reqwest::Client, AppError> {
+    binance_http_client_for(binance_bind_local_ip()?)
+}
+
+fn binance_http_client_for(
+    bind_local_ip: Option<std::net::IpAddr>,
+) -> Result<reqwest::Client, AppError> {
+    let mut builder = reqwest::Client::builder().timeout(StdDuration::from_secs(8));
+    if let Some(local_ip) = bind_local_ip {
+        builder = builder.local_address(local_ip);
+    }
+    builder
+        .build()
+        .map_err(|err| AppError::internal("HTTP_CLIENT_FAILED", err.to_string()))
+}
+
+fn normalize_api_key(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.len() < 20 || value.len() > 128 || !value.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return Err(AppError::bad_request(
+            "BINANCE_API_KEY_INVALID",
+            "api_key format is invalid",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn normalize_api_secret(value: &str) -> Result<String, AppError> {
+    let value = value.trim();
+    if value.len() < 20 || value.len() > 128 || !value.chars().all(|ch| ch.is_ascii_alphanumeric())
+    {
+        return Err(AppError::bad_request(
+            "BINANCE_API_SECRET_INVALID",
+            "api_secret format is invalid",
+        ));
+    }
+    Ok(value.to_string())
+}
+
+fn encryption_key() -> Result<[u8; 32], AppError> {
+    let raw = env::var("APP_ENCRYPTION_KEY").map_err(|_| {
+        AppError::bad_request(
+            "APP_ENCRYPTION_KEY_MISSING",
+            "APP_ENCRYPTION_KEY must be set before storing exchange credentials",
+        )
+    })?;
+    let trimmed = raw.trim();
+    let decoded = general_purpose::STANDARD
+        .decode(trimmed)
+        .or_else(|_| hex::decode(trimmed))
+        .map_err(|_| {
+            AppError::bad_request(
+                "APP_ENCRYPTION_KEY_INVALID",
+                "APP_ENCRYPTION_KEY must be base64 or hex",
+            )
+        })?;
+    if decoded.len() != 32 {
+        return Err(AppError::bad_request(
+            "APP_ENCRYPTION_KEY_INVALID",
+            "APP_ENCRYPTION_KEY must decode to 32 bytes",
+        ));
+    }
+    let mut key = [0u8; 32];
+    key.copy_from_slice(&decoded);
+    Ok(key)
+}
+
+fn encrypt_secret(secret: &str) -> Result<String, AppError> {
+    let key = encryption_key()?;
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
+        AppError::internal("ENCRYPTION_INIT_FAILED", "failed to initialize encryption")
+    })?;
+    let mut nonce = [0u8; 12];
+    OsRng.fill_bytes(&mut nonce);
+    let encrypted = cipher
+        .encrypt(Nonce::from_slice(&nonce), secret.as_bytes())
+        .map_err(|_| AppError::internal("ENCRYPTION_FAILED", "failed to encrypt secret"))?;
+    Ok(format!(
+        "v1:{}:{}",
+        general_purpose::STANDARD.encode(nonce),
+        general_purpose::STANDARD.encode(encrypted)
+    ))
+}
+
+fn decrypt_secret(ciphertext: &str) -> Result<String, AppError> {
+    let key = encryption_key()?;
+    let parts = ciphertext.split(':').collect::<Vec<_>>();
+    if parts.len() != 3 || parts[0] != "v1" {
+        return Err(AppError::bad_request(
+            "SECRET_CIPHERTEXT_INVALID",
+            "stored secret has invalid format",
+        ));
+    }
+    let nonce = general_purpose::STANDARD
+        .decode(parts[1])
+        .map_err(|_| AppError::bad_request("SECRET_CIPHERTEXT_INVALID", "invalid secret nonce"))?;
+    let encrypted = general_purpose::STANDARD
+        .decode(parts[2])
+        .map_err(|_| AppError::bad_request("SECRET_CIPHERTEXT_INVALID", "invalid secret body"))?;
+    if nonce.len() != 12 {
+        return Err(AppError::bad_request(
+            "SECRET_CIPHERTEXT_INVALID",
+            "invalid secret nonce length",
+        ));
+    }
+    let cipher = Aes256Gcm::new_from_slice(&key).map_err(|_| {
+        AppError::internal("ENCRYPTION_INIT_FAILED", "failed to initialize encryption")
+    })?;
+    let decrypted = cipher
+        .decrypt(Nonce::from_slice(&nonce), encrypted.as_ref())
+        .map_err(|_| {
+            AppError::bad_request("SECRET_DECRYPT_FAILED", "failed to decrypt exchange secret")
+        })?;
+    String::from_utf8(decrypted)
+        .map_err(|_| AppError::bad_request("SECRET_DECRYPT_FAILED", "exchange secret is not utf8"))
+}
+
+fn binance_signature(query: &str, secret: &str) -> Result<String, AppError> {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(secret.as_bytes()).map_err(|_| {
+        AppError::bad_request("BINANCE_SECRET_INVALID", "invalid Binance API secret")
+    })?;
+    mac.update(query.as_bytes());
+    Ok(hex::encode(mac.finalize().into_bytes()))
+}
+
+async fn binance_server_time(client: &reqwest::Client, base_url: &str) -> Result<i64, AppError> {
+    let response = client
+        .get(format!("{base_url}/fapi/v1/time"))
+        .send()
+        .await
+        .map_err(|err| AppError::bad_request("BINANCE_REQUEST_FAILED", err.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::bad_request(
+            "BINANCE_REQUEST_FAILED",
+            format!("server time failed: {status} {text}"),
+        ));
+    }
+    response
+        .json::<BinanceTimeResponse>()
+        .await
+        .map(|body| body.server_time)
+        .map_err(|err| AppError::bad_request("BINANCE_RESPONSE_INVALID", err.to_string()))
+}
+
+fn append_query_pair(query: &mut String, name: &str, value: impl ToString) {
+    if !query.is_empty() {
+        query.push('&');
+    }
+    query.push_str(name);
+    query.push('=');
+    query.push_str(&value.to_string());
+}
+
+async fn binance_signed_get<T: DeserializeOwned>(
+    client: &reqwest::Client,
+    api_key: &str,
+    api_secret: &str,
+    path: &str,
+    mut pairs: Vec<(&str, String)>,
+) -> Result<T, AppError> {
+    let base_url = binance_base_url();
+    let server_time = binance_server_time(client, &base_url).await?;
+    pairs.push(("recvWindow", BINANCE_RECV_WINDOW.to_string()));
+    pairs.push(("timestamp", server_time.to_string()));
+    let mut query = String::new();
+    for (name, value) in pairs {
+        append_query_pair(&mut query, name, value);
+    }
+    let signature = binance_signature(&query, api_secret)?;
+    let response = client
+        .get(format!("{base_url}{path}?{query}&signature={signature}"))
+        .header("X-MBX-APIKEY", api_key)
+        .send()
+        .await
+        .map_err(|err| AppError::bad_request("BINANCE_REQUEST_FAILED", err.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::bad_request(
+            "BINANCE_REQUEST_FAILED",
+            format!("{path} failed: {status} {text}"),
+        ));
+    }
+    response
+        .json::<T>()
+        .await
+        .map_err(|err| AppError::bad_request("BINANCE_RESPONSE_INVALID", err.to_string()))
+}
+
+fn binance_account_snapshot(
+    account: BinanceAccountResponse,
+) -> Result<BinanceAccountSnapshot, AppError> {
+    if let Some(asset) = account
+        .assets
+        .into_iter()
+        .find(|asset| asset.asset.eq_ignore_ascii_case("USDT"))
+    {
+        return Ok(BinanceAccountSnapshot {
+            wallet_balance_usdt: parse_decimal(&asset.wallet_balance, "walletBalance")?,
+            available_balance_usdt: parse_decimal(&asset.available_balance, "availableBalance")?,
+        });
+    }
+    Ok(BinanceAccountSnapshot {
+        wallet_balance_usdt: parse_decimal(&account.total_wallet_balance, "totalWalletBalance")?,
+        available_balance_usdt: parse_decimal(&account.total_wallet_balance, "totalWalletBalance")?,
+    })
+}
+
+async fn binance_account_access(
+    api_key: &str,
+    api_secret: &str,
+) -> Result<BinanceAccountSnapshot, AppError> {
+    binance_account_access_with_bind(api_key, api_secret, binance_bind_local_ip()?).await
+}
+
+async fn binance_account_access_with_bind(
+    api_key: &str,
+    api_secret: &str,
+    bind_local_ip: Option<std::net::IpAddr>,
+) -> Result<BinanceAccountSnapshot, AppError> {
+    let client = binance_http_client_for(bind_local_ip)?;
+    let account: BinanceAccountResponse =
+        binance_signed_get(&client, api_key, api_secret, "/fapi/v2/account", Vec::new()).await?;
+    binance_account_snapshot(account)
+}
+
+async fn binance_income_events_with_client(
+    api_key: &str,
+    api_secret: &str,
+    start_time: DateTime<Utc>,
+    end_time: DateTime<Utc>,
+    limit: usize,
+    bind_local_ip: Option<std::net::IpAddr>,
+) -> Result<Vec<BinanceIncomeResponse>, AppError> {
+    let client = binance_http_client_for(bind_local_ip)?;
+    binance_signed_get(
+        &client,
+        api_key,
+        api_secret,
+        "/fapi/v1/income",
+        vec![
+            ("startTime", start_time.timestamp_millis().to_string()),
+            ("endTime", end_time.timestamp_millis().to_string()),
+            ("limit", limit.to_string()),
+        ],
+    )
+    .await
+}
+
 async fn rpc_call<T: DeserializeOwned>(
     rpc_url: &str,
     method: &str,
@@ -2242,6 +3114,22 @@ async fn submit_execution_report(
     }))
 }
 
+async fn admin_sync_exchange(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<ExchangeSyncResponse>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    let Some(pool) = state.db.as_ref() else {
+        return Err(AppError::bad_request(
+            "DATABASE_REQUIRED",
+            "exchange synchronization requires PostgreSQL",
+        ));
+    };
+    let config = ExchangeWorkerConfig::from_env();
+    let response = sync_exchange_orders(pool, &config).await?;
+    Ok(Json(response))
+}
+
 async fn settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -2311,19 +3199,75 @@ async fn ws_handler(
 
 async fn websocket_loop(mut socket: WebSocket, state: SharedState, user_id: Uuid) {
     let mut rx = state.signal_tx.subscribe();
+    let ws_connection_id = Uuid::now_v7();
     let _ = socket
         .send(Message::Text(
-            json!({"type": "connection.ready", "data": {"server_time": Utc::now()}}).to_string(),
+            json!({
+                "type": "connection.ready",
+                "data": {
+                    "server_time": Utc::now(),
+                    "ws_connection_id": ws_connection_id
+                }
+            })
+            .to_string(),
         ))
         .await;
     while let Ok(signal) = rx.recv().await {
         let payload = authorize_signal_for_user(&state, user_id, &signal).await;
+        let delivery_id = Uuid::now_v7();
+        let sent_at = Utc::now();
+        if let Some(pool) = state.db.as_ref() {
+            if let Err(err) = db_insert_signal_delivery(
+                pool,
+                &SignalDeliveryRecord {
+                    id: delivery_id,
+                    signal_id: signal.id,
+                    user_id,
+                    reservation_id: payload
+                        .reservation_id
+                        .as_deref()
+                        .and_then(|value| Uuid::parse_str(value).ok()),
+                    ws_connection_id,
+                    delivery_status: "sent".to_string(),
+                    authorization_status: payload.authorization_status.clone(),
+                    trade_authorized: payload.trade_authorized,
+                    stake_usdt: parse_decimal(&payload.suggested_stake, "suggested_stake")
+                        .unwrap_or(Decimal::ZERO),
+                    fee_reserve_usdt: parse_decimal(&payload.fee_reserve_usdt, "fee_reserve_usdt")
+                        .unwrap_or(Decimal::ZERO),
+                    sent_at,
+                    received_at: None,
+                    client_received_at: None,
+                    page_state: None,
+                    app_version: None,
+                    last_error: None,
+                    created_at: sent_at,
+                    updated_at: sent_at,
+                },
+            )
+            .await
+            {
+                eprintln!("signal delivery insert failed: {}", err.message);
+            }
+        }
         let text = json!({
             "type": "signal.created",
+            "delivery_id": delivery_id,
+            "sent_at": sent_at,
+            "ws_connection_id": ws_connection_id,
             "data": payload,
         })
         .to_string();
         if socket.send(Message::Text(text)).await.is_err() {
+            if let Some(pool) = state.db.as_ref() {
+                let _ = db_mark_signal_delivery_failed(
+                    pool,
+                    delivery_id,
+                    "websocket send failed",
+                    Utc::now(),
+                )
+                .await;
+            }
             break;
         }
     }
@@ -2902,34 +3846,30 @@ fn normalize_admin_username(username: &str) -> Result<String, AppError> {
     Ok(username.to_string())
 }
 
-fn validate_trading_settings(settings: &TradingSettings) -> Result<(), AppError> {
+fn validate_platform_trading_settings(settings: &PlatformTradingSettings) -> Result<(), AppError> {
     if settings.stake_percent < dec!(0.01) || settings.stake_percent > dec!(0.20) {
         return Err(AppError::bad_request(
-            "USER_SETTING_OUT_OF_RANGE",
+            "PLATFORM_SETTING_OUT_OF_RANGE",
             "stake_percent must be between 0.01 and 0.20",
         ));
     }
-    if settings.min_stake_usdt <= Decimal::ZERO {
+    if !(MIN_EVENT_STAKE..=MAX_EVENT_STAKE).contains(&settings.min_stake_usdt) {
         return Err(AppError::bad_request(
-            "USER_SETTING_OUT_OF_RANGE",
-            "min_stake_usdt must be positive",
+            "PLATFORM_SETTING_OUT_OF_RANGE",
+            "min_stake_usdt must be between 5 and 250",
         ));
     }
-    if let Some(max) = settings.max_single_stake_usdt {
-        if !(MIN_EVENT_STAKE..=MAX_EVENT_STAKE).contains(&max) {
-            return Err(AppError::bad_request(
-                "USER_SETTING_OUT_OF_RANGE",
-                "max_single_stake_usdt must be between 5 and 250",
-            ));
-        }
+    if !(MIN_EVENT_STAKE..=MAX_EVENT_STAKE).contains(&settings.max_single_stake_usdt) {
+        return Err(AppError::bad_request(
+            "PLATFORM_SETTING_OUT_OF_RANGE",
+            "max_single_stake_usdt must be between 5 and 250",
+        ));
     }
-    if let Some(confidence) = settings.min_confidence {
-        if confidence < Decimal::ZERO || confidence > Decimal::ONE {
-            return Err(AppError::bad_request(
-                "USER_SETTING_OUT_OF_RANGE",
-                "min_confidence must be between 0 and 1",
-            ));
-        }
+    if settings.min_stake_usdt > settings.max_single_stake_usdt {
+        return Err(AppError::bad_request(
+            "PLATFORM_SETTING_OUT_OF_RANGE",
+            "min_stake_usdt cannot exceed max_single_stake_usdt",
+        ));
     }
     Ok(())
 }
@@ -2980,8 +3920,8 @@ async fn load_automation_settings(state: &SharedState, user_id: Uuid) -> Automat
 
 async fn load_trading_settings(state: &SharedState, user_id: Uuid) -> TradingSettings {
     if let Some(pool) = state.db.as_ref() {
-        if let Ok(Some(settings)) = db_load_trading_settings(pool, user_id).await {
-            return settings;
+        if let Ok(settings) = db_load_platform_trading_settings(pool).await {
+            return TradingSettings::from(&settings);
         }
     }
     state
@@ -3014,6 +3954,16 @@ async fn load_balance(state: &SharedState, user_id: Uuid) -> BalanceRecord {
         })
 }
 
+async fn load_exchange_available_balance(
+    state: &SharedState,
+    user_id: Uuid,
+) -> Result<Option<Decimal>, AppError> {
+    let Some(pool) = state.db.as_ref() else {
+        return Ok(None);
+    };
+    db_exchange_available_balance(pool, user_id).await
+}
+
 async fn display_signal_for_user(
     state: &SharedState,
     user_id: Uuid,
@@ -3021,7 +3971,12 @@ async fn display_signal_for_user(
 ) -> SignalApiResponse {
     let settings = load_trading_settings(state, user_id).await;
     let balance = load_balance(state, user_id).await;
-    let stake = calculated_stake(balance.available, &settings, Some(signal.suggested_stake));
+    let exchange_available = load_exchange_available_balance(state, user_id)
+        .await
+        .ok()
+        .flatten();
+    let stake_base = exchange_available.unwrap_or(balance.available);
+    let stake = calculated_stake(stake_base, &settings, None);
     SignalApiResponse {
         id: signal.id.to_string(),
         signal_id: signal.id.to_string(),
@@ -3035,8 +3990,8 @@ async fn display_signal_for_user(
         entry_price: money(signal.entry_price),
         suggested_stake: money(stake),
         stake_percent: decimal(settings.stake_percent),
-        suggested_stake_rule: "display-only; no reserve is created by latest/history endpoints"
-            .to_string(),
+        suggested_stake_rule:
+            "展示值按缓存的 U 本位合约可用余额和后台比例计算；latest/history 不创建预扣".to_string(),
         trade_authorized: false,
         reservation_id: None,
         fee_reserve_usdt: money(Decimal::ZERO),
@@ -3054,11 +4009,31 @@ async fn authorize_signal_for_user(
     let trading = load_trading_settings(state, user_id).await;
     let automation = load_automation_settings(state, user_id).await;
     let balance = load_balance(state, user_id).await;
-    let stake = calculated_stake(balance.available, &trading, Some(signal.suggested_stake));
+    let exchange_available = match load_exchange_available_balance(state, user_id).await {
+        Ok(value) => value,
+        Err(err) => {
+            return signal_response_with_status(
+                signal,
+                &trading,
+                MIN_EVENT_STAKE,
+                Decimal::ZERO,
+                balance.available,
+                err.code,
+            )
+        }
+    };
+    let stake_base = exchange_available.unwrap_or(Decimal::ZERO);
+    let stake = calculated_stake(stake_base, &trading, None);
     let expected_profit = stake * DEFAULT_PAYOUT_RATIO;
     let fee_reserve = expected_profit * PROFIT_SHARE_RATE;
 
     let mut status = "reserved".to_string();
+    if exchange_available.is_none() {
+        status = "exchange_balance_missing".to_string();
+    }
+    if status == "reserved" && stake_base < MIN_EVENT_STAKE {
+        status = "exchange_balance_insufficient".to_string();
+    }
     if !automation.automation_enabled
         || automation.execution_mode != "automatic"
         || automation.require_final_confirmation
@@ -3175,7 +4150,9 @@ async fn authorize_signal_for_user(
         entry_price: money(signal.entry_price),
         suggested_stake: money(stake),
         stake_percent: decimal(trading.stake_percent),
-        suggested_stake_rule: "clamp(max(balance * user_stake_percent, 5 USDT), 5, 250 USDT); fee reserve = expected profit * 30%".to_string(),
+        suggested_stake_rule:
+            "U本位合约可用余额 * 后台比例，最低 5 USDT，最高 250 USDT；预扣 = 预计盈利 * 30%"
+                .to_string(),
         trade_authorized: status == "reserved",
         reservation_id: reservation_id.map(|id| id.to_string()),
         fee_reserve_usdt: money(fee_reserve),
@@ -3230,7 +4207,9 @@ fn signal_response_with_status(
         entry_price: money(signal.entry_price),
         suggested_stake: money(stake),
         stake_percent: decimal(trading.stake_percent),
-        suggested_stake_rule: "clamp(max(balance * user_stake_percent, 5 USDT), 5, 250 USDT); fee reserve = expected profit * 30%".to_string(),
+        suggested_stake_rule:
+            "U本位合约可用余额 * 后台比例，最低 5 USDT，最高 250 USDT；预扣 = 预计盈利 * 30%"
+                .to_string(),
         trade_authorized: false,
         reservation_id: None,
         fee_reserve_usdt: money(fee_reserve),
@@ -3238,6 +4217,217 @@ fn signal_response_with_status(
         balance_available_after_reserve: money(balance_after),
         model_version: signal.model_version.clone(),
     }
+}
+
+async fn sync_exchange_orders(
+    pool: &PgPool,
+    config: &ExchangeWorkerConfig,
+) -> Result<ExchangeSyncResponse, AppError> {
+    let refreshed_balances = refresh_exchange_balances(pool, config).await?;
+    let pending_orders =
+        db_pending_exchange_orders(pool, BINANCE_ORDER_CONFIRM_LIMIT, config).await?;
+    let mut checked_orders = 0usize;
+    let mut confirmed_orders = 0usize;
+    for order in pending_orders {
+        checked_orders += 1;
+        if confirm_order_from_binance_income(pool, &order, config).await? {
+            confirmed_orders += 1;
+        }
+    }
+
+    let due_orders = db_confirmed_exchange_orders_due_for_settlement(
+        pool,
+        Utc::now(),
+        BINANCE_SETTLEMENT_SYNC_LIMIT,
+        config,
+    )
+    .await?;
+    let mut settled_reports = 0usize;
+    let mut pending_settlements = 0usize;
+    for order in due_orders {
+        match settle_order_from_binance_income(pool, &order, config).await? {
+            true => settled_reports += 1,
+            false => pending_settlements += 1,
+        }
+    }
+
+    Ok(ExchangeSyncResponse {
+        refreshed_balances,
+        checked_orders,
+        confirmed_orders,
+        settled_reports,
+        pending_settlements,
+    })
+}
+
+async fn refresh_exchange_balances(
+    pool: &PgPool,
+    config: &ExchangeWorkerConfig,
+) -> Result<usize, AppError> {
+    let now = Utc::now();
+    let credentials = db_exchange_credentials_for_balance_refresh(
+        pool,
+        now,
+        BINANCE_BALANCE_REFRESH_LIMIT,
+        config,
+    )
+    .await?;
+    let mut refreshed = 0usize;
+    for credential in credentials {
+        let api_secret = match decrypt_secret(&credential.api_secret_ciphertext) {
+            Ok(secret) => secret,
+            Err(err) => {
+                db_mark_exchange_error(pool, credential.user_id, &err.message, Utc::now()).await?;
+                continue;
+            }
+        };
+        match binance_account_access_with_bind(
+            &credential.api_key,
+            &api_secret,
+            config.bind_local_ip,
+        )
+        .await
+        {
+            Ok(snapshot) => {
+                db_update_exchange_balance(pool, credential.user_id, &snapshot, Utc::now()).await?;
+                refreshed += 1;
+            }
+            Err(err) => {
+                db_mark_exchange_error(pool, credential.user_id, &err.message, Utc::now()).await?;
+            }
+        }
+    }
+    Ok(refreshed)
+}
+
+async fn confirm_order_from_binance_income(
+    pool: &PgPool,
+    order: &EventContractOrderRecord,
+    config: &ExchangeWorkerConfig,
+) -> Result<bool, AppError> {
+    let Some(credentials) = db_exchange_credentials(pool, order.user_id).await? else {
+        return Ok(false);
+    };
+    let api_secret = decrypt_secret(&credentials.api_secret_ciphertext)?;
+    let anchor = order.reported_at.unwrap_or(order.created_at);
+    let start = anchor - Duration::minutes(BINANCE_INCOME_LOOKBACK_MINUTES);
+    let end = anchor + Duration::minutes(BINANCE_INCOME_LOOKBACK_MINUTES);
+    let rows = binance_income_events_with_client(
+        &credentials.api_key,
+        &api_secret,
+        start,
+        end,
+        100,
+        config.bind_local_ip,
+    )
+    .await?;
+    let mut matches = Vec::new();
+    for row in rows {
+        if row.income_type != "EVENT_CONTRACTS_ORDER" {
+            continue;
+        }
+        let Some(event) = binance_income_to_record(order.user_id, &row)? else {
+            continue;
+        };
+        if event.asset != "USDT" {
+            continue;
+        }
+        if event.income != -order.stake_usdt {
+            continue;
+        }
+        let delta = (event.event_time - anchor).num_seconds().abs();
+        matches.push((delta, event));
+    }
+    matches.sort_by_key(|(delta, _)| *delta);
+    let Some((_, event)) = matches.into_iter().next() else {
+        return Ok(false);
+    };
+    db_confirm_order_from_exchange(pool, order.id, &event).await
+}
+
+async fn settle_order_from_binance_income(
+    pool: &PgPool,
+    order: &EventContractOrderRecord,
+    config: &ExchangeWorkerConfig,
+) -> Result<bool, AppError> {
+    let Some(exchange_ref) = db_order_exchange_ref(pool, order.id).await? else {
+        return Ok(false);
+    };
+    let Some(credentials) = db_exchange_credentials(pool, order.user_id).await? else {
+        return Ok(false);
+    };
+    let api_secret = decrypt_secret(&credentials.api_secret_ciphertext)?;
+    let anchor = order.reported_at.unwrap_or(order.created_at);
+    let start = anchor - Duration::minutes(1);
+    let end =
+        anchor + Duration::seconds(order.period_seconds as i64 + BINANCE_SETTLEMENT_GRACE_SECONDS);
+    if Utc::now() < end {
+        return Ok(false);
+    }
+    let rows = binance_income_events_with_client(
+        &credentials.api_key,
+        &api_secret,
+        start,
+        Utc::now(),
+        100,
+        config.bind_local_ip,
+    )
+    .await?;
+    let mut order_event: Option<BinanceIncomeEventRecord> = None;
+    let mut payout_event: Option<BinanceIncomeEventRecord> = None;
+    for row in rows {
+        let Some(event) = binance_income_to_record(order.user_id, &row)? else {
+            continue;
+        };
+        if event.external_ref != exchange_ref || event.asset != "USDT" {
+            continue;
+        }
+        if event.income_type == "EVENT_CONTRACTS_ORDER" && event.income == -order.stake_usdt {
+            order_event = Some(event);
+        } else if event.income_type == "EVENT_CONTRACTS_PAYOUT" && event.income > Decimal::ZERO {
+            match payout_event.as_ref() {
+                Some(existing) if existing.event_time >= event.event_time => {}
+                _ => payout_event = Some(event),
+            }
+        }
+    }
+    if order_event.is_none() {
+        return Ok(false);
+    }
+    let payout = payout_event
+        .as_ref()
+        .map(|event| event.income)
+        .unwrap_or(Decimal::ZERO);
+    let gross_profit = payout - order.stake_usdt;
+    let result = if gross_profit > Decimal::ZERO {
+        "WIN"
+    } else {
+        "LOSS"
+    };
+    let now = Utc::now();
+    let report = ExecutionReportRecord {
+        id: Uuid::now_v7(),
+        user_id: order.user_id,
+        signal_id: order.signal_id.clone(),
+        client_report_id: format!("binance-income:{}:{}", order.id, exchange_ref),
+        source: "binance_income".to_string(),
+        symbol: order.symbol.clone(),
+        period_seconds: order.period_seconds,
+        direction: order.direction.clone(),
+        stake_usdt: order.stake_usdt,
+        entry_price: None,
+        expiry_price: None,
+        payout_ratio: Some(DEFAULT_PAYOUT_RATIO),
+        gross_profit: Some(gross_profit),
+        result: result.to_string(),
+        automation_profile: order.automation_profile.clone(),
+        automation_confidence: order.automation_confidence,
+        action_trace_id: order.action_trace_id.clone(),
+        report_status: "pending_review".to_string(),
+        reported_at: now,
+        created_at: now,
+    };
+    db_insert_exchange_execution_report_and_settle(pool, &report, payout_event.as_ref()).await
 }
 
 fn calculated_stake(
@@ -3670,62 +4860,49 @@ async fn db_session_by_token(
         .map_err(AppError::from_sqlx)
 }
 
-async fn db_load_trading_settings(
+async fn db_load_platform_trading_settings(
     pool: &PgPool,
-    user_id: Uuid,
-) -> Result<Option<TradingSettings>, AppError> {
+) -> Result<PlatformTradingSettings, AppError> {
     sqlx::query(
         r#"
-        select stake_percent, min_stake_usdt, max_single_stake_usdt, min_confidence,
-               signal_alert_enabled, floating_window_enabled
-        from user_trading_settings
-        where user_id = $1
+        select stake_percent, min_stake_usdt, max_single_stake_usdt, updated_at
+        from platform_trading_settings
+        where id = true
         "#,
     )
-    .bind(user_id)
     .fetch_optional(pool)
     .await
     .map(|row| {
-        row.map(|row| TradingSettings {
+        row.map(|row| PlatformTradingSettings {
             stake_percent: row.get("stake_percent"),
             min_stake_usdt: row.get("min_stake_usdt"),
             max_single_stake_usdt: row.get("max_single_stake_usdt"),
-            min_confidence: row.get("min_confidence"),
-            signal_alert_enabled: row.get("signal_alert_enabled"),
-            floating_window_enabled: row.get("floating_window_enabled"),
+            updated_at: Some(row.get("updated_at")),
         })
+        .unwrap_or_default()
     })
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_save_trading_settings(
+async fn db_save_platform_trading_settings(
     pool: &PgPool,
-    user_id: Uuid,
-    settings: &TradingSettings,
+    settings: &PlatformTradingSettings,
 ) -> Result<(), AppError> {
     sqlx::query(
         r#"
-        insert into user_trading_settings
-          (user_id, stake_percent, min_stake_usdt, max_single_stake_usdt, min_confidence,
-           signal_alert_enabled, floating_window_enabled, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8)
-        on conflict (user_id) do update set
+        insert into platform_trading_settings
+          (id, stake_percent, min_stake_usdt, max_single_stake_usdt, updated_at)
+        values (true, $1, $2, $3, $4)
+        on conflict (id) do update set
           stake_percent = excluded.stake_percent,
           min_stake_usdt = excluded.min_stake_usdt,
           max_single_stake_usdt = excluded.max_single_stake_usdt,
-          min_confidence = excluded.min_confidence,
-          signal_alert_enabled = excluded.signal_alert_enabled,
-          floating_window_enabled = excluded.floating_window_enabled,
           updated_at = excluded.updated_at
         "#,
     )
-    .bind(user_id)
     .bind(settings.stake_percent)
     .bind(settings.min_stake_usdt)
     .bind(settings.max_single_stake_usdt)
-    .bind(settings.min_confidence)
-    .bind(settings.signal_alert_enabled)
-    .bind(settings.floating_window_enabled)
     .bind(Utc::now())
     .execute(pool)
     .await
@@ -3876,6 +5053,343 @@ async fn db_save_page_state(
     .bind(page.down_button_found)
     .bind(page.observed_at)
     .bind(page.updated_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_signal_delivery(
+    pool: &PgPool,
+    delivery: &SignalDeliveryRecord,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into signal_deliveries
+          (id, signal_id, user_id, reservation_id, ws_connection_id,
+           delivery_status, authorization_status, trade_authorized, stake_usdt,
+           fee_reserve_usdt, sent_at, received_at, client_received_at, page_state,
+           app_version, last_error, created_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+        on conflict (signal_id, user_id, ws_connection_id) do nothing
+        "#,
+    )
+    .bind(delivery.id)
+    .bind(delivery.signal_id)
+    .bind(delivery.user_id)
+    .bind(delivery.reservation_id)
+    .bind(delivery.ws_connection_id)
+    .bind(&delivery.delivery_status)
+    .bind(&delivery.authorization_status)
+    .bind(delivery.trade_authorized)
+    .bind(delivery.stake_usdt)
+    .bind(delivery.fee_reserve_usdt)
+    .bind(delivery.sent_at)
+    .bind(delivery.received_at)
+    .bind(delivery.client_received_at)
+    .bind(&delivery.page_state)
+    .bind(&delivery.app_version)
+    .bind(&delivery.last_error)
+    .bind(delivery.created_at)
+    .bind(delivery.updated_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_ack_signal_delivery(
+    pool: &PgPool,
+    user_id: Uuid,
+    req: &SignalDeliveryAckRequest,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let row = sqlx::query(
+        r#"
+        update signal_deliveries
+        set delivery_status = case
+              when delivery_status = 'received' then 'ack_duplicate'
+              else 'received'
+            end,
+            received_at = coalesce(received_at, $4),
+            client_received_at = coalesce(client_received_at, $5),
+            page_state = coalesce($6, page_state),
+            app_version = coalesce($7, app_version),
+            updated_at = $4
+        where id = $1
+          and user_id = $2
+          and signal_id = $3
+        returning id
+        "#,
+    )
+    .bind(req.delivery_id)
+    .bind(user_id)
+    .bind(req.signal_id)
+    .bind(now)
+    .bind(req.received_at)
+    .bind(&req.page_state)
+    .bind(
+        req.app_version
+            .as_deref()
+            .map(|value| value.chars().take(64).collect::<String>()),
+    )
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    if row.is_none() {
+        return Err(AppError::bad_request(
+            "SIGNAL_DELIVERY_NOT_FOUND",
+            "signal delivery not found for this user",
+        ));
+    }
+    Ok(())
+}
+
+async fn db_mark_signal_delivery_failed(
+    pool: &PgPool,
+    delivery_id: Uuid,
+    message: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update signal_deliveries
+        set delivery_status = 'failed',
+            last_error = $2,
+            updated_at = $3
+        where id = $1
+          and delivery_status = 'sent'
+        "#,
+    )
+    .bind(delivery_id)
+    .bind(message.chars().take(500).collect::<String>())
+    .bind(now)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_exchange_credential_status(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<ExchangeCredentialStatus>, AppError> {
+    sqlx::query(
+        r#"
+        select provider, can_read_account, verification_status,
+               balance_available_usdt, balance_wallet_usdt, balance_updated_at,
+               last_verified_at, last_error, updated_at
+        from user_exchange_credentials
+        where user_id = $1 and provider = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| ExchangeCredentialStatus {
+            provider: row.get("provider"),
+            connected: true,
+            can_read_account: row.get("can_read_account"),
+            verification_status: row.get("verification_status"),
+            balance_available_usdt: row
+                .try_get::<Option<Decimal>, _>("balance_available_usdt")
+                .ok()
+                .flatten()
+                .map(money),
+            balance_wallet_usdt: row
+                .try_get::<Option<Decimal>, _>("balance_wallet_usdt")
+                .ok()
+                .flatten()
+                .map(money),
+            balance_updated_at: row.get("balance_updated_at"),
+            last_verified_at: row.get("last_verified_at"),
+            last_error: row.get("last_error"),
+            updated_at: Some(row.get("updated_at")),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_upsert_exchange_credentials(
+    pool: &PgPool,
+    user_id: Uuid,
+    api_key: &str,
+    api_secret_ciphertext: &str,
+    snapshot: &BinanceAccountSnapshot,
+    verified_at: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into user_exchange_credentials
+          (user_id, provider, api_key, api_secret_ciphertext, can_read_account,
+           verification_status, balance_available_usdt, balance_wallet_usdt, balance_updated_at,
+           last_verified_at, last_error, created_at, updated_at)
+        values ($1, $2, $3, $4, true, 'verified', $5, $6, $7, $7, null, $7, $7)
+        on conflict (user_id) do update set
+          api_key = excluded.api_key,
+          api_secret_ciphertext = excluded.api_secret_ciphertext,
+          can_read_account = true,
+          verification_status = 'verified',
+          balance_available_usdt = excluded.balance_available_usdt,
+          balance_wallet_usdt = excluded.balance_wallet_usdt,
+          balance_updated_at = excluded.balance_updated_at,
+          last_verified_at = excluded.last_verified_at,
+          last_error = null,
+          updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .bind(api_key)
+    .bind(api_secret_ciphertext)
+    .bind(snapshot.available_balance_usdt)
+    .bind(snapshot.wallet_balance_usdt)
+    .bind(verified_at)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_exchange_credentials(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<ExchangeCredentialRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select user_id, provider, api_key, api_secret_ciphertext, can_read_account,
+               verification_status, last_verified_at, last_error, updated_at
+        from user_exchange_credentials
+        where user_id = $1 and provider = $2 and verification_status = 'verified'
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| ExchangeCredentialRecord {
+            user_id: row.get("user_id"),
+            api_key: row.get("api_key"),
+            api_secret_ciphertext: row.get("api_secret_ciphertext"),
+        })
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_exchange_available_balance(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<Decimal>, AppError> {
+    sqlx::query(
+        r#"
+        select balance_available_usdt
+        from user_exchange_credentials
+        where user_id = $1
+          and provider = $2
+          and verification_status = 'verified'
+          and can_read_account = true
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.and_then(|row| row.get("balance_available_usdt")))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_exchange_credentials_for_balance_refresh(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+    config: &ExchangeWorkerConfig,
+) -> Result<Vec<ExchangeCredentialRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select user_id, api_key, api_secret_ciphertext
+        from user_exchange_credentials
+        where provider = $1
+          and verification_status = 'verified'
+          and can_read_account = true
+          and (
+            balance_updated_at is null
+            or balance_updated_at <= $2
+          )
+          and mod(abs(hashtext(user_id::text)), $3) = $4
+        order by coalesce(balance_updated_at, timestamptz 'epoch') asc
+        limit $5
+        "#,
+    )
+    .bind(BINANCE_PROVIDER)
+    .bind(now - Duration::seconds(BINANCE_BALANCE_REFRESH_SECONDS))
+    .bind(config.shard_total)
+    .bind(config.shard_index)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(|row| ExchangeCredentialRecord {
+                user_id: row.get("user_id"),
+                api_key: row.get("api_key"),
+                api_secret_ciphertext: row.get("api_secret_ciphertext"),
+            })
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_update_exchange_balance(
+    pool: &PgPool,
+    user_id: Uuid,
+    snapshot: &BinanceAccountSnapshot,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update user_exchange_credentials
+        set balance_available_usdt = $3,
+            balance_wallet_usdt = $4,
+            balance_updated_at = $5,
+            last_verified_at = $5,
+            last_error = null,
+            updated_at = $5
+        where user_id = $1 and provider = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .bind(snapshot.available_balance_usdt)
+    .bind(snapshot.wallet_balance_usdt)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_mark_exchange_error(
+    pool: &PgPool,
+    user_id: Uuid,
+    message: &str,
+    now: DateTime<Utc>,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update user_exchange_credentials
+        set last_error = $3,
+            balance_updated_at = $4,
+            updated_at = $4
+        where user_id = $1 and provider = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .bind(message.chars().take(500).collect::<String>())
+    .bind(now)
     .execute(pool)
     .await
     .map(|_| ())
@@ -4891,6 +6405,383 @@ async fn db_insert_order_with_reservation_validation(
     Ok(())
 }
 
+fn binance_income_to_record(
+    user_id: Uuid,
+    income: &BinanceIncomeResponse,
+) -> Result<Option<BinanceIncomeEventRecord>, AppError> {
+    let Some(external_ref) = income
+        .info
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let value = parse_decimal(&income.income, "income")?;
+    let event_time = DateTime::<Utc>::from_timestamp_millis(income.time).ok_or_else(|| {
+        AppError::bad_request("BINANCE_INCOME_TIME_INVALID", "invalid income event time")
+    })?;
+    Ok(Some(BinanceIncomeEventRecord {
+        id: Uuid::now_v7(),
+        user_id,
+        provider: BINANCE_PROVIDER.to_string(),
+        external_ref: external_ref.to_string(),
+        income_type: income.income_type.clone(),
+        income: value,
+        asset: income.asset.clone(),
+        event_time,
+        tran_id: income.tran_id.as_ref().map(|value| value.to_string()),
+        trade_id: income.trade_id.as_ref().map(|value| value.to_string()),
+        raw: serde_json::to_value(income).unwrap_or_else(|_| json!({})),
+        created_at: Utc::now(),
+    }))
+}
+
+async fn db_upsert_income_event(
+    tx: &mut Transaction<'_, Postgres>,
+    event: &BinanceIncomeEventRecord,
+) -> Result<Uuid, AppError> {
+    sqlx::query(
+        r#"
+        insert into binance_income_events
+          (id, user_id, provider, external_ref, income_type, income, asset,
+           event_time, tran_id, trade_id, raw, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+        on conflict (user_id, provider, external_ref, income_type, income, event_time) do update set
+          tran_id = excluded.tran_id,
+          trade_id = excluded.trade_id,
+          raw = excluded.raw
+        returning id
+        "#,
+    )
+    .bind(event.id)
+    .bind(event.user_id)
+    .bind(&event.provider)
+    .bind(&event.external_ref)
+    .bind(&event.income_type)
+    .bind(event.income)
+    .bind(&event.asset)
+    .bind(event.event_time)
+    .bind(&event.tran_id)
+    .bind(&event.trade_id)
+    .bind(&event.raw)
+    .bind(event.created_at)
+    .fetch_one(&mut **tx)
+    .await
+    .map(|row| row.get("id"))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_confirm_order_from_exchange(
+    pool: &PgPool,
+    order_id: Uuid,
+    event: &BinanceIncomeEventRecord,
+) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let income_event_id = db_upsert_income_event(&mut tx, event).await?;
+    let row = sqlx::query(
+        r#"
+        update event_contract_orders
+        set exchange_ref = $2,
+            exchange_order_income_id = $3,
+            exchange_order_amount = $4,
+            exchange_order_time = $5,
+            exchange_verification_status = 'confirmed',
+            exchange_verified_at = $6,
+            order_status = 'exchange_confirmed'
+        where id = $1
+          and exchange_verification_status in ('unverified', 'pending')
+        returning id
+        "#,
+    )
+    .bind(order_id)
+    .bind(&event.external_ref)
+    .bind(income_event_id)
+    .bind(-event.income)
+    .bind(event.event_time)
+    .bind(Utc::now())
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(row.is_some())
+}
+
+fn event_order_from_row(row: sqlx::postgres::PgRow) -> EventContractOrderRecord {
+    EventContractOrderRecord {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        reservation_id: row.get("reservation_id"),
+        signal_id: row.get("signal_ref"),
+        client_order_id: row.get("client_order_id"),
+        source: row.get("source"),
+        symbol: row.get("symbol"),
+        period_seconds: row.get("period_seconds"),
+        direction: row.get("direction"),
+        stake_usdt: row.get("stake_usdt"),
+        automation_profile: row.get("automation_profile"),
+        automation_confidence: row.get("automation_confidence"),
+        action_trace_id: row.get("action_trace_id"),
+        raw_audit: row.get("raw_audit"),
+        order_status: row.get("order_status"),
+        reported_at: row.get("reported_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn exchange_worker_slot_from_row(row: sqlx::postgres::PgRow) -> ExchangeWorkerSlot {
+    ExchangeWorkerSlot {
+        id: row.get("id"),
+        name: row.get("name"),
+        shard_total: row.get("shard_total"),
+        shard_index: row.get("shard_index"),
+        bind_local_ip: row.get("bind_local_ip"),
+        enabled: row.get("enabled"),
+        status: row.get("status"),
+        last_started_at: row.get("last_started_at"),
+        last_stopped_at: row.get("last_stopped_at"),
+        last_error: row.get("last_error"),
+        updated_at: row.get("updated_at"),
+        created_at: row.get("created_at"),
+    }
+}
+
+fn validate_exchange_worker_request(req: &SaveExchangeWorkerSlotRequest) -> Result<(), AppError> {
+    if req.shard_total < 1 {
+        return Err(AppError::bad_request(
+            "WORKER_SHARD_TOTAL_INVALID",
+            "shard_total must be at least 1",
+        ));
+    }
+    if req.shard_index < 0 || req.shard_index >= req.shard_total {
+        return Err(AppError::bad_request(
+            "WORKER_SHARD_INDEX_INVALID",
+            "shard_index must be between 0 and shard_total - 1",
+        ));
+    }
+    parse_optional_ip(req.bind_local_ip.as_deref(), "bind_local_ip")?;
+    Ok(())
+}
+
+async fn db_exchange_worker_slots(pool: &PgPool) -> Result<Vec<ExchangeWorkerSlot>, AppError> {
+    sqlx::query(
+        r#"
+        select id, name, shard_total, shard_index, bind_local_ip, enabled, status,
+               last_started_at, last_stopped_at, last_error, updated_at, created_at
+        from exchange_worker_slots
+        order by shard_total asc, shard_index asc, created_at asc
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(exchange_worker_slot_from_row)
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_save_exchange_worker_slot(
+    pool: &PgPool,
+    req: &SaveExchangeWorkerSlotRequest,
+) -> Result<ExchangeWorkerSlot, AppError> {
+    let id = req.id.unwrap_or_else(Uuid::now_v7);
+    let now = Utc::now();
+    let name = req
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("exchange-worker");
+    let bind_local_ip = req
+        .bind_local_ip
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    sqlx::query(
+        r#"
+        insert into exchange_worker_slots
+          (id, name, shard_total, shard_index, bind_local_ip, enabled, status,
+           last_started_at, last_stopped_at, last_error, updated_at, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7,
+                case when $6 then $8 else null end,
+                case when $6 then null else $8 end,
+                null, $8, $8)
+        on conflict (id) do update set
+            name = excluded.name,
+            shard_total = excluded.shard_total,
+            shard_index = excluded.shard_index,
+            bind_local_ip = excluded.bind_local_ip,
+            enabled = excluded.enabled,
+            status = excluded.status,
+            last_started_at = case when excluded.enabled then excluded.updated_at else exchange_worker_slots.last_started_at end,
+            last_stopped_at = case when excluded.enabled then exchange_worker_slots.last_stopped_at else excluded.updated_at end,
+            last_error = null,
+            updated_at = excluded.updated_at
+        "#,
+    )
+    .bind(id)
+    .bind(name)
+    .bind(req.shard_total)
+    .bind(req.shard_index)
+    .bind(bind_local_ip)
+    .bind(req.enabled)
+    .bind(if req.enabled { "running" } else { "stopped" })
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    db_exchange_worker_slot(pool, id).await
+}
+
+async fn db_exchange_worker_slot(pool: &PgPool, id: Uuid) -> Result<ExchangeWorkerSlot, AppError> {
+    sqlx::query(
+        r#"
+        select id, name, shard_total, shard_index, bind_local_ip, enabled, status,
+               last_started_at, last_stopped_at, last_error, updated_at, created_at
+        from exchange_worker_slots
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .fetch_optional(pool)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .map(exchange_worker_slot_from_row)
+    .ok_or_else(|| AppError::bad_request("WORKER_NOT_FOUND", "exchange worker not found"))
+}
+
+async fn db_set_exchange_worker_enabled(
+    pool: &PgPool,
+    id: Uuid,
+    enabled: bool,
+) -> Result<ExchangeWorkerSlot, AppError> {
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        update exchange_worker_slots
+        set enabled = $2,
+            status = case when $2 then 'running' else 'stopped' end,
+            last_started_at = case when $2 then $3 else last_started_at end,
+            last_stopped_at = case when $2 then last_stopped_at else $3 end,
+            last_error = null,
+            updated_at = $3
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(enabled)
+    .bind(now)
+    .execute(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    db_exchange_worker_slot(pool, id).await
+}
+
+async fn db_delete_exchange_worker_slot(pool: &PgPool, id: Uuid) -> Result<(), AppError> {
+    sqlx::query("delete from exchange_worker_slots where id = $1")
+        .bind(id)
+        .execute(pool)
+        .await
+        .map(|_| ())
+        .map_err(AppError::from_sqlx)
+}
+
+async fn db_mark_exchange_worker_error(
+    pool: &PgPool,
+    id: Uuid,
+    error: &str,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        update exchange_worker_slots
+        set status = 'error',
+            last_error = $2,
+            updated_at = $3
+        where id = $1
+        "#,
+    )
+    .bind(id)
+    .bind(error)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_pending_exchange_orders(
+    pool: &PgPool,
+    limit: i64,
+    config: &ExchangeWorkerConfig,
+) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
+               period_seconds, direction, stake_usdt, automation_profile,
+               automation_confidence, action_trace_id, raw_audit, order_status, reported_at, created_at
+        from event_contract_orders
+        where exchange_verification_status in ('unverified', 'pending')
+          and mod(abs(hashtext(user_id::text)), $1) = $2
+        order by created_at asc
+        limit $3
+        "#,
+    )
+    .bind(config.shard_total)
+    .bind(config.shard_index)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(event_order_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_confirmed_exchange_orders_due_for_settlement(
+    pool: &PgPool,
+    now: DateTime<Utc>,
+    limit: i64,
+    config: &ExchangeWorkerConfig,
+) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
+               period_seconds, direction, stake_usdt, automation_profile,
+               automation_confidence, action_trace_id, raw_audit, order_status, reported_at, created_at
+        from event_contract_orders
+        where exchange_verification_status = 'confirmed'
+          and exchange_ref is not null
+          and created_at <= $1
+          and mod(abs(hashtext(user_id::text)), $2) = $3
+          and not exists (
+            select 1 from execution_reports r
+            where r.user_id = event_contract_orders.user_id
+              and r.signal_id::text = event_contract_orders.signal_ref
+          )
+        order by created_at asc
+        limit $4
+        "#,
+    )
+    .bind(now - Duration::seconds(BINANCE_SETTLEMENT_GRACE_SECONDS))
+    .bind(config.shard_total)
+    .bind(config.shard_index)
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(event_order_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_order_exchange_ref(pool: &PgPool, order_id: Uuid) -> Result<Option<String>, AppError> {
+    sqlx::query("select exchange_ref from event_contract_orders where id = $1")
+        .bind(order_id)
+        .fetch_optional(pool)
+        .await
+        .map(|row| row.and_then(|row| row.get("exchange_ref")))
+        .map_err(AppError::from_sqlx)
+}
+
 async fn db_insert_execution_report(
     pool: &PgPool,
     report: &ExecutionReportRecord,
@@ -4936,6 +6827,72 @@ async fn db_insert_execution_report(
     .await
     .map(|_| ())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_exchange_execution_report_and_settle(
+    pool: &PgPool,
+    report: &ExecutionReportRecord,
+    payout_event: Option<&BinanceIncomeEventRecord>,
+) -> Result<bool, AppError> {
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let payout_event_id = match payout_event {
+        Some(event) => Some(db_upsert_income_event(&mut tx, event).await?),
+        None => None,
+    };
+    let signal_id = Uuid::parse_str(&report.signal_id).map_err(|_| {
+        AppError::bad_request(
+            "SIGNAL_ID_INVALID",
+            "signal_id must be a uuid for persistence",
+        )
+    })?;
+    let inserted = sqlx::query(
+        r#"
+        insert into execution_reports
+          (id, user_id, signal_id, client_report_id, source, symbol, period_seconds,
+           direction, stake_usdt, entry_price, expiry_price, payout_ratio, gross_profit,
+           result, automation_profile, automation_confidence, action_trace_id,
+           report_status, reported_at, created_at, exchange_ref, exchange_payout_income_id, exchange_verified_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, null, $10, $11,
+                $12, $13, $14, $15, 'pending_review', $16, $17, $18, $19, $20)
+        on conflict (user_id, client_report_id) do nothing
+        returning id
+        "#,
+    )
+    .bind(report.id)
+    .bind(report.user_id)
+    .bind(signal_id)
+    .bind(&report.client_report_id)
+    .bind(&report.source)
+    .bind(&report.symbol)
+    .bind(report.period_seconds)
+    .bind(&report.direction)
+    .bind(report.stake_usdt)
+    .bind(report.payout_ratio)
+    .bind(report.gross_profit)
+    .bind(&report.result)
+    .bind(&report.automation_profile)
+    .bind(report.automation_confidence)
+    .bind(&report.action_trace_id)
+    .bind(report.reported_at)
+    .bind(report.created_at)
+    .bind(payout_event.map(|event| event.external_ref.clone()))
+    .bind(payout_event_id)
+    .bind(payout_event.map(|_| Utc::now()))
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    if inserted.is_none() {
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+        return Ok(false);
+    }
+    db_settle_execution_report_tx(&mut tx, report).await?;
+    sqlx::query("update execution_reports set report_status = 'settled' where id = $1")
+        .bind(report.id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(true)
 }
 
 async fn db_admin_settle_execution_report(pool: &PgPool, report_id: Uuid) -> Result<(), AppError> {

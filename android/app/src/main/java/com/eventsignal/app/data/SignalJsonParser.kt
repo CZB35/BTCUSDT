@@ -19,6 +19,7 @@ object SignalJsonParser {
         val obj = data.jsonObject
         return SignalSnapshot(
             id = obj["id"].asTextOrNull(),
+            deliveryId = root.jsonObject["delivery_id"].asTextOrNull() ?: obj["delivery_id"].asTextOrNull(),
             symbol = obj["symbol"].asTextOrNull() ?: "BTCUSDT",
             direction = obj["direction"].asTextOrNull() ?: "HOLD",
             confidence = obj["confidence"].asTextOrNull() ?: "-",

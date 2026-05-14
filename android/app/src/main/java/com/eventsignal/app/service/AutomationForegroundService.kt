@@ -6,6 +6,8 @@ import android.os.IBinder
 import com.eventsignal.app.automation.AutomationStateStore
 import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.data.SignalJsonParser
+import com.eventsignal.app.domain.SignalDeliveryAckRequest
+import com.eventsignal.app.domain.SignalSnapshot
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
@@ -17,6 +19,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Response
 import okhttp3.WebSocket
 import okhttp3.WebSocketListener
+import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
@@ -35,6 +38,7 @@ class AutomationForegroundService : Service() {
     override fun onCreate() {
         super.onCreate()
         stateStore = AutomationStateStore(applicationContext)
+        stateStore.saveConnectionState("stopped")
         startForeground(
             1002,
             runtimeNotification(this, "Automation active", "Monitoring authorized action state"),
@@ -54,6 +58,7 @@ class AutomationForegroundService : Service() {
         webSocket?.cancel()
         webSocket = null
         if (::stateStore.isInitialized) {
+            stateStore.saveConnectionState("stopped")
             stateStore.clearRecognitionState("\u81ea\u52a8\u5316\u670d\u52a1\u5df2\u505c\u6b62")
         }
         scope.cancel()
@@ -74,16 +79,19 @@ class AutomationForegroundService : Service() {
                 val requestResult = repository.websocketRequest()
                 val request = requestResult.getOrNull()
                 if (request == null) {
+                    stateStore.saveConnectionState("request_failed")
                     stateStore.saveLastStatus("ws_request_failed:${requestResult.exceptionOrNull()?.message}")
                     delay(2_000)
                     continue
                 }
+                stateStore.saveConnectionState("connecting")
                 stateStore.saveLastStatus("ws_connecting")
                 val closed = AtomicBoolean(false)
                 webSocket = wsClient.newWebSocket(
                     request,
                     object : WebSocketListener() {
                         override fun onOpen(webSocket: WebSocket, response: Response) {
+                            stateStore.saveConnectionState("connected")
                             stateStore.saveLastStatus("ws_connected")
                         }
 
@@ -93,11 +101,13 @@ class AutomationForegroundService : Service() {
 
                         override fun onFailure(webSocket: WebSocket, t: Throwable, response: Response?) {
                             closed.set(true)
+                            stateStore.saveConnectionState("failed")
                             stateStore.saveLastStatus("ws_failed:${t.javaClass.simpleName}")
                         }
 
                         override fun onClosed(webSocket: WebSocket, code: Int, reason: String) {
                             closed.set(true)
+                            stateStore.saveConnectionState("closed:$code")
                             stateStore.saveLastStatus("ws_closed:$code")
                         }
                     },
@@ -120,6 +130,7 @@ class AutomationForegroundService : Service() {
             .onFailure { stateStore.saveLastStatus("ws_signal_parse_failed:${it.javaClass.simpleName}") }
             .getOrNull() ?: return
         val signalId = signal.id ?: return
+        ackSignalReceived(signal)
         if (!handledSignalIds.add(signalId)) {
             stateStore.saveLastStatus("ws_signal_duplicate_ignored:$signalId")
             return
@@ -135,5 +146,35 @@ class AutomationForegroundService : Service() {
         stateStore.saveSignal(signal)
         stateStore.saveLastStatus("ws_signal_execute:$signalId")
         AutomationRuntime.requestExecution()
+    }
+
+    private fun ackSignalReceived(signal: SignalSnapshot) {
+        val deliveryId = signal.deliveryId ?: return
+        val signalId = signal.id ?: return
+        scope.launch {
+            val repository = EventSignalRepository(applicationContext)
+            val debug = stateStore.loadDebugState()
+            val result = repository.ackSignalDelivery(
+                SignalDeliveryAckRequest(
+                    deliveryId = deliveryId,
+                    signalId = signalId,
+                    reservationId = signal.reservationId,
+                    receivedAt = Instant.now().toString(),
+                    appVersion = packageManager.getPackageInfo(packageName, 0).versionName,
+                    pageState = mapOf(
+                        "screen_name" to debug.screenName,
+                        "confidence" to debug.confidence.toString(),
+                        "package_name" to debug.packageName,
+                        "amount_field_found" to debug.amountFieldFound.toString(),
+                        "up_button_found" to debug.upButtonFound.toString(),
+                        "down_button_found" to debug.downButtonFound.toString(),
+                        "safe_to_act" to debug.safeToAct.toString(),
+                    ),
+                ),
+            )
+            result.onFailure {
+                stateStore.saveLastStatus("ws_ack_failed:${it.javaClass.simpleName}")
+            }
+        }
     }
 }

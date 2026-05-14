@@ -8,15 +8,29 @@ import {
   CircleDollarSign,
   CreditCard,
   Radio,
+  Power,
   RefreshCw,
   Send,
   ShieldCheck,
+  SlidersHorizontal,
   Smartphone,
-  Users
+  SquarePen,
+  Trash2,
+  Users,
+  Zap
 } from "lucide-react";
 import "./styles.css";
 
-type AdminView = "overview" | "signals" | "users" | "deposits" | "withdrawals" | "orders" | "settlements";
+type AdminView =
+  | "overview"
+  | "settings"
+  | "signals"
+  | "workers"
+  | "users"
+  | "deposits"
+  | "withdrawals"
+  | "orders"
+  | "settlements";
 
 type AdminOverview = {
   stats: {
@@ -165,9 +179,31 @@ type PageStateRecord = {
   updated_at: string;
 };
 
+type PlatformTradingSettings = {
+  stake_percent: string;
+  min_stake_usdt: string;
+  max_single_stake_usdt: string;
+  updated_at?: string | null;
+};
+
+type ExchangeWorkerSlot = {
+  id: string;
+  name: string;
+  shard_total: number;
+  shard_index: number;
+  bind_local_ip?: string | null;
+  enabled: boolean;
+  status: string;
+  last_started_at?: string | null;
+  last_stopped_at?: string | null;
+  last_error?: string | null;
+  updated_at: string;
+  created_at: string;
+};
+
 const TOKEN_KEY = "event_signal_admin_token";
 const ADMIN_USER_KEY = "event_signal_admin_user";
-const API_BASE = (import.meta.env.VITE_API_BASE_URL || "http://127.0.0.1:8787").trim().replace(/\/$/, "");
+const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
 
 function App() {
   const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || "");
@@ -184,8 +220,18 @@ function App() {
   const [reports, setReports] = useState<ReportRecord[]>([]);
   const [settlements, setSettlements] = useState<SettlementRecord[]>([]);
   const [pageStates, setPageStates] = useState<PageStateRecord[]>([]);
+  const [exchangeWorkers, setExchangeWorkers] = useState<ExchangeWorkerSlot[]>([]);
+  const [workerName, setWorkerName] = useState("");
+  const [workerShardTotal, setWorkerShardTotal] = useState("3");
+  const [workerShardIndex, setWorkerShardIndex] = useState("0");
+  const [workerBindLocalIp, setWorkerBindLocalIp] = useState("");
+  const [workerEnabled, setWorkerEnabled] = useState(false);
+  const [tradingSettings, setTradingSettings] = useState<PlatformTradingSettings>({
+    stake_percent: "0.05",
+    min_stake_usdt: "5",
+    max_single_stake_usdt: "250"
+  });
   const [direction, setDirection] = useState<"UP" | "DOWN">("DOWN");
-  const [stake, setStake] = useState("5");
   const [confidence, setConfidence] = useState("1");
   const [status, setStatus] = useState(token ? "正在连接后台" : "请输入管理员账号密码");
   const loggedIn = token.trim().length > 0;
@@ -223,10 +269,12 @@ function App() {
 
   async function loadAll(nextToken = token) {
     setStatus("正在刷新");
-    const [nextOverview, nextSignals, nextUsers, nextDeposits, nextWithdrawals, nextLedger, nextOrders, nextReports, nextSettlements, nextPageStates] =
+    const [nextOverview, nextSettings, nextSignals, nextWorkers, nextUsers, nextDeposits, nextWithdrawals, nextLedger, nextOrders, nextReports, nextSettlements, nextPageStates] =
       await Promise.all([
         adminFetch<AdminOverview>("/v1/admin/overview", nextToken),
+        adminFetch<PlatformTradingSettings>("/v1/admin/trading-settings", nextToken),
         adminFetch<SignalRecord[]>("/v1/admin/signals", nextToken),
+        adminFetch<ExchangeWorkerSlot[]>("/v1/admin/exchange-workers", nextToken),
         adminFetch<UserRecord[]>("/v1/admin/users", nextToken),
         adminFetch<DepositRecord[]>("/v1/admin/deposits", nextToken),
         adminFetch<WithdrawalRecord[]>("/v1/admin/withdrawals", nextToken),
@@ -238,7 +286,9 @@ function App() {
       ]);
 
     if (nextOverview) setOverview(nextOverview);
+    if (nextSettings) setTradingSettings(nextSettings);
     if (nextSignals) setSignals(nextSignals);
+    if (nextWorkers) setExchangeWorkers(nextWorkers);
     if (nextUsers) setUsers(nextUsers);
     if (nextDeposits) setDeposits(nextDeposits);
     if (nextWithdrawals) setWithdrawals(nextWithdrawals);
@@ -291,7 +341,7 @@ function App() {
       headers: adminHeaders(),
       body: JSON.stringify({
         direction,
-        suggested_stake: stake,
+        suggested_stake: tradingSettings.min_stake_usdt || "5",
         confidence
       })
     });
@@ -301,6 +351,77 @@ function App() {
     }
     await loadAll();
     setStatus("信号已单次下发");
+  }
+
+  async function saveTradingSettings(next: PlatformTradingSettings) {
+    setStatus("正在保存比例");
+    const res = await fetch(`${API_BASE}/v1/admin/trading-settings`, {
+      method: "PUT",
+      headers: adminHeaders(),
+      body: JSON.stringify(next)
+    });
+    if (!res.ok) {
+      setStatus(`保存失败 ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    setTradingSettings(data);
+    setStatus("比例已保存");
+  }
+
+  async function saveExchangeWorker(next: Partial<ExchangeWorkerSlot> & { shard_total?: number; shard_index?: number; enabled?: boolean }) {
+    const shardTotal = Number(next.shard_total ?? workerShardTotal);
+    const shardIndex = Number(next.shard_index ?? workerShardIndex);
+    setStatus("姝ｅ湪淇濆瓨 worker");
+    const res = await fetch(`${API_BASE}/v1/admin/exchange-workers`, {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify({
+        id: next.id ?? null,
+        name: next.name ?? (workerName.trim() || null),
+        shard_total: Number.isFinite(shardTotal) ? shardTotal : 3,
+        shard_index: Number.isFinite(shardIndex) ? shardIndex : 0,
+        bind_local_ip: (next.bind_local_ip ?? workerBindLocalIp).trim() || null,
+        enabled: next.enabled ?? workerEnabled
+      })
+    });
+    if (!res.ok) {
+      setStatus(`淇濆瓨 worker 澶辫触 ${res.status}`);
+      return;
+    }
+    setExchangeWorkers(await res.json());
+    setStatus("worker 宸蹭繚瀛?");
+  }
+
+  async function toggleExchangeWorker(id: string, enabled: boolean) {
+    setStatus(enabled ? "姝ｅ湪鍚敤 worker" : "姝ｅ湪鍏抽棴 worker");
+    const res = await fetch(`${API_BASE}/v1/admin/exchange-workers/toggle`, {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify({ id, enabled })
+    });
+    if (!res.ok) {
+      setStatus(`worker 鎿嶄綔澶辫触 ${res.status}`);
+      return;
+    }
+    setExchangeWorkers(await res.json());
+    setStatus(enabled ? "worker 宸插惎鐢?" : "worker 宸插叧闂?");
+  }
+
+  async function deleteExchangeWorker(id: string) {
+    if (!window.confirm("纭畾鍒犻櫎杩欎釜 worker slot ?")) return;
+    setStatus("姝ｅ湪鍒犻櫎 worker");
+    const res = await fetch(`${API_BASE}/v1/admin/exchange-workers/delete`, {
+      method: "POST",
+      headers: adminHeaders(),
+      body: JSON.stringify({ id })
+    });
+    if (!res.ok) {
+      setStatus(`鍒犻櫎 worker 澶辫触 ${res.status}`);
+      return;
+    }
+    setExchangeWorkers(await res.json());
+    setStatus("worker 宸插垹闄?");
   }
 
   async function settleReport(reportId: string) {
@@ -407,6 +528,7 @@ function App() {
         <nav>
           <NavItem active={view === "withdrawals"} icon={<ArrowDownRight size={18} />} label="提现" onClick={() => setView("withdrawals")} />
           <NavItem active={view === "overview"} icon={<Activity size={18} />} label="总览" onClick={() => setView("overview")} />
+          <NavItem active={view === "settings"} icon={<SlidersHorizontal size={18} />} label="设置" onClick={() => setView("settings")} />
           <NavItem active={view === "signals"} icon={<Radio size={18} />} label="信号" onClick={() => setView("signals")} />
           <NavItem active={view === "users"} icon={<Users size={18} />} label="用户" onClick={() => setView("users")} />
           <NavItem active={view === "deposits"} icon={<CreditCard size={18} />} label="充值" onClick={() => setView("deposits")} />
@@ -443,14 +565,38 @@ function App() {
         {view === "overview" && (
           <OverviewPage overview={overview} latest={latest} reports={reports} onSettle={settleReport} />
         )}
+        {view === "settings" && (
+          <SettingsPage settings={tradingSettings} onSave={saveTradingSettings} />
+        )}
+        {view === "settings" && (
+          <ExchangeWorkersPage
+            workers={exchangeWorkers}
+            draft={{
+              name: workerName,
+              shardTotal: workerShardTotal,
+              shardIndex: workerShardIndex,
+              bindLocalIp: workerBindLocalIp,
+              enabled: workerEnabled
+            }}
+            onDraftChange={({ name, shardTotal, shardIndex, bindLocalIp, enabled }) => {
+              setWorkerName(name);
+              setWorkerShardTotal(shardTotal);
+              setWorkerShardIndex(shardIndex);
+              setWorkerBindLocalIp(bindLocalIp);
+              setWorkerEnabled(enabled);
+            }}
+            onSave={saveExchangeWorker}
+            onToggle={toggleExchangeWorker}
+            onDelete={deleteExchangeWorker}
+          />
+        )}
         {view === "signals" && (
           <SignalsPage
             direction={direction}
-            stake={stake}
+            settings={tradingSettings}
             confidence={confidence}
             signals={signals}
             onDirectionChange={setDirection}
-            onStakeChange={setStake}
             onConfidenceChange={setConfidence}
             onEmit={emitSignal}
           />
@@ -519,20 +665,18 @@ function OverviewPage({
 
 function SignalsPage({
   direction,
-  stake,
+  settings,
   confidence,
   signals,
   onDirectionChange,
-  onStakeChange,
   onConfidenceChange,
   onEmit
 }: {
   direction: "UP" | "DOWN";
-  stake: string;
+  settings: PlatformTradingSettings;
   confidence: string;
   signals: SignalRecord[];
   onDirectionChange: (direction: "UP" | "DOWN") => void;
-  onStakeChange: (stake: string) => void;
   onConfidenceChange: (confidence: string) => void;
   onEmit: () => void;
 }) {
@@ -555,8 +699,8 @@ function SignalsPage({
         </div>
         <div className="form-row">
           <label>
-            金额 USDT
-            <input value={stake} onChange={(event) => onStakeChange(event.target.value)} />
+            后台比例
+            <input value={`${stakePercentLabel(settings.stake_percent)}，最低 ${settings.min_stake_usdt}U，最高 ${settings.max_single_stake_usdt}U`} readOnly />
           </label>
           <label>
             置信度
@@ -590,6 +734,189 @@ function SignalsPage({
         />
       </section>
     </>
+  );
+}
+
+function SettingsPage({
+  settings,
+  onSave
+}: {
+  settings: PlatformTradingSettings;
+  onSave: (settings: PlatformTradingSettings) => void;
+}) {
+  const [draft, setDraft] = useState(settings);
+
+  useEffect(() => {
+    setDraft(settings);
+  }, [settings]);
+
+  return (
+    <section className="panel signal-panel">
+      <div className="panel-title">
+        <div>
+          <h2>下单比例</h2>
+          <p>所有用户按币安 U 本位合约可用余额计算下单金额，信号瞬间不再查询币安接口。</p>
+        </div>
+      </div>
+      <div className="form-row">
+        <label>
+          下单比例
+          <input
+            value={draft.stake_percent}
+            onChange={(event) => setDraft({ ...draft, stake_percent: event.target.value })}
+            placeholder="0.05"
+          />
+        </label>
+        <label>
+          最低金额 USDT
+          <input
+            value={draft.min_stake_usdt}
+            onChange={(event) => setDraft({ ...draft, min_stake_usdt: event.target.value })}
+            placeholder="5"
+          />
+        </label>
+      </div>
+      <div className="form-row">
+        <label>
+          最高金额 USDT
+          <input
+            value={draft.max_single_stake_usdt}
+            onChange={(event) => setDraft({ ...draft, max_single_stake_usdt: event.target.value })}
+            placeholder="250"
+          />
+        </label>
+        <label>
+          更新时间
+          <input value={shortTime(settings.updated_at)} readOnly />
+        </label>
+      </div>
+      <button className="primary" onClick={() => onSave(draft)}>
+        <SlidersHorizontal size={18} />
+        保存设置
+      </button>
+    </section>
+  );
+}
+
+function ExchangeWorkersPage({
+  workers,
+  draft,
+  onDraftChange,
+  onSave,
+  onToggle,
+  onDelete
+}: {
+  workers: ExchangeWorkerSlot[];
+  draft: {
+    name: string;
+    shardTotal: string;
+    shardIndex: string;
+    bindLocalIp: string;
+    enabled: boolean;
+  };
+  onDraftChange: (draft: {
+    name: string;
+    shardTotal: string;
+    shardIndex: string;
+    bindLocalIp: string;
+    enabled: boolean;
+  }) => void;
+  onSave: (slot: Partial<ExchangeWorkerSlot> & { shard_total?: number; shard_index?: number; enabled?: boolean }) => void;
+  onToggle: (id: string, enabled: boolean) => void;
+  onDelete: (id: string) => void;
+}) {
+  const updateDraft = (patch: Partial<typeof draft>) => onDraftChange({ ...draft, ...patch });
+  return (
+    <section className="panel signal-panel">
+      <div className="panel-title">
+        <div>
+          <h2>Exchange Worker</h2>
+          <p>配置 Binance income 查询分片和本地出口 IP；IP 留空时使用服务器默认出口。</p>
+        </div>
+      </div>
+      <div className="form-row">
+        <label>
+          名称
+          <input value={draft.name} onChange={(event) => updateDraft({ name: event.target.value })} placeholder="worker-0" />
+        </label>
+        <label>
+          本地出口 IP
+          <input value={draft.bindLocalIp} onChange={(event) => updateDraft({ bindLocalIp: event.target.value })} placeholder="可留空，例如 10.0.0.4" />
+        </label>
+      </div>
+      <div className="form-row">
+        <label>
+          分片总数
+          <input value={draft.shardTotal} onChange={(event) => updateDraft({ shardTotal: event.target.value })} placeholder="3" />
+        </label>
+        <label>
+          当前分片
+          <input value={draft.shardIndex} onChange={(event) => updateDraft({ shardIndex: event.target.value })} placeholder="0" />
+        </label>
+      </div>
+      <div className="row-actions">
+        <button
+          className={draft.enabled ? "table-action" : "table-action secondary-action"}
+          onClick={() => updateDraft({ enabled: !draft.enabled })}
+        >
+          <Power size={14} />
+          {draft.enabled ? "创建后启用" : "创建后停用"}
+        </button>
+        <button
+          className="primary"
+          onClick={() =>
+            onSave({
+              name: draft.name,
+              shard_total: Number(draft.shardTotal),
+              shard_index: Number(draft.shardIndex),
+              bind_local_ip: draft.bindLocalIp,
+              enabled: draft.enabled
+            })
+          }
+        >
+          <SquarePen size={18} />
+          保存 Worker
+        </button>
+      </div>
+
+      <Table
+        columns={["名称", "分片", "出口 IP", "状态", "最后启动", "错误", "操作"]}
+        rows={workers.map((worker) => [
+          worker.name,
+          `${worker.shard_index}/${worker.shard_total}`,
+          worker.bind_local_ip || "默认出口",
+          <StatusPill active={worker.enabled && worker.status === "running"}>{worker.enabled ? worker.status : "stopped"}</StatusPill>,
+          shortTime(worker.last_started_at),
+          worker.last_error ? shortId(worker.last_error, 18) : "-",
+          <div className="row-actions">
+            <button className="table-action" onClick={() => onToggle(worker.id, !worker.enabled)}>
+              <Power size={14} />
+              {worker.enabled ? "停用" : "启用"}
+            </button>
+            <button
+              className="table-action secondary-action"
+              onClick={() =>
+                onSave({
+                  id: worker.id,
+                  name: worker.name,
+                  shard_total: worker.shard_total,
+                  shard_index: worker.shard_index,
+                  bind_local_ip: worker.bind_local_ip || "",
+                  enabled: worker.enabled
+                })
+              }
+            >
+              <SquarePen size={14} />
+              保存
+            </button>
+            <button className="table-action secondary-action" onClick={() => onDelete(worker.id)}>
+              <Trash2 size={14} />
+              删除
+            </button>
+          </div>
+        ])}
+      />
+    </section>
   );
 }
 
@@ -900,6 +1227,7 @@ function ToneText({ tone, children }: { tone: string; children: ReactNode }) {
 }
 
 function viewTitle(view: AdminView) {
+  if (view === "settings") return "交易设置";
   if (view === "signals") return "信号管理";
   if (view === "users") return "用户与页面闸门";
   if (view === "deposits") return "充值与流水";
@@ -909,6 +1237,7 @@ function viewTitle(view: AdminView) {
 }
 
 function viewSubtitle(view: AdminView) {
+  if (view === "settings") return "配置所有用户的 U 本位余额下单比例和 5U 到 250U 限制。";
   if (view === "signals") return "下发测试信号并查看历史信号。";
   if (view === "users") return "查看钱包账号、登录设备和页面识别状态。";
   if (view === "deposits") return "查看链上充值校验、入账状态和余额流水。";
@@ -924,6 +1253,12 @@ function labelDirection(direction?: string) {
   return "-";
 }
 
+function stakePercentLabel(value?: string) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value || "-";
+  return `${(parsed * 100).toFixed(2)}%`;
+}
+
 function directionTone(direction?: string) {
   if (direction === "UP") return "price-up";
   if (direction === "DOWN") return "price-down";
@@ -936,7 +1271,7 @@ function resultLabel(result?: string) {
   return result || "-";
 }
 
-function shortTime(value?: string) {
+function shortTime(value?: string | null) {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
 }

@@ -214,13 +214,28 @@ class FloatingSignalService : Service() {
         val signal = stateStore.loadSignal()
         val settings = stateStore.loadSettings()
         val debug = stateStore.loadDebugState()
+        val connection = stateStore.loadConnectionState()
         val signalText = view.findViewWithTag<TextView>("signal")
         val statusText = view.findViewWithTag<TextView>("status")
         signalText.text = "\u4fe1\u53f7\uff1a${signal?.direction ?: "-"}  ${signal?.suggestedStake ?: "-"}U  ${settings.executionMode}"
-        statusText.text = "\u8bc6\u522b\uff1a${debug.screenName} ${"%.2f".format(debug.confidence)}  " +
-            "\u6846${yesNo(debug.amountFieldFound)} \u6da8${yesNo(debug.upButtonFound)} \u8dcc${yesNo(debug.downButtonFound)}\n" +
-            "\u52a8\u4f5c\uff1a${debug.lastAction}\n" +
+        statusText.text =
+            "\u8bc6\u522b\uff1a${recognitionLabel(debug)} ${debug.screenName} ${"%.2f".format(debug.confidence)}\n" +
+            "WS\uff1a${wsLabel(connection)}  \u6846${yesNo(debug.amountFieldFound)} \u6da8${yesNo(debug.upButtonFound)} \u8dcc${yesNo(debug.downButtonFound)}\n" +
+            "\u52a8\u4f5c\uff1a${debug.lastAction}  " +
             if (AutomationRuntime.running) "\u8fd0\u884c\u4e2d" else "\u5df2\u505c"
+    }
+
+    private fun recognitionLabel(debug: com.eventsignal.app.automation.AutomationDebugState): String =
+        if (debug.safeToAct) "\u5df2\u8bc6\u522b" else "\u672a\u8bc6\u522b"
+
+    private fun wsLabel(state: String): String = when {
+        state == "connected" -> "\u6b63\u5e38"
+        state == "connecting" -> "\u8fde\u63a5\u4e2d"
+        state == "request_failed" -> "\u8bf7\u6c42\u5931\u8d25"
+        state == "failed" -> "\u5f02\u5e38"
+        state.startsWith("closed:") -> "\u5df2\u5173\u95ed"
+        state == "stopped" -> "\u5df2\u505c"
+        else -> "\u672a\u77e5"
     }
 
     private fun yesNo(value: Boolean): String = if (value) "\u662f" else "\u5426"
