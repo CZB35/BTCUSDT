@@ -11,7 +11,7 @@ ENV VITE_API_BASE_URL=${VITE_API_BASE_URL}
 ENV VITE_BASE_PATH=${VITE_BASE_PATH}
 RUN npm run build
 
-FROM rust:1.85-bookworm AS backend-builder
+FROM rust:1-bookworm AS backend-builder
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
