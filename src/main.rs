@@ -1,4 +1,5 @@
 use std::{
+    cmp::Reverse,
     collections::{BTreeMap, HashMap},
     env,
     net::SocketAddr,
@@ -67,10 +68,16 @@ const BINANCE_RECV_WINDOW: i64 = 5000;
 const BINANCE_INCOME_LOOKBACK_MINUTES: i64 = 20;
 const BINANCE_SETTLEMENT_GRACE_SECONDS: i64 = 90;
 const BINANCE_BALANCE_REFRESH_SECONDS: i64 = 30;
-const BINANCE_BALANCE_REFRESH_LIMIT: i64 = 30;
-const DEFAULT_EXCHANGE_SYNC_INTERVAL_SECONDS: u64 = 15;
-const BINANCE_ORDER_CONFIRM_LIMIT: i64 = 5;
-const BINANCE_SETTLEMENT_SYNC_LIMIT: i64 = 3;
+const DEFAULT_BINANCE_BALANCE_REFRESH_LIMIT: i64 = 100;
+const DEFAULT_EXCHANGE_SYNC_INTERVAL_SECONDS: u64 = 2;
+const DEFAULT_BINANCE_ORDER_CONFIRM_LIMIT: i64 = 100;
+const DEFAULT_BINANCE_SETTLEMENT_SYNC_LIMIT: i64 = 100;
+const DEFAULT_DB_MAX_CONNECTIONS: u32 = 40;
+const DEFAULT_BSC_SYNC_INTERVAL_SECONDS: u64 = 6;
+const DEFAULT_BSC_DEPOSIT_SYNC_LIMIT: i64 = 100;
+const DEFAULT_BSC_RPC_TIMEOUT_SECONDS: u64 = 8;
+const DEFAULT_QUERY_LIMIT: i64 = 50;
+const MAX_QUERY_LIMIT: i64 = 500;
 const DEFAULT_PREDICTION_INTERVAL_SECONDS: u64 = 1;
 const DEFAULT_PREDICTION_CANDLE_LIMIT: usize = 720;
 const DEFAULT_PREDICTION_STALE_SECONDS: i64 = 5;
@@ -140,7 +147,7 @@ async fn main() -> anyhow::Result<()> {
     let db = match &cli.database_url {
         Some(database_url) => {
             let pool = PgPoolOptions::new()
-                .max_connections(10)
+                .max_connections(env_u32("DB_MAX_CONNECTIONS", DEFAULT_DB_MAX_CONNECTIONS, 5))
                 .connect(database_url)
                 .await?;
             sqlx::migrate!("./migrations").run(&pool).await?;
@@ -177,6 +184,7 @@ async fn main() -> anyhow::Result<()> {
     start_exchange_sync_workers(&state)
         .await
         .map_err(|err| anyhow::anyhow!("{}: {}", err.code, err.message))?;
+    start_bsc_deposit_sync_worker(&state);
     start_market_data_feed(&state);
     start_prediction_loop(&state);
     let app = router(state);
@@ -358,6 +366,79 @@ async fn run_exchange_sync_worker(
             eprintln!("exchange sync failed: {}", err.message);
         }
     }
+}
+
+fn start_bsc_deposit_sync_worker(state: &SharedState) {
+    let Some(pool) = state.db.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(StdDuration::from_secs(env_u64(
+            "BSC_DEPOSIT_SYNC_INTERVAL_SECONDS",
+            DEFAULT_BSC_SYNC_INTERVAL_SECONDS,
+            1,
+        )));
+        loop {
+            interval.tick().await;
+            if let Err(err) = sync_confirming_deposits(&pool).await {
+                eprintln!("BSC deposit sync failed: {}", err.message);
+            }
+        }
+    });
+}
+
+async fn sync_confirming_deposits(pool: &PgPool) -> Result<usize, AppError> {
+    let rows = db_confirming_deposits(
+        pool,
+        env_i64("BSC_DEPOSIT_SYNC_LIMIT", DEFAULT_BSC_DEPOSIT_SYNC_LIMIT, 1),
+    )
+    .await?;
+    let settings = db_load_platform_trading_settings(pool).await?;
+    let mut updated = 0usize;
+    for deposit in rows {
+        let verified = match verify_bsc_contract_deposit(
+            &deposit.tx_hash,
+            deposit.user_id,
+            &deposit.from_address,
+            &deposit.deposit_id,
+            Some(deposit.amount),
+        )
+        .await
+        {
+            Ok(verified) => verified,
+            Err(err) => {
+                eprintln!(
+                    "BSC deposit {} sync skipped: {}",
+                    deposit.tx_hash, err.message
+                );
+                continue;
+            }
+        };
+        let platform_fee = verified.amount * settings.deposit_fee_rate;
+        let refreshed = DepositRecord {
+            id: deposit.id,
+            user_id: deposit.user_id,
+            chain: "bsc".to_string(),
+            asset: "USDT".to_string(),
+            token_contract: verified.token_contract,
+            contract_address: verified.contract_address,
+            deposit_id: verified.deposit_id,
+            tx_hash: verified.tx_hash,
+            from_address: verified.from_address,
+            to_address: verified.to_address,
+            amount: verified.amount,
+            credited_amount: verified.amount - platform_fee,
+            platform_fee,
+            block_number: verified.block_number,
+            confirmations: verified.confirmations,
+            status: verified.status,
+            credited_at: verified.credited_at,
+            created_at: deposit.created_at,
+        };
+        db_credit_deposit(pool, &refreshed).await?;
+        updated += 1;
+    }
+    Ok(updated)
 }
 
 fn start_prediction_loop(state: &SharedState) {
@@ -808,10 +889,10 @@ struct AutomationSettings {
 impl Default for AutomationSettings {
     fn default() -> Self {
         Self {
-            automation_enabled: false,
-            execution_mode: "manual".to_string(),
+            automation_enabled: true,
+            execution_mode: "automatic".to_string(),
             target_app_profile: Some("binance_event_contract_v1".to_string()),
-            require_final_confirmation: true,
+            require_final_confirmation: false,
             emergency_stop_enabled: true,
         }
     }
@@ -1455,6 +1536,14 @@ struct DeleteExchangeWorkerSlotRequest {
     id: Uuid,
 }
 
+#[derive(Deserialize, Clone)]
+struct ListQuery {
+    page: Option<i64>,
+    limit: Option<i64>,
+    search: Option<String>,
+    status: Option<String>,
+}
+
 #[derive(Clone, Serialize)]
 struct BinanceIncomeEventRecord {
     id: Uuid,
@@ -1935,10 +2024,10 @@ async fn register(
             "#,
         )
         .bind(user_id)
-        .bind(false)
-        .bind("manual")
-        .bind("binance_event_contract_v1")
         .bind(true)
+        .bind("automatic")
+        .bind("binance_event_contract_v1")
+        .bind(false)
         .bind(true)
         .execute(&mut *tx)
         .await
@@ -2778,19 +2867,23 @@ async fn balance(
 async fn ledger(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_ledger_for_user(pool, user_id).await?));
+        return Ok(Json(db_ledger_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .ledger
-        .read()
-        .await
-        .iter()
-        .filter(|entry| entry.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_ledger(
+        state
+            .ledger
+            .read()
+            .await
+            .iter()
+            .filter(|entry| entry.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
@@ -2912,19 +3005,23 @@ async fn user_has_credited_deposit(state: &SharedState, user_id: Uuid) -> Result
 async fn deposits(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<DepositRecord>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_deposits_for_user(pool, user_id).await?));
+        return Ok(Json(db_deposits_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .deposits
-        .read()
-        .await
-        .iter()
-        .filter(|deposit| deposit.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_deposits(
+        state
+            .deposits
+            .read()
+            .await
+            .iter()
+            .filter(|deposit| deposit.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
@@ -2977,38 +3074,46 @@ async fn referral_summary(
 async fn event_contract_orders(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<EventContractOrderRecord>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_orders_for_user(pool, user_id).await?));
+        return Ok(Json(db_orders_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .orders
-        .read()
-        .await
-        .iter()
-        .filter(|order| order.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_orders(
+        state
+            .orders
+            .read()
+            .await
+            .iter()
+            .filter(|order| order.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
 async fn execution_reports(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<ExecutionReportRecord>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_reports_for_user(pool, user_id).await?));
+        return Ok(Json(db_reports_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .reports
-        .read()
-        .await
-        .iter()
-        .filter(|report| report.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_reports(
+        state
+            .reports
+            .read()
+            .await
+            .iter()
+            .filter(|report| report.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
@@ -3062,19 +3167,23 @@ async fn create_withdrawal(
 async fn withdrawals(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<WithdrawalRecord>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_withdrawals_for_user(pool, user_id).await?));
+        return Ok(Json(db_withdrawals_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .withdrawals
-        .read()
-        .await
-        .iter()
-        .filter(|withdrawal| withdrawal.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_withdrawals(
+        state
+            .withdrawals
+            .read()
+            .await
+            .iter()
+            .filter(|withdrawal| withdrawal.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
@@ -3091,6 +3200,149 @@ async fn bound_wallet_for_user(state: &SharedState, user_id: Uuid) -> Result<Str
         .get(&user_id)
         .map(|user| user.wallet_address.clone())
         .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
+}
+
+fn filter_page_deposits(mut rows: Vec<DepositRecord>, query: &ListQuery) -> Vec<DepositRecord> {
+    let status = status_filter(query);
+    let search = search_value(query);
+    rows.retain(|row| {
+        status_matches(&row.status, status.as_deref())
+            && search_matches(
+                search.as_deref(),
+                [
+                    row.tx_hash.as_str(),
+                    row.deposit_id.as_str(),
+                    row.from_address.as_str(),
+                    row.status.as_str(),
+                ],
+            )
+    });
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    page_vec(rows, query)
+}
+
+fn filter_page_ledger(mut rows: Vec<LedgerEntry>, query: &ListQuery) -> Vec<LedgerEntry> {
+    let search = search_value(query);
+    rows.retain(|row| {
+        search_matches(
+            search.as_deref(),
+            [
+                row.entry_type.as_str(),
+                row.ref_type.as_str(),
+                row.idempotency_key.as_str(),
+            ],
+        )
+    });
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    page_vec(rows, query)
+}
+
+fn filter_page_orders(
+    mut rows: Vec<EventContractOrderRecord>,
+    query: &ListQuery,
+) -> Vec<EventContractOrderRecord> {
+    let status = status_filter(query);
+    let search = search_value(query);
+    rows.retain(|row| {
+        status_matches(&row.order_status, status.as_deref())
+            && search_matches(
+                search.as_deref(),
+                [
+                    row.client_order_id.as_str(),
+                    row.signal_id.as_str(),
+                    row.symbol.as_str(),
+                    row.direction.as_str(),
+                ],
+            )
+    });
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    page_vec(rows, query)
+}
+
+fn filter_page_reports(
+    mut rows: Vec<ExecutionReportRecord>,
+    query: &ListQuery,
+) -> Vec<ExecutionReportRecord> {
+    let status = status_filter(query);
+    let search = search_value(query);
+    rows.retain(|row| {
+        status_matches(&row.report_status, status.as_deref())
+            && search_matches(
+                search.as_deref(),
+                [
+                    row.client_report_id.as_str(),
+                    row.signal_id.as_str(),
+                    row.symbol.as_str(),
+                    row.result.as_str(),
+                ],
+            )
+    });
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    page_vec(rows, query)
+}
+
+fn filter_page_withdrawals(
+    mut rows: Vec<WithdrawalRecord>,
+    query: &ListQuery,
+) -> Vec<WithdrawalRecord> {
+    let status = status_filter(query);
+    let search = search_value(query);
+    rows.retain(|row| {
+        status_matches(&row.status, status.as_deref())
+            && search_matches(
+                search.as_deref(),
+                [
+                    row.refund_id.as_str(),
+                    row.to_address.as_str(),
+                    row.tx_hash.as_deref().unwrap_or_default(),
+                    row.status.as_str(),
+                ],
+            )
+    });
+    rows.sort_by_key(|row| Reverse(row.requested_at));
+    page_vec(rows, query)
+}
+
+fn filter_page_settlements(
+    mut rows: Vec<SettlementRecord>,
+    query: &ListQuery,
+) -> Vec<SettlementRecord> {
+    let status = status_filter(query);
+    rows.retain(|row| status_matches(&row.status, status.as_deref()));
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    page_vec(rows, query)
+}
+
+fn page_vec<T>(rows: Vec<T>, query: &ListQuery) -> Vec<T> {
+    let (_, limit, offset) = page_params(query);
+    rows.into_iter()
+        .skip(offset as usize)
+        .take(limit as usize)
+        .collect()
+}
+
+fn search_value(query: &ListQuery) -> Option<String> {
+    query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+}
+
+fn status_matches(actual: &str, expected: Option<&str>) -> bool {
+    expected
+        .map(|status| actual.eq_ignore_ascii_case(status))
+        .unwrap_or(true)
+}
+
+fn search_matches<'a>(search: Option<&str>, values: impl IntoIterator<Item = &'a str>) -> bool {
+    let Some(search) = search else {
+        return true;
+    };
+    values
+        .into_iter()
+        .any(|value| value.to_ascii_lowercase().contains(search))
 }
 
 async fn credit_deposit_memory(
@@ -3690,6 +3942,14 @@ fn env_i64(name: &str, default: i64, min: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn env_u32(name: &str, default: u32, min: u32) -> u32 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u32>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
 fn env_u64(name: &str, default: u64, min: u64) -> u64 {
     env::var(name)
         .ok()
@@ -3724,6 +3984,42 @@ fn env_bool(name: &str, default: bool) -> bool {
             )
         })
         .unwrap_or(default)
+}
+
+fn page_params(query: &ListQuery) -> (i64, i64, i64) {
+    let page = query.page.unwrap_or(1).max(1);
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_QUERY_LIMIT)
+        .clamp(1, MAX_QUERY_LIMIT);
+    let offset = (page - 1) * limit;
+    (page, limit, offset)
+}
+
+fn search_pattern(query: &ListQuery) -> Option<String> {
+    query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            format!(
+                "%{}%",
+                value
+                    .replace('\\', "\\\\")
+                    .replace('%', "\\%")
+                    .replace('_', "\\_")
+            )
+        })
+}
+
+fn status_filter(query: &ListQuery) -> Option<String> {
+    query
+        .status
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
 }
 
 fn binance_bind_local_ip() -> Result<Option<std::net::IpAddr>, AppError> {
@@ -4596,7 +4892,14 @@ async fn rpc_call<T: DeserializeOwned>(
     method: &str,
     params: serde_json::Value,
 ) -> Result<Option<T>, AppError> {
-    let client = reqwest::Client::new();
+    let client = reqwest::Client::builder()
+        .timeout(StdDuration::from_secs(env_u64(
+            "BSC_RPC_TIMEOUT_SECONDS",
+            DEFAULT_BSC_RPC_TIMEOUT_SECONDS,
+            1,
+        )))
+        .build()
+        .map_err(|err| AppError::internal("BSC_RPC_CLIENT_FAILED", err.to_string()))?;
     let body = json!({
         "jsonrpc": "2.0",
         "id": 1,
@@ -4664,8 +4967,8 @@ async fn submit_order(
         reported_at: req.reported_at,
         created_at: now,
     };
-    if let Some(pool) = state.db.as_ref() {
-        db_insert_order_with_reservation_validation(pool, &order).await?;
+    let saved_order_id = if let Some(pool) = state.db.as_ref() {
+        db_insert_order_with_reservation_validation(pool, &order).await?
     } else {
         let signal_id = Uuid::parse_str(&order.signal_id)
             .map_err(|_| AppError::bad_request("SIGNAL_ID_INVALID", "signal_id must be a uuid"))?;
@@ -4683,10 +4986,11 @@ async fn submit_order(
         reservation.status = "order_submitted".to_string();
         reservation.order_id = Some(order_id);
         reservation.updated_at = now;
-    }
-    state.orders.write().await.push(order);
+        state.orders.write().await.push(order);
+        order_id
+    };
     Ok(Json(SubmitOrderResponse {
-        order_id,
+        order_id: saved_order_id,
         status: "submitted".to_string(),
     }))
 }
@@ -4753,19 +5057,23 @@ async fn admin_sync_exchange(
 async fn settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<SettlementRecord>>, AppError> {
     let user_id = require_dapp_user(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_settlements_for_user(pool, user_id).await?));
+        return Ok(Json(db_settlements_for_user(pool, user_id, &query).await?));
     }
-    let rows = state
-        .settlements
-        .read()
-        .await
-        .iter()
-        .filter(|settlement| settlement.user_id == user_id)
-        .cloned()
-        .collect();
+    let rows = filter_page_settlements(
+        state
+            .settlements
+            .read()
+            .await
+            .iter()
+            .filter(|settlement| settlement.user_id == user_id)
+            .cloned()
+            .collect(),
+        &query,
+    );
     Ok(Json(rows))
 }
 
@@ -5032,54 +5340,78 @@ async fn admin_signals(
 async fn admin_users(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<AdminUserRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_users(pool).await?));
+        return Ok(Json(db_admin_users(pool, &query).await?));
     }
-    Ok(Json(
-        state
-            .users
-            .read()
-            .await
-            .values()
-            .cloned()
-            .map(AdminUserRecord::from)
-            .collect(),
-    ))
+    let mut rows = state
+        .users
+        .read()
+        .await
+        .values()
+        .cloned()
+        .map(AdminUserRecord::from)
+        .collect::<Vec<_>>();
+    let search = search_value(&query);
+    rows.retain(|row| {
+        search_matches(
+            search.as_deref(),
+            [
+                row.wallet_address.as_str(),
+                row.status.as_str(),
+                row.id.to_string().as_str(),
+            ],
+        )
+    });
+    rows.sort_by_key(|row| Reverse(row.created_at));
+    Ok(Json(page_vec(rows, &query)))
 }
 
 async fn admin_orders(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<EventContractOrderRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_orders(pool).await?));
+        return Ok(Json(db_admin_orders(pool, &query).await?));
     }
-    Ok(Json(state.orders.read().await.clone()))
+    Ok(Json(filter_page_orders(
+        state.orders.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_deposits(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<DepositRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_deposits(pool).await?));
+        return Ok(Json(db_admin_deposits(pool, &query).await?));
     }
-    Ok(Json(state.deposits.read().await.clone()))
+    Ok(Json(filter_page_deposits(
+        state.deposits.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_withdrawals(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<WithdrawalRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_withdrawals(pool).await?));
+        return Ok(Json(db_admin_withdrawals(pool, &query).await?));
     }
-    Ok(Json(state.withdrawals.read().await.clone()))
+    Ok(Json(filter_page_withdrawals(
+        state.withdrawals.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_confirm_withdrawal(
@@ -5143,23 +5475,31 @@ async fn admin_reject_withdrawal(
 async fn admin_ledger(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<LedgerEntry>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_ledger(pool).await?));
+        return Ok(Json(db_admin_ledger(pool, &query).await?));
     }
-    Ok(Json(state.ledger.read().await.clone()))
+    Ok(Json(filter_page_ledger(
+        state.ledger.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_reports(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<ExecutionReportRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_reports(pool).await?));
+        return Ok(Json(db_admin_reports(pool, &query).await?));
     }
-    Ok(Json(state.reports.read().await.clone()))
+    Ok(Json(filter_page_reports(
+        state.reports.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_settle_execution_report(
@@ -5209,12 +5549,16 @@ async fn admin_settle_execution_report(
 async fn admin_settlements(
     State(state): State<SharedState>,
     headers: HeaderMap,
+    Query(query): Query<ListQuery>,
 ) -> Result<Json<Vec<SettlementRecord>>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        return Ok(Json(db_admin_settlements(pool).await?));
+        return Ok(Json(db_admin_settlements(pool, &query).await?));
     }
-    Ok(Json(state.settlements.read().await.clone()))
+    Ok(Json(filter_page_settlements(
+        state.settlements.read().await.clone(),
+        &query,
+    )))
 }
 
 async fn admin_page_states(
@@ -5759,19 +6103,16 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
 }
 
 fn validate_automation_settings(settings: &AutomationSettings) -> Result<(), AppError> {
-    if !matches!(
-        settings.execution_mode.as_str(),
-        "manual" | "assisted" | "automatic"
-    ) {
+    if settings.execution_mode != "automatic" {
         return Err(AppError::bad_request(
             "AUTOMATION_SETTING_OUT_OF_RANGE",
-            "execution_mode must be manual, assisted, or automatic",
+            "execution_mode must be automatic",
         ));
     }
-    if settings.execution_mode == "automatic" && !settings.automation_enabled {
+    if settings.require_final_confirmation {
         return Err(AppError::bad_request(
             "AUTOMATION_SETTING_OUT_OF_RANGE",
-            "automatic mode requires automation_enabled",
+            "automatic mode cannot require final confirmation",
         ));
     }
     Ok(())
@@ -6019,8 +6360,8 @@ async fn authorize_signal_for_user(
     if status == "reserved" {
         match page.as_ref() {
             None => status = "page_state_missing".to_string(),
-            Some(page) if !page_is_fresh(&page) => status = "page_state_stale".to_string(),
-            Some(page) if !page_is_fresh_and_ready(&page) => status = "page_not_ready".to_string(),
+            Some(page) if !page_is_fresh(page) => status = "page_state_stale".to_string(),
+            Some(page) if !page_is_fresh_and_ready(page) => status = "page_not_ready".to_string(),
             Some(page) => {
                 account_match =
                     account_match_from_balances(page.observed_balance_usdt, exchange_available);
@@ -6210,8 +6551,16 @@ async fn sync_exchange_orders(
     config: &ExchangeWorkerConfig,
 ) -> Result<ExchangeSyncResponse, AppError> {
     let refreshed_balances = refresh_exchange_balances(pool, config).await?;
-    let pending_orders =
-        db_pending_exchange_orders(pool, BINANCE_ORDER_CONFIRM_LIMIT, config).await?;
+    let pending_orders = db_pending_exchange_orders(
+        pool,
+        env_i64(
+            "BINANCE_ORDER_CONFIRM_LIMIT",
+            DEFAULT_BINANCE_ORDER_CONFIRM_LIMIT,
+            1,
+        ),
+        config,
+    )
+    .await?;
     let mut checked_orders = 0usize;
     let mut confirmed_orders = 0usize;
     for order in pending_orders {
@@ -6224,7 +6573,11 @@ async fn sync_exchange_orders(
     let due_orders = db_confirmed_exchange_orders_due_for_settlement(
         pool,
         Utc::now(),
-        BINANCE_SETTLEMENT_SYNC_LIMIT,
+        env_i64(
+            "BINANCE_SETTLEMENT_SYNC_LIMIT",
+            DEFAULT_BINANCE_SETTLEMENT_SYNC_LIMIT,
+            1,
+        ),
         config,
     )
     .await?;
@@ -6254,7 +6607,11 @@ async fn refresh_exchange_balances(
     let credentials = db_exchange_credentials_for_balance_refresh(
         pool,
         now,
-        BINANCE_BALANCE_REFRESH_LIMIT,
+        env_i64(
+            "BINANCE_BALANCE_REFRESH_LIMIT",
+            DEFAULT_BINANCE_BALANCE_REFRESH_LIMIT,
+            1,
+        ),
         config,
     )
     .await?;
@@ -6629,7 +6986,7 @@ async fn settle_execution_report(
     });
     if result == "WIN" && gross_profit > Decimal::ZERO {
         let settings = load_platform_settings(state).await;
-        apply_referral_rewards_memory(&state, &settlement, gross_profit, &settings).await?;
+        apply_referral_rewards_memory(state, &settlement, gross_profit, &settings).await?;
     }
     Ok(())
 }
@@ -7858,18 +8215,33 @@ fn signal_from_row(row: sqlx::postgres::PgRow) -> SignalCore {
     }
 }
 
-async fn db_ledger_for_user(pool: &PgPool, user_id: Uuid) -> Result<Vec<LedgerEntry>, AppError> {
+async fn db_ledger_for_user(
+    pool: &PgPool,
+    user_id: Uuid,
+    query: &ListQuery,
+) -> Result<Vec<LedgerEntry>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
     sqlx::query(
         r#"
         select id, user_id, asset, entry_type, amount, balance_available_after,
                balance_frozen_after, ref_type, ref_id, idempotency_key, created_at
         from ledger_entries
         where user_id = $1
+          and (
+            $2::text is null
+            or entry_type ilike $2 escape '\'
+            or ref_type ilike $2 escape '\'
+            or idempotency_key ilike $2 escape '\'
+          )
         order by created_at desc
-        limit 100
+        limit $3 offset $4
         "#,
     )
     .bind(user_id)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(ledger_from_row).collect())
@@ -7980,7 +8352,9 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
         let existing_user_id: Uuid = row.get("user_id");
         let existing_amount: Decimal = row.get("amount");
         let existing_status: String = row.get("status");
-        if existing_user_id != deposit.user_id || existing_amount != deposit.amount {
+        if existing_user_id != deposit.user_id
+            || (existing_amount != deposit.amount && existing_status == "credited")
+        {
             return Err(AppError::conflict(
                 "DEPOSIT_ALREADY_SUBMITTED",
                 "deposit transaction belongs to a different deposit",
@@ -7994,7 +8368,8 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
                 credited_at = coalesce(credited_at, $4),
                 block_number = case when $5 > 0 then $5 else block_number end,
                 credited_amount = $6,
-                platform_fee = $7
+                platform_fee = $7,
+                amount = $8
             where tx_hash = $1
             "#,
         )
@@ -8005,6 +8380,7 @@ async fn db_credit_deposit(pool: &PgPool, deposit: &DepositRecord) -> Result<(),
         .bind(deposit.block_number)
         .bind(deposit.credited_amount)
         .bind(deposit.platform_fee)
+        .bind(deposit.amount)
         .execute(&mut *tx)
         .await
         .map_err(AppError::from_sqlx)?;
@@ -8269,7 +8645,11 @@ fn referral_reward_from_row(row: sqlx::postgres::PgRow) -> ReferralRewardRecord 
 async fn db_deposits_for_user(
     pool: &PgPool,
     user_id: Uuid,
+    query: &ListQuery,
 ) -> Result<Vec<DepositRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
@@ -8277,27 +8657,78 @@ async fn db_deposits_for_user(
                confirmations, status, credited_at, created_at
         from deposits
         where user_id = $1
+          and ($2::text is null or status = $2)
+          and (
+            $3::text is null
+            or tx_hash ilike $3 escape '\'
+            or deposit_id ilike $3 escape '\'
+            or from_address ilike $3 escape '\'
+            or status ilike $3 escape '\'
+          )
         order by created_at desc
+        limit $4 offset $5
         "#,
     )
     .bind(user_id)
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(deposit_from_row).collect())
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_admin_deposits(pool: &PgPool) -> Result<Vec<DepositRecord>, AppError> {
+async fn db_confirming_deposits(pool: &PgPool, limit: i64) -> Result<Vec<DepositRecord>, AppError> {
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
                from_address, to_address, amount, credited_amount, platform_fee, block_number,
                confirmations, status, credited_at, created_at
         from deposits
-        order by created_at desc
-        limit 200
+        where status = 'confirming'
+        order by created_at asc
+        limit $1
         "#,
     )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| rows.into_iter().map(deposit_from_row).collect())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_admin_deposits(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<DepositRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
+    sqlx::query(
+        r#"
+        select id, user_id, chain, asset, token_contract, contract_address, deposit_id, tx_hash,
+               from_address, to_address, amount, credited_amount, platform_fee, block_number,
+               confirmations, status, credited_at, created_at
+        from deposits
+        where ($1::text is null or status = $1)
+          and (
+            $2::text is null
+            or tx_hash ilike $2 escape '\'
+            or deposit_id ilike $2 escape '\'
+            or from_address ilike $2 escape '\'
+            or user_id::text ilike $2 escape '\'
+            or status ilike $2 escape '\'
+          )
+        order by created_at desc
+        limit $3 offset $4
+        "#,
+    )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(deposit_from_row).collect())
@@ -8327,16 +8758,26 @@ fn deposit_from_row(row: sqlx::postgres::PgRow) -> DepositRecord {
     }
 }
 
-async fn db_admin_ledger(pool: &PgPool) -> Result<Vec<LedgerEntry>, AppError> {
+async fn db_admin_ledger(pool: &PgPool, query: &ListQuery) -> Result<Vec<LedgerEntry>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
     sqlx::query(
         r#"
         select id, user_id, asset, entry_type, amount, balance_available_after,
                balance_frozen_after, ref_type, ref_id, idempotency_key, created_at
         from ledger_entries
+        where $1::text is null
+           or entry_type ilike $1 escape '\'
+           or ref_type ilike $1 escape '\'
+           or idempotency_key ilike $1 escape '\'
+           or user_id::text ilike $1 escape '\'
         order by created_at desc
-        limit 200
+        limit $2 offset $3
         "#,
     )
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(ledger_from_row).collect())
@@ -8648,7 +9089,11 @@ async fn db_create_withdrawal(
 async fn db_withdrawals_for_user(
     pool: &PgPool,
     user_id: Uuid,
+    query: &ListQuery,
 ) -> Result<Vec<WithdrawalRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, tx_hash,
@@ -8656,27 +9101,59 @@ async fn db_withdrawals_for_user(
                status, requested_at, processed_at, rejected_at, reject_reason
         from withdrawals
         where user_id = $1
+          and ($2::text is null or status = $2)
+          and (
+            $3::text is null
+            or refund_id ilike $3 escape '\'
+            or to_address ilike $3 escape '\'
+            or tx_hash ilike $3 escape '\'
+            or status ilike $3 escape '\'
+          )
         order by requested_at desc
+        limit $4 offset $5
         "#,
     )
     .bind(user_id)
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(withdrawal_from_row).collect())
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_admin_withdrawals(pool: &PgPool) -> Result<Vec<WithdrawalRecord>, AppError> {
+async fn db_admin_withdrawals(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<WithdrawalRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, chain, asset, token_contract, contract_address, tx_hash,
                refund_id, payout_wallet, to_address, amount, block_number, confirmations,
                status, requested_at, processed_at, rejected_at, reject_reason
         from withdrawals
+        where ($1::text is null or status = $1)
+          and (
+            $2::text is null
+            or refund_id ilike $2 escape '\'
+            or to_address ilike $2 escape '\'
+            or tx_hash ilike $2 escape '\'
+            or user_id::text ilike $2 escape '\'
+            or status ilike $2 escape '\'
+          )
         order by requested_at desc
-        limit 200
+        limit $3 offset $4
         "#,
     )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(withdrawal_from_row).collect())
@@ -8825,7 +9302,7 @@ async fn db_reserve_signal_fee(
 async fn db_insert_order_with_reservation_validation(
     pool: &PgPool,
     order: &EventContractOrderRecord,
-) -> Result<(), AppError> {
+) -> Result<Uuid, AppError> {
     let reservation_id = order.reservation_id.ok_or_else(|| {
         AppError::bad_request("RESERVATION_REQUIRED", "reservation_id is required")
     })?;
@@ -8869,7 +9346,7 @@ async fn db_insert_order_with_reservation_validation(
     }
     let expected_profit = order.stake_usdt * DEFAULT_PAYOUT_RATIO;
     let expected_payout = order.stake_usdt + expected_profit;
-    sqlx::query(
+    let saved_id: Uuid = sqlx::query(
         r#"
         insert into event_contract_orders
           (id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
@@ -8877,7 +9354,9 @@ async fn db_insert_order_with_reservation_validation(
            expected_profit_usdt, automation_profile, automation_confidence, action_trace_id,
            raw_audit, order_status, reported_at, created_at)
         values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
-        on conflict (user_id, client_order_id) do nothing
+        on conflict (user_id, client_order_id) do update
+        set reported_at = coalesce(event_contract_orders.reported_at, excluded.reported_at)
+        returning id
         "#,
     )
     .bind(order.id)
@@ -8900,8 +9379,9 @@ async fn db_insert_order_with_reservation_validation(
     .bind(&order.order_status)
     .bind(order.reported_at)
     .bind(order.created_at)
-    .execute(&mut *tx)
+    .fetch_one(&mut *tx)
     .await
+    .map(|row| row.get("id"))
     .map_err(AppError::from_sqlx)?;
     sqlx::query(
         r#"
@@ -8911,13 +9391,13 @@ async fn db_insert_order_with_reservation_validation(
         "#,
     )
     .bind(reservation_id)
-    .bind(order.id)
+    .bind(saved_id)
     .bind(Utc::now())
     .execute(&mut *tx)
     .await
     .map_err(AppError::from_sqlx)?;
     tx.commit().await.map_err(AppError::from_sqlx)?;
-    Ok(())
+    Ok(saved_id)
 }
 
 fn binance_income_to_record(
@@ -9809,9 +10289,15 @@ async fn db_admin_overview(
     let stats = db_build_stats(pool, started_at, prediction_runtime).await?;
     let users_total = db_count(pool, "users").await?;
     let ready_pages = db_ready_pages(pool).await?;
-    let orders = db_admin_orders(pool).await?;
-    let reports = db_admin_reports(pool).await?;
-    let settlements = db_admin_settlements(pool).await?;
+    let overview_query = ListQuery {
+        page: Some(1),
+        limit: Some(20),
+        search: None,
+        status: None,
+    };
+    let orders = db_admin_orders(pool, &overview_query).await?;
+    let reports = db_admin_reports(pool, &overview_query).await?;
+    let settlements = db_admin_settlements(pool, &overview_query).await?;
     Ok(json!({
         "stats": stats,
         "users_total": users_total,
@@ -9827,15 +10313,19 @@ async fn db_build_stats(
     started_at: DateTime<Utc>,
     prediction_runtime: PredictionRuntimeStatus,
 ) -> Result<StatsResponse, AppError> {
-    let reports = db_admin_reports(pool).await?;
-    let wins = reports
-        .iter()
-        .filter(|report| report.result.eq_ignore_ascii_case("WIN"))
-        .count();
-    let losses = reports
-        .iter()
-        .filter(|report| report.result.eq_ignore_ascii_case("LOSS"))
-        .count();
+    let outcome_row = sqlx::query(
+        r#"
+        select
+          count(*) filter (where upper(result) = 'WIN') as wins,
+          count(*) filter (where upper(result) = 'LOSS') as losses
+        from execution_reports
+        "#,
+    )
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let wins = outcome_row.get::<i64, _>("wins") as usize;
+    let losses = outcome_row.get::<i64, _>("losses") as usize;
     let settled = wins + losses;
     let hit_rate = if settled == 0 {
         "0".to_string()
@@ -9957,15 +10447,33 @@ async fn db_ready_pages(pool: &PgPool) -> Result<i64, AppError> {
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_admin_users(pool: &PgPool) -> Result<Vec<AdminUserRecord>, AppError> {
+async fn db_admin_users(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<AdminUserRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at
         from users
+        where ($1::text is null or status = $1)
+          and (
+            $2::text is null
+            or wallet_address ilike $2 escape '\'
+            or id::text ilike $2 escape '\'
+            or active_device_fingerprint ilike $2 escape '\'
+            or status ilike $2 escape '\'
+          )
         order by created_at desc
-        limit 200
+        limit $3 offset $4
         "#,
     )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| {
@@ -9977,7 +10485,13 @@ async fn db_admin_users(pool: &PgPool) -> Result<Vec<AdminUserRecord>, AppError>
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_admin_orders(pool: &PgPool) -> Result<Vec<EventContractOrderRecord>, AppError> {
+async fn db_admin_orders(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
@@ -9985,10 +10499,24 @@ async fn db_admin_orders(pool: &PgPool) -> Result<Vec<EventContractOrderRecord>,
                automation_confidence, action_trace_id, raw_audit, order_status,
                reported_at, created_at
         from event_contract_orders
+        where ($1::text is null or order_status = $1)
+          and (
+            $2::text is null
+            or client_order_id ilike $2 escape '\'
+            or signal_ref ilike $2 escape '\'
+            or user_id::text ilike $2 escape '\'
+            or symbol ilike $2 escape '\'
+            or direction ilike $2 escape '\'
+            or order_status ilike $2 escape '\'
+          )
         order by created_at desc
-        limit 200
+        limit $3 offset $4
         "#,
     )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(order_from_row).collect())
@@ -9998,7 +10526,11 @@ async fn db_admin_orders(pool: &PgPool) -> Result<Vec<EventContractOrderRecord>,
 async fn db_orders_for_user(
     pool: &PgPool,
     user_id: Uuid,
+    query: &ListQuery,
 ) -> Result<Vec<EventContractOrderRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
@@ -10007,11 +10539,24 @@ async fn db_orders_for_user(
                reported_at, created_at
         from event_contract_orders
         where user_id = $1
+          and ($2::text is null or order_status = $2)
+          and (
+            $3::text is null
+            or client_order_id ilike $3 escape '\'
+            or signal_ref ilike $3 escape '\'
+            or symbol ilike $3 escape '\'
+            or direction ilike $3 escape '\'
+            or order_status ilike $3 escape '\'
+          )
         order by created_at desc
-        limit 100
+        limit $4 offset $5
         "#,
     )
     .bind(user_id)
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(order_from_row).collect())
@@ -10040,7 +10585,13 @@ fn order_from_row(row: sqlx::postgres::PgRow) -> EventContractOrderRecord {
     }
 }
 
-async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, AppError> {
+async fn db_admin_reports(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<ExecutionReportRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
@@ -10048,10 +10599,24 @@ async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, A
                payout_ratio, gross_profit, result, automation_profile,
                automation_confidence, action_trace_id, report_status, reported_at, created_at
         from execution_reports
+        where ($1::text is null or report_status = $1)
+          and (
+            $2::text is null
+            or client_report_id ilike $2 escape '\'
+            or signal_id::text ilike $2 escape '\'
+            or user_id::text ilike $2 escape '\'
+            or symbol ilike $2 escape '\'
+            or result ilike $2 escape '\'
+            or report_status ilike $2 escape '\'
+          )
         order by created_at desc
-        limit 200
+        limit $3 offset $4
         "#,
     )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(execution_report_from_row).collect())
@@ -10061,7 +10626,11 @@ async fn db_admin_reports(pool: &PgPool) -> Result<Vec<ExecutionReportRecord>, A
 async fn db_reports_for_user(
     pool: &PgPool,
     user_id: Uuid,
+    query: &ListQuery,
 ) -> Result<Vec<ExecutionReportRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, user_id, signal_id::text as signal_id, client_report_id, source, symbol,
@@ -10070,11 +10639,24 @@ async fn db_reports_for_user(
                automation_confidence, action_trace_id, report_status, reported_at, created_at
         from execution_reports
         where user_id = $1
+          and ($2::text is null or report_status = $2)
+          and (
+            $3::text is null
+            or client_report_id ilike $3 escape '\'
+            or signal_id::text ilike $3 escape '\'
+            or symbol ilike $3 escape '\'
+            or result ilike $3 escape '\'
+            or report_status ilike $3 escape '\'
+          )
         order by created_at desc
-        limit 100
+        limit $4 offset $5
         "#,
     )
     .bind(user_id)
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(execution_report_from_row).collect())
@@ -10106,16 +10688,34 @@ fn execution_report_from_row(row: sqlx::postgres::PgRow) -> ExecutionReportRecor
     }
 }
 
-async fn db_admin_settlements(pool: &PgPool) -> Result<Vec<SettlementRecord>, AppError> {
+async fn db_admin_settlements(
+    pool: &PgPool,
+    query: &ListQuery,
+) -> Result<Vec<SettlementRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, execution_report_id, user_id, gross_profit, profit_share_fee,
                loss_rebate, user_net_profit, status, created_at
         from settlements
+        where ($1::text is null or status = $1)
+          and (
+            $2::text is null
+            or id::text ilike $2 escape '\'
+            or execution_report_id::text ilike $2 escape '\'
+            or user_id::text ilike $2 escape '\'
+            or status ilike $2 escape '\'
+          )
         order by created_at desc
-        limit 200
+        limit $3 offset $4
         "#,
     )
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(settlement_from_row).collect())
@@ -10125,18 +10725,33 @@ async fn db_admin_settlements(pool: &PgPool) -> Result<Vec<SettlementRecord>, Ap
 async fn db_settlements_for_user(
     pool: &PgPool,
     user_id: Uuid,
+    query: &ListQuery,
 ) -> Result<Vec<SettlementRecord>, AppError> {
+    let (_, limit, offset) = page_params(query);
+    let search = search_pattern(query);
+    let status = status_filter(query);
     sqlx::query(
         r#"
         select id, execution_report_id, user_id, gross_profit, profit_share_fee,
                loss_rebate, user_net_profit, status, created_at
         from settlements
         where user_id = $1
+          and ($2::text is null or status = $2)
+          and (
+            $3::text is null
+            or id::text ilike $3 escape '\'
+            or execution_report_id::text ilike $3 escape '\'
+            or status ilike $3 escape '\'
+          )
         order by created_at desc
-        limit 100
+        limit $4 offset $5
         "#,
     )
     .bind(user_id)
+    .bind(status)
+    .bind(search)
+    .bind(limit)
+    .bind(offset)
     .fetch_all(pool)
     .await
     .map(|rows| rows.into_iter().map(settlement_from_row).collect())

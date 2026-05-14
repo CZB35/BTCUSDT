@@ -202,10 +202,10 @@ Response:
 
 ```json
 {
-  "automation_enabled": false,
-  "execution_mode": "manual",
+  "automation_enabled": true,
+  "execution_mode": "automatic",
   "target_app_profile": "binance_event_contract_v1",
-  "require_final_confirmation": true,
+  "require_final_confirmation": false,
   "emergency_stop_enabled": true
 }
 ```
@@ -217,17 +217,17 @@ Request:
 ```json
 {
   "automation_enabled": true,
-  "execution_mode": "assisted",
+  "execution_mode": "automatic",
   "target_app_profile": "binance_event_contract_v1",
-  "require_final_confirmation": true
+  "require_final_confirmation": false
 }
 ```
 
 Validation:
 
 ```text
-execution_mode must be manual, assisted, or automatic
-automatic mode requires automation_enabled = true
+execution_mode must be automatic
+automatic mode cannot require final confirmation
 target_app_profile must match a supported Android automation profile
 ```
 
@@ -336,7 +336,7 @@ Android sends this immediately after the confirmation dialog is clicked. Automat
 
 ## Execution Reports
 
-This endpoint records manual or Android automation execution results for audit review. It does not change balances by itself.
+This endpoint records Android automation execution results for audit review. It does not change balances by itself.
 
 ### POST /v1/execution-reports
 
@@ -398,7 +398,7 @@ Use the returned token as `x-admin-token` on admin-only endpoints.
 
 ### POST /v1/admin/execution-reports/settle
 
-Admin-only endpoint. It settles one `pending_review` execution report after manual verification and writes the balance/ledger changes in one transaction.
+Admin-only endpoint. It settles one `pending_review` execution report after backend verification and writes the balance/ledger changes in one transaction.
 
 ```json
 {

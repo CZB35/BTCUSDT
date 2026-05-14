@@ -3,7 +3,9 @@ package com.eventsignal.app.automation
 import android.content.Context
 import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.AppRuntimeSummary
+import com.eventsignal.app.domain.EventContractOrderRequest
 import com.eventsignal.app.domain.SignalSnapshot
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -34,6 +36,9 @@ class AutomationStateStore(context: Context) {
 
         @Volatile
         private var cachedRuntimeSummary: AppRuntimeSummary? = null
+
+        @Volatile
+        private var cachedPendingOrders: List<PendingOrderReport>? = null
 
         @Volatile
         private var lastDebugDiskWriteAtMs: Long = 0
@@ -72,12 +77,36 @@ class AutomationStateStore(context: Context) {
             ?: AutomationSettings.default()
 
     fun hasExecuted(signalId: String): Boolean =
-        prefs.getStringSet("executed_signal_ids", emptySet()).orEmpty().contains(signalId)
+        prefs.getStringSet("executed_signal_ids", emptySet()).orEmpty().contains(signalId) ||
+            loadPendingOrders().any { it.signalId == signalId }
 
     fun markExecuted(signalId: String) {
         val next = prefs.getStringSet("executed_signal_ids", emptySet()).orEmpty().toMutableSet()
         next.add(signalId)
         prefs.edit().putStringSet("executed_signal_ids", next.toList().takeLast(100).toSet()).apply()
+    }
+
+    fun savePendingOrder(report: PendingOrderReport) {
+        val next = loadPendingOrders()
+            .filterNot { it.clientOrderId == report.clientOrderId || it.signalId == report.signalId }
+            .plus(report)
+            .takeLast(50)
+        cachedPendingOrders = next
+        prefs.edit().putString("pending_order_reports", json.encodeToString(next)).apply()
+    }
+
+    fun loadPendingOrders(): List<PendingOrderReport> {
+        cachedPendingOrders?.let { return it }
+        val raw = prefs.getString("pending_order_reports", null) ?: return emptyList()
+        return runCatching { json.decodeFromString<List<PendingOrderReport>>(raw) }
+            .getOrDefault(emptyList())
+            .also { cachedPendingOrders = it }
+    }
+
+    fun removePendingOrder(clientOrderId: String) {
+        val next = loadPendingOrders().filterNot { it.clientOrderId == clientOrderId }
+        cachedPendingOrders = next
+        prefs.edit().putString("pending_order_reports", json.encodeToString(next)).apply()
     }
 
     fun saveLastStatus(status: String) {
@@ -166,4 +195,15 @@ class AutomationStateStore(context: Context) {
 
     private fun AutomationDebugState.sameDisplayState(other: AutomationDebugState): Boolean =
         copy(lastEventAtMs = 0, updatedAtMs = 0) == other.copy(lastEventAtMs = 0, updatedAtMs = 0)
+}
+
+@Serializable
+data class PendingOrderReport(
+    val signalId: String,
+    val clientOrderId: String,
+    val order: EventContractOrderRequest,
+    val createdAtMs: Long,
+    val attempts: Int = 0,
+) {
+    fun nextAttempt() = copy(attempts = attempts + 1)
 }

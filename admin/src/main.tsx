@@ -1694,17 +1694,34 @@ function Stat({ icon, label, value }: { icon: ReactNode; label: string; value: n
 
 function DataTable({ columns, rows, pageSize = 10 }: { columns: string[]; rows: TableRow[]; pageSize?: number }) {
   const [page, setPage] = useState(0);
+  const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<TableRow | null>(null);
-  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredRows = normalizedQuery
+    ? rows.filter((row) =>
+        row.id.toLowerCase().includes(normalizedQuery)
+        || row.cells.some((cell) => String(cell).toLowerCase().includes(normalizedQuery))
+        || Object.values(row.details || {}).some((value) => String(value).toLowerCase().includes(normalizedQuery))
+      )
+    : rows;
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
   const safePage = Math.min(page, totalPages - 1);
-  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const visibleRows = filteredRows.slice(safePage * pageSize, safePage * pageSize + pageSize);
 
   useEffect(() => {
     if (page > totalPages - 1) setPage(totalPages - 1);
   }, [page, totalPages]);
 
+  useEffect(() => {
+    setPage(0);
+  }, [query, rows.length]);
+
   return (
     <>
+      <div className="table-toolbar">
+        <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索记录" />
+        <span>共 {filteredRows.length} 条</span>
+      </div>
       <div className="table-wrap">
         <table>
           <thead>
@@ -1721,9 +1738,9 @@ function DataTable({ columns, rows, pageSize = 10 }: { columns: string[]; rows: 
           </tbody>
         </table>
       </div>
-      {rows.length > pageSize && (
+      {filteredRows.length > pageSize && (
         <div className="pagination">
-          <span>共 {rows.length} 条，第 {safePage + 1}/{totalPages} 页</span>
+          <span>第 {safePage + 1}/{totalPages} 页</span>
           <div className="row-actions">
             <button className="table-action secondary-action" disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button>
             <button className="table-action secondary-action" disabled={safePage >= totalPages - 1} onClick={() => setPage((value) => Math.min(totalPages - 1, value + 1))}>下一页</button>
@@ -1807,7 +1824,7 @@ function labelDirection(direction?: string) {
 
 function predictionModeLabel(mode?: string) {
   if (mode === "strategy_loop") return "策略自动预测";
-  if (mode === "manual_signal") return "手动信号";
+  if (mode === "manual_signal") return "后台测试信号";
   return mode || "-";
 }
 

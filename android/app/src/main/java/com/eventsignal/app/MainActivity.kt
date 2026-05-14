@@ -322,16 +322,13 @@ private fun MainScreen(repository: EventSignalRepository) {
                                 status = "请先绑定并验证交易账号"
                                 return@AutomationCard
                             }
-                            persistAutomationSettings(automationSettings.copy(automationEnabled = enabled))
+                            val next = automationSettings.copy(
+                                automationEnabled = enabled,
+                                executionMode = "automatic",
+                                requireFinalConfirmation = false,
+                            )
+                            persistAutomationSettings(next)
                             status = if (enabled) "自动化已开启" else "自动化已关闭"
-                        },
-                        onModeChange = { mode ->
-                            if (mode != "manual" && !tradingAccountReady) {
-                                status = "请先绑定并验证交易账号"
-                                return@AutomationCard
-                            }
-                            persistAutomationSettings(automationSettings.copy(executionMode = mode))
-                            status = "执行模式已切换为${modeLabel(mode)}"
                         },
                         onStart = {
                             if (accessToken.isBlank()) {
@@ -549,7 +546,6 @@ private fun AutomationCard(
     status: String,
     tradingAccountReady: Boolean,
     onToggle: (Boolean) -> Unit,
-    onModeChange: (String) -> Unit,
     onStart: () -> Unit,
     onCalibrate: () -> Unit,
     onStop: () -> Unit,
@@ -569,24 +565,9 @@ private fun AutomationCard(
                 onCheckedChange = onToggle,
             )
         }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            ModeButton("手动", settings.executionMode == "manual", Modifier.weight(1f)) { onModeChange("manual") }
-            ModeButton(
-                "辅助",
-                settings.executionMode == "assisted",
-                Modifier.weight(1f),
-                enabled = tradingAccountReady,
-            ) { onModeChange("assisted") }
-            ModeButton(
-                "自动",
-                settings.executionMode == "automatic",
-                Modifier.weight(1f),
-                enabled = tradingAccountReady,
-            ) { onModeChange("automatic") }
-        }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             StatusChip("交易账号 ${if (tradingAccountReady) "已验证" else "未验证"}", tradingAccountReady, Modifier.weight(1f))
-            StatusChip("执行门槛 ${if (tradingAccountReady) "已放行" else "暂停"}", tradingAccountReady, Modifier.weight(1f))
+            StatusChip("自动执行 ${if (settings.automationEnabled) "开启" else "暂停"}", settings.automationEnabled, Modifier.weight(1f))
         }
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             StatusChip("页面 ${debugState.screenName}", debugState.safeToAct, Modifier.weight(1f))
@@ -694,29 +675,6 @@ private fun ReadinessChip(label: String, ready: Boolean, modifier: Modifier = Mo
 }
 
 @Composable
-private fun ModeButton(
-    label: String,
-    selected: Boolean,
-    modifier: Modifier = Modifier,
-    enabled: Boolean = true,
-    onClick: () -> Unit,
-) {
-    if (selected) {
-        Button(
-            onClick = onClick,
-            modifier = modifier,
-            enabled = enabled,
-            colors = ButtonDefaults.buttonColors(containerColor = BinanceYellow, contentColor = Color(0xFF181A20)),
-            shape = RoundedCornerShape(6.dp),
-        ) {
-            Text(label)
-        }
-    } else {
-        SecondaryButton(text = label, modifier = modifier, enabled = enabled, onClick = onClick)
-    }
-}
-
-@Composable
 private fun PrimaryButton(text: String, modifier: Modifier = Modifier, enabled: Boolean = true, onClick: () -> Unit) {
     Button(
         onClick = onClick,
@@ -756,14 +714,6 @@ private fun signalStateLabel(signal: SignalSnapshot): String =
         signal.authorizationStatus == "fee_reserve_insufficient" -> "预扣余额不足"
         signal.authorizationStatus in privateAccountGateStatuses -> "校验失败"
         else -> "等待授权"
-    }
-
-private fun modeLabel(mode: String): String =
-    when (mode) {
-        "manual" -> "手动"
-        "assisted" -> "辅助"
-        "automatic" -> "自动"
-        else -> mode
     }
 
 private fun confidenceLabel(raw: String): String =
@@ -826,6 +776,5 @@ private fun runtimeStatusLabel(status: String): String = when {
     status.startsWith("order_reported") -> "订单已上报"
     status.startsWith("action_button_not_found") -> "执行失败：按钮未找到"
     status.startsWith("action_click_failed") -> "执行失败：按钮点击失败"
-    status.startsWith("amount_prepared_waiting_confirmation") -> "金额已填写，等待确认"
     else -> status
 }

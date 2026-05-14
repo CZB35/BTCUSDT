@@ -253,7 +253,6 @@ class FloatingSignalService : Service() {
         status == "trading_account_not_verified" -> "未验证"
         status.startsWith("confirmed") -> "已确认"
         status.startsWith("order_reported") -> "已上报"
-        status.startsWith("amount_prepared_waiting_confirmation") -> "待确认"
         status.startsWith("action_button_not_found") -> "按钮缺失"
         status.startsWith("action_click_failed") -> "点击失败"
         else -> status

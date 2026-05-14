@@ -569,7 +569,7 @@ function DepositPage(props: {
           <Metric label="预计到账" value={`${Number.isFinite(credited) ? credited.toFixed(2) : "0"}U`} />
         </div>
         <label>充值金额<input value={props.amount} onChange={(event) => props.onAmount(event.target.value)} placeholder="首次至少 100U" /></label>
-        <label>交易哈希<input value={props.txHash} onChange={(event) => props.onTxHash(event.target.value)} placeholder="自动充值后会填入，也可手动提交" /></label>
+        <label>交易哈希<input value={props.txHash} onChange={(event) => props.onTxHash(event.target.value)} placeholder="钱包充值后会自动填入，异常时提交哈希" /></label>
         <div className="row">
           <button className="primary" onClick={props.onSend}>钱包充值</button>
           <button className="secondary" onClick={props.onSubmit}>提交哈希</button>
@@ -745,21 +745,40 @@ function Metric({ label, value }: { label: string; value: string }) {
 
 function RecordList({ title, rows, pageSize = 8 }: { title: string; rows: RecordRow[]; pageSize?: number }) {
   const [page, setPage] = useState(0);
+  const [query, setQuery] = useState("");
   const [selected, setSelected] = useState<RecordRow | null>(null);
-  const totalPages = Math.max(1, Math.ceil(rows.length / pageSize));
+  const normalizedQuery = query.trim().toLowerCase();
+  const filteredRows = normalizedQuery
+    ? rows.filter((row) =>
+        row.id.toLowerCase().includes(normalizedQuery)
+        || String(row.main).toLowerCase().includes(normalizedQuery)
+        || String(row.value).toLowerCase().includes(normalizedQuery)
+        || String(row.sub).toLowerCase().includes(normalizedQuery)
+        || String(row.extra).toLowerCase().includes(normalizedQuery)
+        || Object.values(row.details || {}).some((value) => String(value).toLowerCase().includes(normalizedQuery))
+      )
+    : rows;
+  const totalPages = Math.max(1, Math.ceil(filteredRows.length / pageSize));
   const safePage = Math.min(page, totalPages - 1);
-  const visibleRows = rows.slice(safePage * pageSize, safePage * pageSize + pageSize);
+  const visibleRows = filteredRows.slice(safePage * pageSize, safePage * pageSize + pageSize);
 
   useEffect(() => {
     if (page > totalPages - 1) setPage(totalPages - 1);
   }, [page, totalPages]);
+
+  useEffect(() => {
+    setPage(0);
+  }, [query, rows.length]);
 
   return (
     <>
       <section className="list-card">
         <div className="list-row list-head">
           <h2>{title}</h2>
-          {rows.length > pageSize && <span>{safePage + 1}/{totalPages}</span>}
+          <span>{filteredRows.length} 条</span>
+        </div>
+        <div className="list-search">
+          <input value={query} onChange={(event) => setQuery(event.target.value)} placeholder="搜索记录" />
         </div>
         {visibleRows.length === 0 ? <div className="empty">暂无记录</div> : visibleRows.map((row) => (
           <button className="list-row record-button" key={row.id} onClick={() => row.details && setSelected(row)}>
@@ -767,7 +786,7 @@ function RecordList({ title, rows, pageSize = 8 }: { title: string; rows: Record
             <div className="list-row-sub"><span>{row.sub}</span><span>{row.extra}</span></div>
           </button>
         ))}
-        {rows.length > pageSize && (
+        {filteredRows.length > pageSize && (
           <div className="pager">
             <button className="ghost" disabled={safePage === 0} onClick={() => setPage((value) => Math.max(0, value - 1))}>上一页</button>
             <button className="ghost" disabled={safePage >= totalPages - 1} onClick={() => setPage((value) => Math.min(totalPages - 1, value + 1))}>下一页</button>

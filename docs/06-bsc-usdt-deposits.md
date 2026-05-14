@@ -59,7 +59,7 @@ Use at least 15 confirmations for normal crediting. For large amounts, use stric
 ```text
 < 100 USDT: 15 confirmations
 100 - 1000 USDT: 20 confirmations
-> 1000 USDT: manual review or 30+ confirmations
+> 1000 USDT: admin review or 30+ confirmations
 ```
 
 ## Deposit Status
@@ -70,7 +70,7 @@ detected
 confirming
 credited
 rejected
-manual_review
+admin_review
 ```
 
 ## Rejection Reasons
@@ -84,7 +84,7 @@ to_address_mismatch
 amount_too_small
 already_credited
 reorg_detected
-manual_review_required
+admin_review_required
 ```
 
 ## Security Notes

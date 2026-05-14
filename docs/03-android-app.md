@@ -115,9 +115,9 @@ Users configure automation separately from trading preferences:
 
 ```text
 automation_enabled: on/off
-execution_mode: manual | assisted | automatic
+execution_mode: automatic
 target_app_profile: selected supported profile
-require_final_confirmation: on/off
+require_final_confirmation: false
 emergency_stop_enabled: on
 ```
 
@@ -145,9 +145,7 @@ Controls:
 - Move window.
 - Hide until next signal.
 - Open main app.
-- Copy suggested amount.
-- Copy direction text.
-- Mark signal as watched or manually participated.
+- Show WebSocket status, recognition status, balance, next stake, order count, hit rate, PnL, and pending settlements.
 
 ## Suggested Stake Display
 
@@ -191,11 +189,9 @@ Core responsibilities:
 - Submit execution reports to `POST /v1/execution-reports`.
 - Stop immediately when the user taps emergency stop, the signal expires, confidence is below threshold, balance/risk limits fail, or screen recognition is uncertain.
 
-Suggested execution modes:
+Execution mode:
 
-- `manual`: show signal and copy helpers only.
-- `assisted`: prepare fields and ask the user before final submission.
-- `automatic`: run the configured action sequence and report the outcome.
+- `automatic`: run the configured action sequence, click the exchange confirmation, and report the order outcome.
 
 The first implementation can study Smart-AutoClicker style concepts: image conditions, trigger groups, actions, pause/resume, and scenario storage. Do not mix GPL-licensed source into this app unless the product accepts GPL-3.0 obligations.
 

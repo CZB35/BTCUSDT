@@ -129,8 +129,8 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
             stateStore.saveLastStatus("execution_skipped_automation_disabled")
             return
         }
-        if (settings.executionMode == "manual") {
-            stateStore.saveLastStatus("execution_skipped_manual_mode")
+        if (settings.executionMode != "automatic") {
+            stateStore.saveLastStatus("execution_skipped_automation_mode_invalid")
             return
         }
         val signal = stateStore.loadSignal() ?: run {
@@ -156,7 +156,9 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
             stateStore.saveLastStatus("execution_failed_screen_not_recognized:${screen.screenName}:${screen.confidence}")
             return
         }
-        actionRunner.maybeRun(screen, profile, settings, signal)
+        scope.launch(Dispatchers.IO) {
+            actionRunner.maybeRun(screen, profile, settings, signal)
+        }
     }
 
     private fun saveScreenState(screen: RecognizedScreen, action: String) {

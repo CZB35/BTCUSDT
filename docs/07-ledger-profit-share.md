@@ -47,7 +47,7 @@ Settlement requires an execution report containing:
 - Gross profit.
 - Optional payout ratio.
 - Optional entry and expiry prices.
-- Source, such as `manual`, `android_assisted`, or `android_automation`.
+- Source, normally `android_automation` for App-generated reports.
 - Optional automation profile, confidence score, and action trace reference.
 
 ## Settlement Status

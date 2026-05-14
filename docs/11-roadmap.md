@@ -53,7 +53,7 @@
 
 - Screen recognition prototype.
 - Action sequence runner.
-- Manual, assisted, and automatic execution modes.
+- Automatic execution mode only.
 - Emergency stop from floating window and notification.
 - Local action trace and audit export.
 - Failure handling for unknown screens, expired signals, and low recognition confidence.
@@ -89,7 +89,7 @@
 
 ## Future Work
 
-- Withdrawal flow with manual review.
+- Withdrawal flow with admin review.
 - More symbols.
 - More periods.
 - Improved ML model after enough live data.

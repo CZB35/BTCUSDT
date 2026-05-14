@@ -46,6 +46,7 @@ class AutomationForegroundService : Service() {
         AutomationRuntime.running = true
         startSignalSocket()
         startRuntimeSummaryLoop()
+        startPendingOrderReportLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -136,6 +137,32 @@ class AutomationForegroundService : Service() {
                 repository.loadAppRuntimeSummary()
                     .onFailure { stateStore.saveLastStatus("runtime_summary_failed:${it.javaClass.simpleName}") }
                 delay(5_000)
+            }
+        }
+    }
+
+    private var pendingOrderLoopStarted = false
+
+    private fun startPendingOrderReportLoop() {
+        if (pendingOrderLoopStarted) return
+        pendingOrderLoopStarted = true
+        scope.launch {
+            val repository = EventSignalRepository(applicationContext)
+            while (isActive) {
+                val pendingOrders = stateStore.loadPendingOrders()
+                for (pending in pendingOrders) {
+                    repository.submitEventContractOrder(pending.order)
+                        .onSuccess {
+                            stateStore.markExecuted(pending.signalId)
+                            stateStore.removePendingOrder(pending.clientOrderId)
+                            stateStore.saveLastStatus("pending_order_reported:${pending.order.stakeUsdt}")
+                        }
+                        .onFailure {
+                            stateStore.savePendingOrder(pending.nextAttempt())
+                            stateStore.saveLastStatus("pending_order_retry:${pending.attempts + 1}")
+                        }
+                }
+                delay(2_000)
             }
         }
     }

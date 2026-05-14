@@ -421,6 +421,24 @@ td {
   background: rgba(252, 213, 53, 0.06);
 }
 
+.table-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+
+.table-toolbar input {
+  width: min(320px, 100%);
+}
+
+.table-toolbar span {
+  color: #929aa5;
+  font-size: 13px;
+  white-space: nowrap;
+}
+
 .pagination {
   display: flex;
   align-items: center;

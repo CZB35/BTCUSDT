@@ -24,7 +24,7 @@ class ActionRunner(
         signal: SignalSnapshot,
     ) {
         if (!screen.safeToAct) return
-        if (settings.executionMode == "manual" || !settings.automationEnabled) return
+        if (!settings.automationEnabled || settings.executionMode != "automatic") return
 
         val signalId = signal.id ?: run {
             stateStore.saveLastStatus("missing_signal_id")
@@ -84,12 +84,6 @@ class ActionRunner(
             return
         }
 
-        if (settings.executionMode == "assisted" || settings.requireFinalConfirmation) {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已输入金额，等待手动确认")
-            stateStore.saveLastStatus("amount_prepared_waiting_confirmation:$amount")
-            return
-        }
-
         val button = if (direction == "UP") upButton else downButton
         if (button == null) {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到执行按钮")
@@ -99,9 +93,8 @@ class ActionRunner(
         if (click(button)) {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已点击执行按钮，等待确认")
             if (clickConfirm(profile)) {
-                stateStore.markExecuted(signalId)
                 saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已确认下单")
-                submitOrderReport(
+                val pending = buildOrderReport(
                     signal = signal,
                     signalId = signalId,
                     direction = direction,
@@ -109,6 +102,8 @@ class ActionRunner(
                     profile = profile,
                     screen = screen,
                 )
+                stateStore.savePendingOrder(pending)
+                submitPendingOrder(pending)
                 stateStore.saveLastStatus("confirmed:$amount:${screen.confidence}")
             } else {
                 stateStore.saveLastStatus("confirm_button_not_found:$amount")
@@ -139,14 +134,14 @@ class ActionRunner(
         }
     }
 
-    private fun submitOrderReport(
+    private fun buildOrderReport(
         signal: SignalSnapshot,
         signalId: String,
         direction: String,
         amount: String,
         profile: AutomationProfile,
         screen: RecognizedScreen,
-    ) {
+    ): PendingOrderReport {
         val traceId = "android-${System.currentTimeMillis()}-$signalId"
         val order = EventContractOrderRequest(
             clientOrderId = traceId,
@@ -171,9 +166,25 @@ class ActionRunner(
             ),
             reportedAt = Instant.now().toString(),
         )
-        repository.submitEventContractOrder(order)
-            .onSuccess { stateStore.saveLastStatus("order_reported:$amount") }
-            .onFailure { stateStore.saveLastStatus("order_report_failed:${it.message}") }
+        return PendingOrderReport(
+            signalId = signalId,
+            clientOrderId = traceId,
+            order = order,
+            createdAtMs = System.currentTimeMillis(),
+        )
+    }
+
+    private fun submitPendingOrder(pending: PendingOrderReport) {
+        repository.submitEventContractOrder(pending.order)
+            .onSuccess {
+                stateStore.markExecuted(pending.signalId)
+                stateStore.removePendingOrder(pending.clientOrderId)
+                stateStore.saveLastStatus("order_reported:${pending.order.stakeUsdt}")
+            }
+            .onFailure {
+                stateStore.savePendingOrder(pending.nextAttempt())
+                stateStore.saveLastStatus("order_report_failed:${it.javaClass.simpleName}")
+            }
     }
 
     private fun saveActionState(

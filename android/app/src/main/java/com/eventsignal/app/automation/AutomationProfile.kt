@@ -18,8 +18,6 @@ object BuiltInProfiles {
             "com.binance.dev",
             "com.binance.client",
             "com.binance.mobile",
-            "com.android.chrome",
-            "org.chromium.webview_shell",
         ),
         minRecognitionConfidence = 0.62,
         pageKeywords = listOf(

@@ -101,18 +101,18 @@ The backend creates this row with defaults when a user is registered or when set
 ```sql
 create table user_automation_settings (
   user_id uuid primary key references users(id),
-  automation_enabled boolean not null default false,
-  execution_mode text not null default 'manual',
+  automation_enabled boolean not null default true,
+  execution_mode text not null default 'automatic',
   target_app_profile text,
-  require_final_confirmation boolean not null default true,
+  require_final_confirmation boolean not null default false,
   emergency_stop_enabled boolean not null default true,
   created_at timestamptz not null default now(),
   updated_at timestamptz not null default now(),
-  constraint execution_mode_allowed check (execution_mode in ('manual', 'assisted', 'automatic'))
+  constraint execution_mode_allowed check (execution_mode = 'automatic')
 );
 ```
 
-The Android app reads this row before starting automation. Automatic mode must still obey signal freshness, confidence, balance, and per-order stake limits.
+The Android app reads this row before starting automation. The only execution mode is automatic, and it must still obey signal freshness, confidence, balance, and per-order stake limits.
 
 ## automation_page_states
 
@@ -242,7 +242,7 @@ create table execution_reports (
   user_id uuid not null references users(id),
   signal_id uuid not null references signals(id),
   client_report_id text not null,
-  source text not null default 'manual',
+  source text not null default 'android_automation',
   symbol text not null,
   period_seconds integer not null,
   direction text not null,
@@ -263,11 +263,11 @@ create table execution_reports (
 );
 ```
 
-`source` should be `manual`, `android_assisted`, or `android_automation`. Store only audit metadata by default; keep screenshots or large traces in object storage and reference them from `raw_audit`.
+`source` should be `android_automation` for App-generated execution reports. Store only audit metadata by default; keep screenshots or large traces in object storage and reference them from `raw_audit`.
 
 ## signal_reservations
 
-Created before an automatic signal is delivered. It freezes estimated fee coverage so manual withdrawals cannot remove funds needed for settlement.
+Created before an automatic signal is delivered. It freezes estimated fee coverage so withdrawals cannot remove funds needed for settlement.
 
 ```sql
 create table signal_reservations (

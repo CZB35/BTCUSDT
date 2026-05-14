@@ -20,17 +20,17 @@ The platform does not custody user Binance accounts and does not require Binance
 - Floating Android window showing signal, countdown, confidence, and suggested amount.
 - Android automation module for user-authorized event contract operation based on delivered signals and saved risk settings.
 - Suggested amount rule: user-configurable percentage of available platform balance, default 5%, clamped to the event-contract order range of 5-250 USDT.
-- Signal authorization freezes the estimated 30% winning-profit share before Android receives an automatic trade signal, so later manual withdrawals cannot remove fee coverage.
+- Signal authorization freezes the estimated 30% winning-profit share before Android receives an automatic trade signal, so later withdrawals cannot remove fee coverage.
 - User trading preference settings: stake percentage, single-order cap, minimum signal confidence, and enable/disable signal alerts.
 - Automation preference settings: enable/disable automation, execution mode, target app profile, per-order confirmation requirement, and emergency stop.
 - Copy helpers for signal direction and suggested amount.
-- Execution report submission from Android automation and manual reconciliation flows.
+- Execution report submission from Android automation and backend reconciliation flows.
 - Settlement: winning orders deduct 30% of verified gross profit; losing orders credit 30% of verified loss amount back to platform balance.
 - Admin dashboard API foundation for user, deposit, signal, and ledger inspection.
 
 ## Explicit Non-Goals For First Release
 
-- No automatic withdrawal function. Withdrawals, if added, require manual approval and must use `available` balance only.
+- No automatic withdrawal function. Withdrawals require admin approval and must use `available` balance only.
 - No cross-platform iOS app.
 - No direct Binance Event Contract API integration unless official endpoints are obtained.
 - No promise of profit or guaranteed signal accuracy.

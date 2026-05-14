@@ -144,14 +144,27 @@ class ScreenRecognitionService {
         }
 
     private fun extractObservedBalanceUsdt(texts: List<String>): String? {
-        val normalized = texts.joinToString(" ") { it.replace(",", "") }
-        val patterns = listOf(
+        val normalizedTexts = texts.map { it.replace(",", "").replace("\\s+".toRegex(), " ").trim() }
+        val joined = normalizedTexts.joinToString(" ")
+        val directPatterns = listOf(
             Regex("""U\s*本\s*位\s*合\s*约\s*([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
-            Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
+            Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT\s*U\s*本\s*位\s*合\s*约""", RegexOption.IGNORE_CASE),
         )
-        return patterns.firstNotNullOfOrNull { pattern ->
-            pattern.find(normalized)?.groupValues?.getOrNull(1)
+        directPatterns.firstNotNullOfOrNull { pattern ->
+            pattern.find(joined)?.groupValues?.getOrNull(1)
+        }?.let { return it }
+
+        normalizedTexts.forEachIndexed { index, text ->
+            if (text.contains("U本位合约") || text.contains("U 本位合约")) {
+                val local = normalizedTexts.drop(index).take(4).joinToString(" ")
+                Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE)
+                    .find(local)
+                    ?.groupValues
+                    ?.getOrNull(1)
+                    ?.let { return it }
+            }
         }
+        return null
     }
 
     private fun AccessibilityNodeInfo.toSnapshot(): NodeSnapshot =

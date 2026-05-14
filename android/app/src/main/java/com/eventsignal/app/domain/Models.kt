@@ -18,10 +18,10 @@ data class AutomationSettings(
 ) {
     companion object {
         fun default() = AutomationSettings(
-            automationEnabled = false,
-            executionMode = "manual",
+            automationEnabled = true,
+            executionMode = "automatic",
             targetAppProfile = "binance_event_contract_v1",
-            requireFinalConfirmation = true,
+            requireFinalConfirmation = false,
             emergencyStopEnabled = true,
         )
     }

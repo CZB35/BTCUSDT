@@ -110,8 +110,8 @@ min_confidence = platform default
 signal_alert_enabled = true
 floating_window_enabled = true
 automation_enabled = false
-execution_mode = manual
-require_final_confirmation = true
+execution_mode = automatic
+require_final_confirmation = false
 ```
 
 ## Configuration

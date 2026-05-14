@@ -321,6 +321,14 @@ input:focus {
   font-size: 12px;
 }
 
+.list-search {
+  padding: 0 12px 12px;
+}
+
+.list-search input {
+  width: 100%;
+}
+
 .pager {
   display: grid;
   grid-template-columns: 1fr 1fr;
