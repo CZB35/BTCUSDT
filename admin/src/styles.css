@@ -192,6 +192,20 @@ label {
   font-size: 13px;
 }
 
+.switch-line {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-height: 40px;
+  color: #eaecef;
+  font-weight: 700;
+}
+
+.switch-line input {
+  width: 18px;
+  height: 18px;
+}
+
 input {
   height: 40px;
   border: 1px solid #2b3139;

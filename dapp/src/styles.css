@@ -34,6 +34,25 @@ button {
   padding: 14px 14px 88px;
 }
 
+.auth-shell {
+  display: grid;
+  align-items: center;
+  padding-bottom: 14px;
+}
+
+.auth-card {
+  align-content: start;
+}
+
+.auth-brand {
+  padding-bottom: 4px;
+}
+
+.auth-status {
+  color: #707a8a;
+  font-size: 13px;
+}
+
 .topbar {
   position: sticky;
   top: 0;
@@ -215,6 +234,13 @@ input:focus {
   font-weight: 800;
 }
 
+.primary:disabled,
+.secondary:disabled,
+.ghost:disabled {
+  cursor: not-allowed;
+  opacity: 0.45;
+}
+
 .primary {
   background: #fcd535;
   color: #181a20;
@@ -382,7 +408,7 @@ button:disabled {
   bottom: 0;
   z-index: 10;
   display: grid;
-  grid-template-columns: repeat(5, 1fr);
+  grid-template-columns: repeat(6, 1fr);
   width: min(480px, 100%);
   transform: translateX(-50%);
   border-top: 1px solid #eaecef;

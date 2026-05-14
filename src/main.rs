@@ -1,5 +1,9 @@
 use std::{
-    collections::HashMap, env, net::SocketAddr, str::FromStr, sync::Arc,
+    collections::{BTreeMap, HashMap},
+    env,
+    net::SocketAddr,
+    str::FromStr,
+    sync::Arc,
     time::Duration as StdDuration,
 };
 
@@ -22,9 +26,10 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Duration, Utc};
+use chrono::{DateTime, Duration, TimeZone, Utc};
 use clap::Parser;
 use ethers_core::types::{Address, Signature, U256};
+use futures_util::{SinkExt, StreamExt};
 use hmac::{Hmac, Mac};
 use rand_core::RngCore;
 use rust_decimal::Decimal;
@@ -34,6 +39,7 @@ use serde_json::json;
 use sqlx::{postgres::PgPoolOptions, PgPool, Postgres, Row, Transaction};
 use tokio::sync::{broadcast, RwLock};
 use tokio::task::JoinHandle;
+use tokio_tungstenite::{connect_async, tungstenite::Message as TungsteniteMessage};
 use tower_http::cors::{Any, CorsLayer};
 use tower_http::services::ServeDir;
 use uuid::Uuid;
@@ -52,6 +58,8 @@ const DEFAULT_STAKE_PERCENT: Decimal = dec!(0.05);
 const MIN_EVENT_STAKE: Decimal = dec!(5);
 const MAX_EVENT_STAKE: Decimal = dec!(250);
 const PAGE_GATE_TTL_SECONDS: i64 = 3;
+const ACCOUNT_BALANCE_TOLERANCE_USDT: Decimal = dec!(1);
+const ACCOUNT_BALANCE_CACHE_TTL_SECONDS: i64 = 90;
 const MIN_DEPOSIT_AMOUNT: Decimal = dec!(10);
 const BINANCE_PROVIDER: &str = "binance_futures";
 const BINANCE_FAPI_BASE_URL: &str = "https://fapi.binance.com";
@@ -60,8 +68,21 @@ const BINANCE_INCOME_LOOKBACK_MINUTES: i64 = 20;
 const BINANCE_SETTLEMENT_GRACE_SECONDS: i64 = 90;
 const BINANCE_BALANCE_REFRESH_SECONDS: i64 = 30;
 const BINANCE_BALANCE_REFRESH_LIMIT: i64 = 30;
+const DEFAULT_EXCHANGE_SYNC_INTERVAL_SECONDS: u64 = 15;
 const BINANCE_ORDER_CONFIRM_LIMIT: i64 = 5;
 const BINANCE_SETTLEMENT_SYNC_LIMIT: i64 = 3;
+const DEFAULT_PREDICTION_INTERVAL_SECONDS: u64 = 1;
+const DEFAULT_PREDICTION_CANDLE_LIMIT: usize = 720;
+const DEFAULT_PREDICTION_STALE_SECONDS: i64 = 5;
+const DEFAULT_PREDICTION_UP_THRESHOLD: f64 = 8.00;
+const DEFAULT_PREDICTION_DOWN_THRESHOLD: f64 = -8.00;
+const DEFAULT_PREDICTION_MIN_CONFIDENCE: f64 = 0.72;
+const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
+const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
+const DEFAULT_MARKET_WS_URL: &str =
+    "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
+const DEFAULT_MARKET_MIN_WARM_CANDLES: usize = 240;
+const DEFAULT_MARKET_WS_RECONNECT_SECONDS: u64 = 2;
 const DEFAULT_EXCHANGE_WORKER_SHARD_TOTAL: i32 = 1;
 const DEFAULT_EXCHANGE_WORKER_SHARD_INDEX: i32 = 0;
 const DEFAULT_BSC_USDT_CONTRACT: &str = "0x55d398326f99059fF775485246999027B3197955";
@@ -156,6 +177,8 @@ async fn main() -> anyhow::Result<()> {
     start_exchange_sync_workers(&state)
         .await
         .map_err(|err| anyhow::anyhow!("{}: {}", err.code, err.message))?;
+    start_market_data_feed(&state);
+    start_prediction_loop(&state);
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
     println!("event-signal service listening on http://{}", cli.listen);
@@ -177,12 +200,18 @@ fn router(state: SharedState) -> Router {
         .route("/v1/auth/login", post(login))
         .route("/v1/auth/logout", post(logout))
         .route("/v1/auth/refresh", post(refresh_token))
+        .route(
+            "/v1/auth/change-password-message",
+            post(change_password_message),
+        )
+        .route("/v1/auth/change-password", post(change_password))
         .route("/v1/wallets/bind-message", post(wallet_bind_message))
         .route("/v1/wallets/verify", post(wallet_verify))
         .route("/v1/stats", get(stats))
         .route("/v1/signals/latest", get(latest_signal))
         .route("/v1/signals/history", get(signal_history))
         .route("/v1/signals/deliveries/ack", post(ack_signal_delivery))
+        .route("/v1/app/runtime-summary", get(app_runtime_summary))
         .route("/v1/user-settings/trading", get(get_trading_settings))
         .route("/v1/user-settings/trading", put(save_trading_settings))
         .route("/v1/user-settings/automation", get(get_automation_settings))
@@ -228,6 +257,18 @@ fn router(state: SharedState) -> Router {
         )
         .route("/v1/admin/signals", get(admin_signals))
         .route("/v1/admin/signals/emit", post(admin_emit_signal))
+        .route(
+            "/v1/admin/prediction-settings",
+            get(admin_prediction_settings),
+        )
+        .route(
+            "/v1/admin/prediction-settings",
+            put(admin_save_prediction_settings),
+        )
+        .route(
+            "/v1/admin/prediction-observations",
+            get(admin_prediction_observations),
+        )
         .route("/v1/admin/users", get(admin_users))
         .route("/v1/admin/orders", get(admin_orders))
         .route("/v1/admin/deposits", get(admin_deposits))
@@ -303,7 +344,11 @@ async fn run_exchange_sync_worker(
     config: ExchangeWorkerConfig,
     slot_id: Option<Uuid>,
 ) {
-    let mut interval = tokio::time::interval(StdDuration::from_secs(15));
+    let mut interval = tokio::time::interval(StdDuration::from_secs(env_u64(
+        "EXCHANGE_SYNC_INTERVAL_SECONDS",
+        DEFAULT_EXCHANGE_SYNC_INTERVAL_SECONDS,
+        1,
+    )));
     loop {
         interval.tick().await;
         if let Err(err) = sync_exchange_orders(&pool, &config).await {
@@ -313,6 +358,138 @@ async fn run_exchange_sync_worker(
             eprintln!("exchange sync failed: {}", err.message);
         }
     }
+}
+
+fn start_prediction_loop(state: &SharedState) {
+    let base_config = PredictionConfig::from_env();
+    {
+        let Ok(mut runtime) = state.prediction_runtime.try_write() else {
+            return;
+        };
+        runtime.enabled = base_config.enabled;
+        runtime.status = if base_config.enabled {
+            "running"
+        } else {
+            "disabled"
+        }
+        .to_string();
+        runtime.message = if base_config.enabled {
+            "strategy loop running".to_string()
+        } else {
+            "prediction disabled by env".to_string()
+        };
+    }
+    let state = state.clone();
+    tokio::spawn(async move {
+        let mut interval =
+            tokio::time::interval(StdDuration::from_secs(base_config.interval_seconds.max(1)));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            interval.tick().await;
+            let settings = load_prediction_settings(&state).await;
+            let config = base_config.with_settings(&settings);
+            if !config.enabled {
+                let mut runtime = state.prediction_runtime.write().await;
+                runtime.enabled = false;
+                runtime.status = "disabled".to_string();
+                runtime.message = "prediction disabled by admin".to_string();
+                runtime.last_evaluated_at = Some(Utc::now());
+                continue;
+            }
+            match evaluate_prediction(&state, &config).await {
+                Ok(decision) => {
+                    update_prediction_runtime(&state, &decision).await;
+                    if let Some(pool) = state.db.as_ref() {
+                        let _ = db_insert_prediction_observation(pool, &decision).await;
+                    }
+                    if decision.direction == "UP" || decision.direction == "DOWN" {
+                        if let Err(err) = emit_prediction_signal(&state, &decision).await {
+                            mark_prediction_error(&state, err.message).await;
+                        }
+                    }
+                }
+                Err(err) => mark_prediction_error(&state, err.message).await,
+            }
+        }
+    });
+}
+
+async fn update_prediction_runtime(state: &SharedState, decision: &PredictionDecision) {
+    let mut runtime = state.prediction_runtime.write().await;
+    runtime.enabled = true;
+    runtime.status = if decision.direction == "HOLD" {
+        "holding"
+    } else {
+        "matched"
+    }
+    .to_string();
+    runtime.last_evaluated_at = Some(Utc::now());
+    runtime.last_direction = decision.direction.clone();
+    runtime.last_score = Some(decision.score);
+    runtime.last_confidence = Some(decision.confidence);
+    runtime.market_source = Some(decision.market_source.clone());
+    runtime.market_age_seconds = Some(decision.market_age_seconds);
+    runtime.market_candles = decision.market_candles;
+    runtime.message = format!(
+        "{} | 行情 {} 延迟 {}s K线 {}",
+        decision.reason,
+        decision.market_source,
+        decision.market_age_seconds,
+        decision.market_candles
+    );
+    runtime.last_error = None;
+}
+
+async fn mark_prediction_error(state: &SharedState, message: String) {
+    let mut runtime = state.prediction_runtime.write().await;
+    runtime.enabled = true;
+    runtime.status = "error".to_string();
+    runtime.last_evaluated_at = Some(Utc::now());
+    runtime.last_error = Some(message.chars().take(500).collect());
+}
+
+async fn emit_prediction_signal(
+    state: &SharedState,
+    decision: &PredictionDecision,
+) -> Result<(), AppError> {
+    {
+        let mut last_cycle = state.prediction_last_emitted_cycle.write().await;
+        if let Some(last) = *last_cycle {
+            let age = (decision.cycle_start - last).num_seconds();
+            if age >= 0 && age < decision.signal_cooldown_seconds {
+                let mut runtime = state.prediction_runtime.write().await;
+                runtime.status = "duplicate_skipped".to_string();
+                runtime.message = format!(
+                    "skip duplicate {} score {:.4}; cooldown {}s remaining",
+                    decision.direction,
+                    decision.score,
+                    decision.signal_cooldown_seconds - age
+                );
+                return Ok(());
+            }
+        }
+        if last_cycle.as_ref() == Some(&decision.cycle_start) {
+            return Ok(());
+        }
+        *last_cycle = Some(decision.cycle_start);
+    }
+    let signal = SignalCore::from_prediction(decision);
+    if let Some(pool) = state.db.as_ref() {
+        if !db_insert_signal(pool, &signal).await? {
+            return Ok(());
+        }
+        let _ = db_insert_prediction_audit(pool, &signal, decision).await;
+    }
+    state.signals.write().await.push(signal.clone());
+    let _ = state.signal_tx.send(signal.clone());
+    let mut runtime = state.prediction_runtime.write().await;
+    runtime.status = "sent".to_string();
+    runtime.last_signal_at = Some(signal.created_at);
+    runtime.message = format!(
+        "sent {} score {:.4} confidence {:.4}",
+        signal.direction, decision.score, decision.confidence
+    );
+    Ok(())
 }
 
 async fn sync_exchange_worker_runtime(
@@ -383,6 +560,7 @@ struct AppState {
     referral_rewards: RwLock<Vec<ReferralRewardRecord>>,
     wallet_nonces: RwLock<HashMap<Uuid, WalletBindChallenge>>,
     sessions: RwLock<HashMap<String, SessionRecord>>,
+    app_signature_nonces: RwLock<HashMap<String, DateTime<Utc>>>,
     rate_limits: RwLock<HashMap<String, RegisterRateLimit>>,
     balances: RwLock<HashMap<Uuid, BalanceRecord>>,
     trading_settings: RwLock<HashMap<Uuid, TradingSettings>>,
@@ -397,6 +575,9 @@ struct AppState {
     withdrawals: RwLock<Vec<WithdrawalRecord>>,
     reservations: RwLock<HashMap<Uuid, SignalReservation>>,
     exchange_workers: RwLock<HashMap<Uuid, JoinHandle<()>>>,
+    market_data: RwLock<MarketDataState>,
+    prediction_runtime: RwLock<PredictionRuntimeStatus>,
+    prediction_last_emitted_cycle: RwLock<Option<DateTime<Utc>>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
 }
@@ -415,6 +596,7 @@ impl AppState {
             referral_rewards: RwLock::new(Vec::new()),
             wallet_nonces: RwLock::new(HashMap::new()),
             sessions: RwLock::new(HashMap::new()),
+            app_signature_nonces: RwLock::new(HashMap::new()),
             rate_limits: RwLock::new(HashMap::new()),
             balances: RwLock::new(HashMap::new()),
             trading_settings: RwLock::new(HashMap::new()),
@@ -429,6 +611,9 @@ impl AppState {
             withdrawals: RwLock::new(Vec::new()),
             reservations: RwLock::new(HashMap::new()),
             exchange_workers: RwLock::new(HashMap::new()),
+            market_data: RwLock::new(MarketDataState::default()),
+            prediction_runtime: RwLock::new(PredictionRuntimeStatus::default()),
+            prediction_last_emitted_cycle: RwLock::new(None),
             signal_tx,
             started_at: Utc::now(),
         })
@@ -442,6 +627,7 @@ struct UserRecord {
     password_hash: String,
     status: String,
     active_device_fingerprint: Option<String>,
+    session_version: i32,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -492,10 +678,26 @@ impl ClientType {
 
 #[derive(Clone)]
 struct WalletBindChallenge {
+    purpose: WalletChallengePurpose,
     chain: String,
     address: String,
     message: String,
     expires_at: DateTime<Utc>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum WalletChallengePurpose {
+    BindWallet,
+    ChangePassword,
+}
+
+impl WalletChallengePurpose {
+    fn label(&self) -> &'static str {
+        match self {
+            WalletChallengePurpose::BindWallet => "wallet bind",
+            WalletChallengePurpose::ChangePassword => "password change",
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -503,7 +705,9 @@ struct SessionRecord {
     user_id: Uuid,
     device_fingerprint: String,
     refresh_token: String,
+    app_session_key: String,
     client_type: ClientType,
+    session_version: i32,
     expires_at: DateTime<Utc>,
 }
 
@@ -622,6 +826,9 @@ struct AutomationPageState {
     amount_field_found: bool,
     up_button_found: bool,
     down_button_found: bool,
+    observed_balance_usdt: Option<Decimal>,
+    account_match_status: String,
+    account_balance_delta_usdt: Option<Decimal>,
     observed_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -660,6 +867,245 @@ impl SignalCore {
             created_at: now,
         }
     }
+
+    fn from_prediction(decision: &PredictionDecision) -> Self {
+        Self {
+            id: Uuid::now_v7(),
+            symbol: DEFAULT_SYMBOL.to_string(),
+            period_seconds: DEFAULT_PERIOD_SECONDS,
+            cycle_start: decision.cycle_start,
+            cycle_end: decision.cycle_end,
+            direction: decision.direction.clone(),
+            confidence: decimal_from_f64(decision.confidence, 6),
+            predicted_return: decimal_from_f64(decision.predicted_return, 10),
+            entry_price: decimal_from_f64(decision.entry_price, 8),
+            suggested_stake: MIN_EVENT_STAKE,
+            model_version: "score-v1".to_string(),
+            created_at: Utc::now(),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PredictionRuntimeStatus {
+    enabled: bool,
+    status: String,
+    last_evaluated_at: Option<DateTime<Utc>>,
+    last_signal_at: Option<DateTime<Utc>>,
+    last_direction: String,
+    last_score: Option<f64>,
+    last_confidence: Option<f64>,
+    market_source: Option<String>,
+    market_age_seconds: Option<i64>,
+    market_candles: usize,
+    message: String,
+    last_error: Option<String>,
+}
+
+impl Default for PredictionRuntimeStatus {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            status: "starting".to_string(),
+            last_evaluated_at: None,
+            last_signal_at: None,
+            last_direction: "HOLD".to_string(),
+            last_score: None,
+            last_confidence: None,
+            market_source: None,
+            market_age_seconds: None,
+            market_candles: 0,
+            message: "prediction loop starting".to_string(),
+            last_error: None,
+        }
+    }
+}
+
+#[derive(Clone)]
+struct PredictionConfig {
+    enabled: bool,
+    interval_seconds: u64,
+    candle_limit: usize,
+    stale_seconds: i64,
+    up_threshold: f64,
+    down_threshold: f64,
+    min_confidence: f64,
+    market_data_base_url: String,
+    market_ws_url: String,
+    market_ws_reconnect_seconds: u64,
+    signal_cooldown_seconds: i64,
+}
+
+#[derive(Clone, Serialize, Deserialize)]
+struct PredictionSettings {
+    enabled: bool,
+    interval_seconds: i32,
+    up_threshold: Decimal,
+    down_threshold: Decimal,
+    min_confidence: Decimal,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+impl Default for PredictionSettings {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            interval_seconds: DEFAULT_PREDICTION_INTERVAL_SECONDS as i32,
+            up_threshold: decimal_from_f64(DEFAULT_PREDICTION_UP_THRESHOLD, 10),
+            down_threshold: decimal_from_f64(DEFAULT_PREDICTION_DOWN_THRESHOLD, 10),
+            min_confidence: decimal_from_f64(DEFAULT_PREDICTION_MIN_CONFIDENCE, 6),
+            updated_at: None,
+        }
+    }
+}
+
+#[derive(Clone, Serialize)]
+struct PredictionObservationRecord {
+    id: Uuid,
+    source: String,
+    symbol: String,
+    period_seconds: i32,
+    model_version: String,
+    direction: String,
+    confidence: Decimal,
+    predicted_return: Decimal,
+    entry_price: Decimal,
+    score: Option<Decimal>,
+    feature_snapshot: serde_json::Value,
+    reason: Option<String>,
+    created_at: DateTime<Utc>,
+}
+
+struct PredictionDecision {
+    direction: String,
+    confidence: f64,
+    predicted_return: f64,
+    entry_price: f64,
+    score: f64,
+    cycle_start: DateTime<Utc>,
+    cycle_end: DateTime<Utc>,
+    signal_cooldown_seconds: i64,
+    market_source: String,
+    market_age_seconds: i64,
+    market_candles: usize,
+    reason: String,
+    feature_snapshot: serde_json::Value,
+}
+
+#[derive(Default)]
+struct MarketDataState {
+    candles: BTreeMap<i64, MarketCandle>,
+    latest_price: Option<f64>,
+    latest_price_time_ms: Option<i64>,
+    latest_source: Option<String>,
+    latest_mark_price: Option<f64>,
+    latest_trade_price: Option<f64>,
+    latest_futures_kline_price: Option<f64>,
+    last_connected_at: Option<DateTime<Utc>>,
+    last_message_at: Option<DateTime<Utc>>,
+    last_error: Option<String>,
+    preheated_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Clone)]
+struct MarketDataSnapshot {
+    candles: Vec<MarketCandle>,
+    latest_price: f64,
+    latest_price_time_ms: i64,
+    latest_source: String,
+    latest_mark_price: Option<f64>,
+    latest_trade_price: Option<f64>,
+    latest_futures_kline_price: Option<f64>,
+    last_message_at: Option<DateTime<Utc>>,
+}
+
+impl MarketDataState {
+    fn snapshot(&self, candle_limit: usize) -> Option<MarketDataSnapshot> {
+        let latest_price = self.latest_price?;
+        let latest_price_time_ms = self.latest_price_time_ms?;
+        let mut candles = self
+            .candles
+            .values()
+            .rev()
+            .take(candle_limit)
+            .cloned()
+            .collect::<Vec<_>>();
+        candles.reverse();
+        Some(MarketDataSnapshot {
+            candles,
+            latest_price,
+            latest_price_time_ms,
+            latest_source: self
+                .latest_source
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            latest_mark_price: self.latest_mark_price,
+            latest_trade_price: self.latest_trade_price,
+            latest_futures_kline_price: self.latest_futures_kline_price,
+            last_message_at: self.last_message_at,
+        })
+    }
+}
+
+#[derive(Deserialize)]
+struct BinanceCombinedStreamMessage {
+    stream: Option<String>,
+    data: serde_json::Value,
+}
+
+#[derive(Deserialize)]
+struct BinanceAggTradeStream {
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "T")]
+    trade_time_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct BinanceMarkPriceStream {
+    #[serde(rename = "p")]
+    mark_price: String,
+    #[serde(rename = "i")]
+    index_price: String,
+    #[serde(rename = "E")]
+    event_time_ms: i64,
+}
+
+#[derive(Deserialize)]
+struct BinanceKlineStream {
+    #[serde(rename = "k")]
+    kline: BinanceKlinePayload,
+}
+
+#[derive(Deserialize)]
+struct BinanceKlinePayload {
+    #[serde(rename = "t")]
+    open_time_ms: i64,
+    #[serde(rename = "T")]
+    close_time_ms: i64,
+    #[serde(rename = "o")]
+    open: String,
+    #[serde(rename = "h")]
+    high: String,
+    #[serde(rename = "l")]
+    low: String,
+    #[serde(rename = "c")]
+    close: String,
+    #[serde(rename = "v")]
+    volume: String,
+    #[serde(rename = "x")]
+    is_closed: bool,
+}
+
+#[derive(Clone)]
+struct MarketCandle {
+    open_time_ms: i64,
+    close_time_ms: i64,
+    open: f64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
 }
 
 #[derive(Clone, Serialize)]
@@ -842,7 +1288,11 @@ struct ExchangeCredentialStatus {
     verification_status: String,
     balance_available_usdt: Option<String>,
     balance_wallet_usdt: Option<String>,
+    account_match_status: Option<String>,
+    observed_balance_usdt: Option<String>,
+    account_balance_delta_usdt: Option<String>,
     balance_updated_at: Option<DateTime<Utc>>,
+    balance_cache_fresh: bool,
     last_verified_at: Option<DateTime<Utc>>,
     last_error: Option<String>,
     updated_at: Option<DateTime<Utc>>,
@@ -862,6 +1312,17 @@ struct BinanceAccountSnapshot {
 }
 
 #[derive(Clone)]
+struct ExchangeBalanceSnapshot {
+    available: Decimal,
+    updated_at: Option<DateTime<Utc>>,
+}
+
+struct AccountMatch {
+    status: String,
+    delta: Option<Decimal>,
+}
+
+#[derive(Clone)]
 struct ExchangeWorkerConfig {
     shard_total: i32,
     shard_index: i32,
@@ -877,6 +1338,83 @@ impl ExchangeWorkerConfig {
             shard_index: shard_index.rem_euclid(shard_total),
             bind_local_ip: binance_bind_local_ip().unwrap_or(None),
         }
+    }
+}
+
+impl PredictionConfig {
+    fn from_env() -> Self {
+        Self {
+            enabled: env_bool("PREDICTION_ENABLED", true),
+            interval_seconds: env_u64(
+                "PREDICTION_INTERVAL_SECONDS",
+                DEFAULT_PREDICTION_INTERVAL_SECONDS,
+                1,
+            ),
+            candle_limit: env_usize(
+                "PREDICTION_CANDLE_LIMIT",
+                DEFAULT_PREDICTION_CANDLE_LIMIT,
+                60,
+            ),
+            stale_seconds: env_i64(
+                "PREDICTION_STALE_SECONDS",
+                DEFAULT_PREDICTION_STALE_SECONDS,
+                30,
+            ),
+            up_threshold: env_f64(
+                "PREDICTION_UP_THRESHOLD",
+                DEFAULT_PREDICTION_UP_THRESHOLD,
+                0.1,
+            ),
+            down_threshold: env_f64(
+                "PREDICTION_DOWN_THRESHOLD",
+                DEFAULT_PREDICTION_DOWN_THRESHOLD,
+                -100.0,
+            ),
+            min_confidence: env_f64(
+                "PREDICTION_MIN_CONFIDENCE",
+                DEFAULT_PREDICTION_MIN_CONFIDENCE,
+                0.0,
+            ),
+            market_data_base_url: env::var("MARKET_DATA_PRIMARY")
+                .unwrap_or_else(|_| DEFAULT_MARKET_DATA_PRIMARY.to_string())
+                .trim_end_matches('/')
+                .to_string(),
+            market_ws_url: env::var("MARKET_WS_URL")
+                .unwrap_or_else(|_| DEFAULT_MARKET_WS_URL.to_string()),
+            market_ws_reconnect_seconds: env_u64(
+                "MARKET_WS_RECONNECT_SECONDS",
+                DEFAULT_MARKET_WS_RECONNECT_SECONDS,
+                1,
+            ),
+            signal_cooldown_seconds: env_i64(
+                "PREDICTION_SIGNAL_COOLDOWN_SECONDS",
+                DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS,
+                0,
+            ),
+        }
+    }
+
+    fn with_settings(&self, settings: &PredictionSettings) -> Self {
+        let mut next = self.clone();
+        next.enabled = settings.enabled;
+        next.interval_seconds = settings.interval_seconds.max(1) as u64;
+        next.up_threshold = settings
+            .up_threshold
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.up_threshold);
+        next.down_threshold = settings
+            .down_threshold
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.down_threshold);
+        next.min_confidence = settings
+            .min_confidence
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.min_confidence);
+        next.signal_cooldown_seconds = self.signal_cooldown_seconds.max(0);
+        next
     }
 }
 
@@ -1045,6 +1583,7 @@ struct AuthRequest {
 struct AuthResponse {
     access_token: String,
     refresh_token: String,
+    app_session_key: String,
     expires_in: i64,
 }
 
@@ -1077,6 +1616,15 @@ struct WalletVerifyRequest {
 }
 
 #[derive(Deserialize)]
+struct ChangePasswordRequest {
+    chain: Option<String>,
+    address: String,
+    message: String,
+    signature: String,
+    new_password: String,
+}
+
+#[derive(Deserialize)]
 struct PageStateRequest {
     page_ready: bool,
     screen_name: String,
@@ -1085,6 +1633,7 @@ struct PageStateRequest {
     amount_field_found: bool,
     up_button_found: bool,
     down_button_found: bool,
+    observed_balance_usdt: Option<String>,
     observed_at: DateTime<Utc>,
 }
 
@@ -1247,6 +1796,9 @@ struct SignalApiResponse {
     reservation_id: Option<String>,
     fee_reserve_usdt: String,
     authorization_status: String,
+    account_match_status: String,
+    observed_balance_usdt: Option<String>,
+    account_balance_delta_usdt: Option<String>,
     balance_available_after_reserve: String,
     model_version: String,
 }
@@ -1269,6 +1821,35 @@ struct StatsResponse {
     hit_rate: String,
     uptime_seconds: i64,
     latest_signal: Option<SignalApiResponse>,
+    prediction: PredictionStatus,
+}
+
+#[derive(Serialize)]
+struct AppRuntimeSummary {
+    orders_total: usize,
+    wins: usize,
+    losses: usize,
+    win_rate: String,
+    pnl_usdt: String,
+    pending_settlements: usize,
+}
+
+#[derive(Serialize)]
+struct PredictionStatus {
+    enabled: bool,
+    mode: String,
+    status: String,
+    last_evaluated_at: Option<DateTime<Utc>>,
+    last_signal_at: Option<DateTime<Utc>>,
+    last_signal_age_seconds: Option<i64>,
+    last_direction: String,
+    last_score: Option<String>,
+    last_confidence: Option<String>,
+    market_source: Option<String>,
+    market_age_seconds: Option<i64>,
+    market_candles: usize,
+    message: String,
+    last_error: Option<String>,
 }
 
 async fn health() -> &'static str {
@@ -1280,6 +1861,7 @@ async fn register(
     Json(req): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     validate_auth_request(&req)?;
+    let client_type = client_type_from_auth(&req)?;
     let account = account_from_auth(&req)?;
     enforce_register_rate_limit(&state, &account).await?;
 
@@ -1312,7 +1894,8 @@ async fn register(
         wallet_address: account.clone(),
         password_hash: password_hash(&req.password)?,
         status: "active".to_string(),
-        active_device_fingerprint: Some(req.device_fingerprint.clone()),
+        active_device_fingerprint: active_device_for_client(client_type, &req.device_fingerprint),
+        session_version: 0,
         created_at: now,
         updated_at: now,
     };
@@ -1329,8 +1912,8 @@ async fn register(
         let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
         sqlx::query(
             r#"
-            insert into users (id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at)
-            values ($1, $2, $3, $4, $5, $6, $7)
+            insert into users (id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(user.id)
@@ -1338,6 +1921,7 @@ async fn register(
         .bind(&user.password_hash)
         .bind(&user.status)
         .bind(&user.active_device_fingerprint)
+        .bind(user.session_version)
         .bind(user.created_at)
         .bind(user.updated_at)
         .execute(&mut *tx)
@@ -1448,13 +2032,7 @@ async fn register(
     );
 
     Ok(Json(
-        create_session(
-            &state,
-            user_id,
-            &req.device_fingerprint,
-            client_type_from_auth(&req)?,
-        )
-        .await?,
+        create_session(&state, user_id, &req.device_fingerprint, client_type).await?,
     ))
 }
 
@@ -1463,6 +2041,7 @@ async fn login(
     Json(req): Json<AuthRequest>,
 ) -> Result<Json<AuthResponse>, AppError> {
     validate_auth_request(&req)?;
+    let client_type = client_type_from_auth(&req)?;
     let account = account_from_auth(&req)?;
     let user_id = if let Some(pool) = state.db.as_ref() {
         let user = db_user_by_wallet(pool, &account).await?.ok_or_else(|| {
@@ -1474,23 +2053,25 @@ async fn login(
                 "invalid credentials",
             ));
         }
-        if let Some(active) = &user.active_device_fingerprint {
-            if active != &req.device_fingerprint {
-                return Err(AppError::conflict(
-                    "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
-                    "this account already has an active device session",
-                ));
+        if client_type == ClientType::Android {
+            if let Some(active) = &user.active_device_fingerprint {
+                if active != &req.device_fingerprint {
+                    return Err(AppError::conflict(
+                        "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
+                        "this account already has an active device session",
+                    ));
+                }
             }
+            sqlx::query(
+                "update users set active_device_fingerprint = $2, updated_at = $3 where id = $1",
+            )
+            .bind(user.id)
+            .bind(&req.device_fingerprint)
+            .bind(Utc::now())
+            .execute(pool)
+            .await
+            .map_err(AppError::from_sqlx)?;
         }
-        sqlx::query(
-            "update users set active_device_fingerprint = $2, updated_at = $3 where id = $1",
-        )
-        .bind(user.id)
-        .bind(&req.device_fingerprint)
-        .bind(Utc::now())
-        .execute(pool)
-        .await
-        .map_err(AppError::from_sqlx)?;
         user.id
     } else {
         let user_id = state
@@ -1513,27 +2094,23 @@ async fn login(
                 "invalid credentials",
             ));
         }
-        if let Some(active) = &user.active_device_fingerprint {
-            if active != &req.device_fingerprint {
-                return Err(AppError::conflict(
-                    "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
-                    "this account already has an active device session",
-                ));
+        if client_type == ClientType::Android {
+            if let Some(active) = &user.active_device_fingerprint {
+                if active != &req.device_fingerprint {
+                    return Err(AppError::conflict(
+                        "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
+                        "this account already has an active device session",
+                    ));
+                }
             }
+            user.active_device_fingerprint = Some(req.device_fingerprint.clone());
+            user.updated_at = Utc::now();
         }
-        user.active_device_fingerprint = Some(req.device_fingerprint.clone());
-        user.updated_at = Utc::now();
         user_id
     };
 
     Ok(Json(
-        create_session(
-            &state,
-            user_id,
-            &req.device_fingerprint,
-            client_type_from_auth(&req)?,
-        )
-        .await?,
+        create_session(&state, user_id, &req.device_fingerprint, client_type).await?,
     ))
 }
 
@@ -1552,22 +2129,27 @@ async fn logout(
                 .execute(pool)
                 .await
                 .map_err(AppError::from_sqlx)?;
-            sqlx::query(
-                r#"
-                update users
-                set active_device_fingerprint = null, updated_at = $3
-                where id = $1 and active_device_fingerprint = $2
-                "#,
-            )
-            .bind(session.user_id)
-            .bind(&session.device_fingerprint)
-            .bind(now)
-            .execute(pool)
-            .await
-            .map_err(AppError::from_sqlx)?;
+            if session.client_type == ClientType::Android {
+                sqlx::query(
+                    r#"
+                    update users
+                    set active_device_fingerprint = null, updated_at = $3
+                    where id = $1 and active_device_fingerprint = $2
+                    "#,
+                )
+                .bind(session.user_id)
+                .bind(&session.device_fingerprint)
+                .bind(now)
+                .execute(pool)
+                .await
+                .map_err(AppError::from_sqlx)?;
+            }
         }
-        if let Some(user) = state.users.write().await.get_mut(&session.user_id) {
-            if user.active_device_fingerprint.as_deref() == Some(&session.device_fingerprint) {
+        if session.client_type == ClientType::Android {
+            if let Some(user) = state.users.write().await.get_mut(&session.user_id) {
+                if user.active_device_fingerprint.as_deref() != Some(&session.device_fingerprint) {
+                    return Ok(Json(json!({ "ok": true })));
+                }
                 user.active_device_fingerprint = None;
                 user.updated_at = Utc::now();
             }
@@ -1599,6 +2181,7 @@ async fn wallet_bind_message(
     state.wallet_nonces.write().await.insert(
         user_id,
         WalletBindChallenge {
+            purpose: WalletChallengePurpose::BindWallet,
             chain: chain.clone(),
             address: address.clone(),
             message: message.clone(),
@@ -1637,6 +2220,12 @@ async fn wallet_verify(
         .ok_or_else(|| {
             AppError::bad_request("WALLET_NONCE_MISSING", "request a bind message first")
         })?;
+    if challenge.purpose != WalletChallengePurpose::BindWallet {
+        return Err(AppError::bad_request(
+            "WALLET_CHALLENGE_PURPOSE_INVALID",
+            format!("expected {}", WalletChallengePurpose::BindWallet.label()),
+        ));
+    }
     if challenge.expires_at < Utc::now() {
         return Err(AppError::bad_request(
             "WALLET_NONCE_EXPIRED",
@@ -1666,6 +2255,121 @@ async fn wallet_verify(
         "chain": chain,
         "address": address,
         "verified": true
+    })))
+}
+
+async fn change_password_message(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<WalletBindMessageRequest>,
+) -> Result<Json<WalletBindMessageResponse>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    let chain = normalize_chain(req.chain.as_deref());
+    let address = normalize_wallet_address(&req.address)?;
+    let account_wallet = load_user_wallet_address(&state, user_id).await?;
+    if address != account_wallet {
+        return Err(AppError::forbidden(
+            "WALLET_ACCOUNT_MISMATCH",
+            "wallet address must match the logged-in account",
+        ));
+    }
+    let nonce = new_token("password-nonce");
+    let expires_at = Utc::now() + Duration::minutes(10);
+    let message = format!(
+        "Change password for BTCUSDT Event Signal Platform\nUser ID: {user_id}\nChain: {chain}\nAddress: {address}\nNonce: {nonce}"
+    );
+    state.wallet_nonces.write().await.insert(
+        user_id,
+        WalletBindChallenge {
+            purpose: WalletChallengePurpose::ChangePassword,
+            chain: chain.clone(),
+            address: address.clone(),
+            message: message.clone(),
+            expires_at,
+        },
+    );
+    Ok(Json(WalletBindMessageResponse {
+        message,
+        nonce,
+        address,
+        chain,
+        expires_at,
+    }))
+}
+
+async fn change_password(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ChangePasswordRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = require_dapp_user(&state, &headers).await?;
+    validate_password(&req.new_password)?;
+    let chain = normalize_chain(req.chain.as_deref());
+    let address = normalize_wallet_address(&req.address)?;
+    let account_wallet = load_user_wallet_address(&state, user_id).await?;
+    if address != account_wallet {
+        return Err(AppError::forbidden(
+            "WALLET_ACCOUNT_MISMATCH",
+            "wallet address must match the logged-in account",
+        ));
+    }
+    let challenge = state
+        .wallet_nonces
+        .write()
+        .await
+        .remove(&user_id)
+        .ok_or_else(|| {
+            AppError::bad_request("WALLET_NONCE_MISSING", "request a password message first")
+        })?;
+    if challenge.purpose != WalletChallengePurpose::ChangePassword {
+        return Err(AppError::bad_request(
+            "WALLET_CHALLENGE_PURPOSE_INVALID",
+            format!(
+                "expected {}",
+                WalletChallengePurpose::ChangePassword.label()
+            ),
+        ));
+    }
+    if challenge.expires_at < Utc::now() {
+        return Err(AppError::bad_request(
+            "WALLET_NONCE_EXPIRED",
+            "password change message expired",
+        ));
+    }
+    if challenge.chain != chain || challenge.address != address || challenge.message != req.message
+    {
+        return Err(AppError::bad_request(
+            "WALLET_MESSAGE_MISMATCH",
+            "password change message does not match current challenge",
+        ));
+    }
+    let recovered = recover_wallet_address(&req.message, &req.signature)?;
+    if recovered != address {
+        return Err(AppError::unauthorized(
+            "WALLET_SIGNATURE_INVALID",
+            "signature does not match wallet address",
+        ));
+    }
+
+    let password_hash = password_hash(&req.new_password)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_change_user_password(pool, user_id, &password_hash).await?;
+    }
+    if let Some(user) = state.users.write().await.get_mut(&user_id) {
+        user.password_hash = password_hash;
+        user.session_version += 1;
+        user.active_device_fingerprint = None;
+        user.updated_at = Utc::now();
+    }
+    state
+        .sessions
+        .write()
+        .await
+        .retain(|_, session| session.user_id != user_id);
+
+    Ok(Json(json!({
+        "ok": true,
+        "message": "password changed; please log in again"
     })))
 }
 
@@ -1700,6 +2404,12 @@ async fn refresh_token(
             }
         }
     };
+    if !session_device_is_current(&state, &session).await {
+        return Err(AppError::unauthorized(
+            "AUTH_SESSION_REVOKED",
+            "session is no longer active",
+        ));
+    }
     Ok(Json(
         create_session(
             &state,
@@ -1713,11 +2423,56 @@ async fn refresh_token(
 
 async fn stats(State(state): State<SharedState>) -> Json<StatsResponse> {
     if let Some(pool) = state.db.as_ref() {
-        if let Ok(stats) = db_build_stats(pool, state.started_at).await {
+        let prediction = state.prediction_runtime.read().await.clone();
+        if let Ok(stats) = db_build_stats(pool, state.started_at, prediction).await {
             return Json(stats);
         }
     }
     Json(build_stats(&state).await)
+}
+
+async fn app_runtime_summary(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<AppRuntimeSummary>, AppError> {
+    let user_id = require_android_user(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_app_runtime_summary(pool, user_id).await?));
+    }
+    let orders = state.orders.read().await;
+    let reports = state.reports.read().await;
+    let settlements = state.settlements.read().await;
+    let orders_total = orders
+        .iter()
+        .filter(|order| order.user_id == user_id)
+        .count();
+    let user_reports = reports
+        .iter()
+        .filter(|report| report.user_id == user_id)
+        .collect::<Vec<_>>();
+    let wins = user_reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("WIN"))
+        .count();
+    let losses = user_reports
+        .iter()
+        .filter(|report| report.result.eq_ignore_ascii_case("LOSS"))
+        .count();
+    let settled = wins + losses;
+    let pnl = settlements
+        .iter()
+        .filter(|settlement| settlement.user_id == user_id)
+        .fold(Decimal::ZERO, |acc, settlement| {
+            acc + settlement.gross_profit
+        });
+    Ok(Json(AppRuntimeSummary {
+        orders_total,
+        wins,
+        losses,
+        win_rate: hit_rate_string(wins, losses),
+        pnl_usdt: money(pnl),
+        pending_settlements: orders_total.saturating_sub(settled),
+    }))
 }
 
 async fn latest_signal(
@@ -1901,6 +2656,23 @@ async fn save_page_state(
 ) -> Result<Json<serde_json::Value>, AppError> {
     let user_id = require_android_user(&state, &headers).await?;
     let confidence = parse_decimal(&req.confidence, "confidence")?;
+    let observed_balance = req
+        .observed_balance_usdt
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(|value| parse_decimal(value, "observed_balance_usdt"))
+        .transpose()?;
+    let exchange_snapshot = load_exchange_balance_snapshot(&state, user_id).await?;
+    let account_match = match exchange_snapshot {
+        Some(snapshot) if balance_cache_fresh(snapshot.updated_at) => {
+            account_match_from_balances(observed_balance, Some(snapshot.available))
+        }
+        Some(_) => AccountMatch {
+            status: "exchange_balance_stale".to_string(),
+            delta: None,
+        },
+        None => account_match_from_balances(observed_balance, None),
+    };
     let page_state = AutomationPageState {
         page_ready: req.page_ready,
         screen_name: req.screen_name,
@@ -1909,6 +2681,9 @@ async fn save_page_state(
         amount_field_found: req.amount_field_found,
         up_button_found: req.up_button_found,
         down_button_found: req.down_button_found,
+        observed_balance_usdt: observed_balance,
+        account_match_status: account_match.status,
+        account_balance_delta_usdt: account_match.delta,
         observed_at: req.observed_at,
         updated_at: Utc::now(),
     };
@@ -2881,7 +3656,11 @@ fn default_exchange_status() -> ExchangeCredentialStatus {
         verification_status: "missing".to_string(),
         balance_available_usdt: None,
         balance_wallet_usdt: None,
+        account_match_status: None,
+        observed_balance_usdt: None,
+        account_balance_delta_usdt: None,
         balance_updated_at: None,
+        balance_cache_fresh: false,
         last_verified_at: None,
         last_error: None,
         updated_at: None,
@@ -2900,6 +3679,50 @@ fn env_i32(name: &str, default: i32, min: i32) -> i32 {
         .ok()
         .and_then(|value| value.trim().parse::<i32>().ok())
         .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn env_i64(name: &str, default: i64, min: i64) -> i64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<i64>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn env_u64(name: &str, default: u64, min: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn env_usize(name: &str, default: usize, min: usize) -> usize {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<usize>().ok())
+        .filter(|value| *value >= min)
+        .unwrap_or(default)
+}
+
+fn env_f64(name: &str, default: f64, min: f64) -> f64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.trim().parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= min)
+        .unwrap_or(default)
+}
+
+fn env_bool(name: &str, default: bool) -> bool {
+    env::var(name)
+        .ok()
+        .map(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
         .unwrap_or(default)
 }
 
@@ -3167,6 +3990,584 @@ async fn binance_account_access_with_bind(
     binance_account_snapshot(account)
 }
 
+fn start_market_data_feed(state: &SharedState) {
+    let config = PredictionConfig::from_env();
+    let state = state.clone();
+    tokio::spawn(async move {
+        let client = match reqwest::Client::builder()
+            .timeout(StdDuration::from_secs(6))
+            .build()
+        {
+            Ok(client) => client,
+            Err(err) => {
+                record_market_error(&state, err.to_string()).await;
+                return;
+            }
+        };
+        loop {
+            match preheat_market_data(&state, &client, &config).await {
+                Ok(()) => break,
+                Err(err) => {
+                    record_market_error(&state, err.message).await;
+                    tokio::time::sleep(StdDuration::from_secs(
+                        config.market_ws_reconnect_seconds.max(1),
+                    ))
+                    .await;
+                }
+            }
+        }
+        loop {
+            if let Err(err) = run_market_ws(&state, &config).await {
+                record_market_error(&state, err.message).await;
+            }
+            tokio::time::sleep(StdDuration::from_secs(
+                config.market_ws_reconnect_seconds.max(1),
+            ))
+            .await;
+        }
+    });
+}
+
+async fn preheat_market_data(
+    state: &SharedState,
+    client: &reqwest::Client,
+    config: &PredictionConfig,
+) -> Result<(), AppError> {
+    let candles = fetch_prediction_candles(client, config).await?;
+    let latest = candles.last().cloned();
+    let mut market = state.market_data.write().await;
+    for candle in candles {
+        market.candles.insert(candle.open_time_ms, candle);
+    }
+    trim_market_candles(&mut market, config.candle_limit * 2);
+    if let Some(latest) = latest {
+        market.latest_price = Some(latest.close);
+        market.latest_price_time_ms = Some(latest.close_time_ms);
+        market.latest_source = Some("preheat_index_kline_1m".to_string());
+    }
+    market.preheated_at = Some(Utc::now());
+    market.last_error = None;
+    Ok(())
+}
+
+async fn fetch_prediction_candles(
+    client: &reqwest::Client,
+    config: &PredictionConfig,
+) -> Result<Vec<MarketCandle>, AppError> {
+    let url = format!(
+        "{}/fapi/v1/indexPriceKlines?pair={}&interval=1m&limit={}",
+        config.market_data_base_url, DEFAULT_SYMBOL, config.candle_limit
+    );
+    let response = client
+        .get(url)
+        .send()
+        .await
+        .map_err(|err| AppError::bad_request("PREDICTION_DATA_FAILED", err.to_string()))?;
+    if !response.status().is_success() {
+        let status = response.status();
+        let text = response.text().await.unwrap_or_default();
+        return Err(AppError::bad_request(
+            "PREDICTION_DATA_FAILED",
+            format!("market data failed: {status} {text}"),
+        ));
+    }
+    let raw = response
+        .json::<Vec<serde_json::Value>>()
+        .await
+        .map_err(|err| AppError::bad_request("PREDICTION_DATA_INVALID", err.to_string()))?;
+    let now_ms = Utc::now().timestamp_millis();
+    let mut candles = Vec::with_capacity(raw.len());
+    for item in raw {
+        let Some(values) = item.as_array() else {
+            continue;
+        };
+        if values.len() < 7 {
+            continue;
+        }
+        let open_time_ms = json_i64(&values[0])?;
+        let close_time_ms = json_i64(&values[6])?;
+        if close_time_ms > now_ms - 500 {
+            continue;
+        }
+        candles.push(MarketCandle {
+            open_time_ms,
+            open: json_f64(&values[1])?,
+            high: json_f64(&values[2])?,
+            low: json_f64(&values[3])?,
+            close: json_f64(&values[4])?,
+            volume: json_f64(&values[5])?,
+            close_time_ms,
+        });
+    }
+    candles.sort_by_key(|candle| candle.open_time_ms);
+    candles.dedup_by_key(|candle| candle.open_time_ms);
+    if candles.len() < DEFAULT_MARKET_MIN_WARM_CANDLES.min(config.candle_limit) {
+        return Err(AppError::bad_request(
+            "PREDICTION_DATA_INSUFFICIENT",
+            "not enough candles",
+        ));
+    }
+    Ok(candles)
+}
+
+async fn run_market_ws(state: &SharedState, config: &PredictionConfig) -> Result<(), AppError> {
+    let (ws_stream, _) = connect_async(&config.market_ws_url)
+        .await
+        .map_err(|err| AppError::bad_request("MARKET_WS_CONNECT_FAILED", err.to_string()))?;
+    {
+        let mut market = state.market_data.write().await;
+        market.last_connected_at = Some(Utc::now());
+        market.last_error = None;
+    }
+    let (mut write, mut read) = ws_stream.split();
+    while let Some(message) = read.next().await {
+        let message = message
+            .map_err(|err| AppError::bad_request("MARKET_WS_READ_FAILED", err.to_string()))?;
+        if let TungsteniteMessage::Ping(payload) = message {
+            write
+                .send(TungsteniteMessage::Pong(payload))
+                .await
+                .map_err(|err| AppError::bad_request("MARKET_WS_WRITE_FAILED", err.to_string()))?;
+            continue;
+        }
+        if !message.is_text() {
+            continue;
+        }
+        let text = message
+            .to_text()
+            .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
+        apply_market_ws_message(state, config, text).await?;
+    }
+    Err(AppError::bad_request(
+        "MARKET_WS_CLOSED",
+        "market websocket closed",
+    ))
+}
+
+async fn apply_market_ws_message(
+    state: &SharedState,
+    config: &PredictionConfig,
+    text: &str,
+) -> Result<(), AppError> {
+    let combined: BinanceCombinedStreamMessage = serde_json::from_str(text)
+        .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
+    let stream = combined.stream.unwrap_or_default();
+    if stream.contains("@aggTrade") {
+        let trade: BinanceAggTradeStream = serde_json::from_value(combined.data)
+            .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
+        update_market_aux_price(state, trade.price, Some(trade.trade_time_ms), "aggTrade").await?;
+    } else if stream.contains("@markPrice") {
+        let mark: BinanceMarkPriceStream = serde_json::from_value(combined.data)
+            .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
+        update_market_index_price(
+            state,
+            mark.index_price,
+            Some(mark.mark_price),
+            mark.event_time_ms,
+        )
+        .await?;
+    } else if stream.contains("@kline_1m") {
+        let kline: BinanceKlineStream = serde_json::from_value(combined.data)
+            .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
+        let live_close = kline.kline.close.clone();
+        let live_time = kline.kline.close_time_ms;
+        if kline.kline.is_closed {
+            let candle = MarketCandle {
+                open_time_ms: kline.kline.open_time_ms,
+                close_time_ms: kline.kline.close_time_ms,
+                open: parse_market_f64(&kline.kline.open)?,
+                high: parse_market_f64(&kline.kline.high)?,
+                low: parse_market_f64(&kline.kline.low)?,
+                close: parse_market_f64(&kline.kline.close)?,
+                volume: parse_market_f64(&kline.kline.volume)?,
+            };
+            let mut market = state.market_data.write().await;
+            market.candles.insert(candle.open_time_ms, candle.clone());
+            market.latest_futures_kline_price = Some(candle.close);
+            market.last_message_at = Some(Utc::now());
+            market.last_error = None;
+            trim_market_candles(&mut market, config.candle_limit * 2);
+        } else {
+            update_market_aux_price(state, live_close, Some(live_time), "kline_1m_live").await?;
+        }
+    }
+    Ok(())
+}
+
+async fn update_market_index_price(
+    state: &SharedState,
+    index_price: String,
+    mark_price: Option<String>,
+    event_time_ms: i64,
+) -> Result<(), AppError> {
+    let price = parse_market_f64(&index_price)?;
+    let mut market = state.market_data.write().await;
+    market.latest_price = Some(price);
+    market.latest_price_time_ms = Some(event_time_ms);
+    market.latest_source = Some("indexPrice".to_string());
+    if let Some(mark_price) = mark_price {
+        market.latest_mark_price = Some(parse_market_f64(&mark_price)?);
+    }
+    market.last_message_at = Some(Utc::now());
+    market.last_error = None;
+    Ok(())
+}
+
+async fn update_market_aux_price(
+    state: &SharedState,
+    price: String,
+    event_time_ms: Option<i64>,
+    source: &str,
+) -> Result<(), AppError> {
+    let price = parse_market_f64(&price)?;
+    let mut market = state.market_data.write().await;
+    match source {
+        "aggTrade" => market.latest_trade_price = Some(price),
+        "kline_1m_live" => market.latest_futures_kline_price = Some(price),
+        _ => {}
+    }
+    if market.latest_price.is_none() {
+        market.latest_price = Some(price);
+        market.latest_price_time_ms = event_time_ms;
+        market.latest_source = Some(source.to_string());
+    }
+    market.last_message_at = Some(Utc::now());
+    market.last_error = None;
+    Ok(())
+}
+
+async fn record_market_error(state: &SharedState, message: String) {
+    let mut market = state.market_data.write().await;
+    market.last_error = Some(message.chars().take(500).collect());
+}
+
+fn trim_market_candles(market: &mut MarketDataState, max_len: usize) {
+    while market.candles.len() > max_len.max(DEFAULT_PREDICTION_CANDLE_LIMIT) {
+        let Some(first) = market.candles.keys().next().copied() else {
+            break;
+        };
+        market.candles.remove(&first);
+    }
+}
+
+fn parse_market_f64(value: &str) -> Result<f64, AppError> {
+    value
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| AppError::bad_request("PREDICTION_DATA_INVALID", "invalid market price"))
+}
+
+async fn evaluate_prediction(
+    state: &SharedState,
+    config: &PredictionConfig,
+) -> Result<PredictionDecision, AppError> {
+    let snapshot = {
+        let market = state.market_data.read().await;
+        if let Some(error) = &market.last_error {
+            return Err(AppError::bad_request(
+                "PREDICTION_MARKET_FEED_ERROR",
+                error.clone(),
+            ));
+        }
+        market.snapshot(config.candle_limit)
+    }
+    .ok_or_else(|| {
+        AppError::bad_request("PREDICTION_DATA_INSUFFICIENT", "market feed warming up")
+    })?;
+    build_prediction_decision(&snapshot, config)
+}
+
+fn build_prediction_decision(
+    snapshot: &MarketDataSnapshot,
+    config: &PredictionConfig,
+) -> Result<PredictionDecision, AppError> {
+    let candles = &snapshot.candles;
+    let latest = candles
+        .last()
+        .ok_or_else(|| AppError::bad_request("PREDICTION_DATA_INSUFFICIENT", "missing candle"))?;
+    if candles.len() < DEFAULT_MARKET_MIN_WARM_CANDLES.min(config.candle_limit) {
+        return Err(AppError::bad_request(
+            "PREDICTION_DATA_INSUFFICIENT",
+            "not enough warm candles",
+        ));
+    }
+    let closes = candles
+        .iter()
+        .map(|candle| candle.close)
+        .collect::<Vec<_>>();
+    let volumes = candles
+        .iter()
+        .map(|candle| candle.volume)
+        .collect::<Vec<_>>();
+    let ret_1 = return_n(&closes, 1);
+    let ret_3 = return_n(&closes, 3);
+    let ret_5 = return_n(&closes, 5);
+    let ret_10 = return_n(&closes, 10);
+    let ret_30 = return_n(&closes, 30);
+    let ema5 = ema_last(&closes, 5);
+    let ema10 = ema_last(&closes, 10);
+    let ema20 = ema_last(&closes, 20);
+    let ema5_prev = ema_last(&closes[..closes.len() - 1], 5);
+    let ema10_prev = ema_last(&closes[..closes.len() - 1], 10);
+    let (boll_pos, boll_width) = bollinger_position_width(&closes, 20);
+    let volume_z = z_score_last(&volumes, 30);
+    let volatility = realized_volatility(&closes, 30);
+    let body_ratio = candle_body_ratio(latest);
+    let price_time = millis_to_utc(snapshot.latest_price_time_ms)?;
+    let age_seconds = (Utc::now() - price_time).num_seconds();
+
+    let live_ret_1 = ratio_delta(snapshot.latest_price, latest.close);
+    let live_ret_3 = if closes.len() > 2 {
+        ratio_delta(snapshot.latest_price, closes[closes.len() - 3])
+    } else {
+        0.0
+    };
+    let momentum_score = live_ret_1 * 1450.0
+        + live_ret_3 * 900.0
+        + ret_1 * 950.0
+        + ret_3 * 700.0
+        + ret_5 * 520.0
+        + ret_10 * 320.0
+        + ret_30 * 120.0;
+    let trend_score = ratio_delta(ema5, ema5_prev) * 1200.0
+        + ratio_delta(ema10, ema10_prev) * 900.0
+        + ratio_delta(ema5, ema20) * 220.0
+        + if ema5 > ema10 && ema10 > ema20 {
+            0.45
+        } else if ema5 < ema10 && ema10 < ema20 {
+            -0.45
+        } else {
+            0.0
+        };
+    let volume_score = clamp(volume_z, -2.5, 2.5) * sign(ret_1 + ret_3) * 0.28;
+    let mean_reversion_score = if boll_pos > 0.92 {
+        -0.42
+    } else if boll_pos < 0.08 {
+        0.42
+    } else {
+        0.0
+    };
+    let candle_score = body_ratio * sign(latest.close - latest.open) * 0.22;
+    let live_score = ratio_delta(snapshot.latest_price, ema5) * 260.0;
+    let mark_index_basis = snapshot
+        .latest_mark_price
+        .map(|price| ratio_delta(price, snapshot.latest_price))
+        .unwrap_or(0.0);
+    let trade_index_basis = snapshot
+        .latest_trade_price
+        .map(|price| ratio_delta(price, snapshot.latest_price))
+        .unwrap_or(0.0);
+    let futures_kline_index_basis = snapshot
+        .latest_futures_kline_price
+        .map(|price| ratio_delta(price, snapshot.latest_price))
+        .unwrap_or(0.0);
+    let basis_score = clamp(
+        mark_index_basis * 800.0 + trade_index_basis * 500.0,
+        -0.8,
+        0.8,
+    );
+    let score = momentum_score
+        + trend_score
+        + volume_score
+        + mean_reversion_score
+        + candle_score
+        + live_score
+        + basis_score;
+    let confidence = clamp(1.0 / (1.0 + (-score.abs() / 2.8).exp()), 0.0, 0.99);
+    let predicted_return = clamp(score / 10_000.0, -0.003, 0.003);
+    let mut direction = if score >= config.up_threshold {
+        "UP".to_string()
+    } else if score <= config.down_threshold {
+        "DOWN".to_string()
+    } else {
+        "HOLD".to_string()
+    };
+    let mut reason = format!("score {score:.4} confidence {confidence:.4}");
+    if age_seconds > config.stale_seconds {
+        direction = "HOLD".to_string();
+        reason = format!("hold stale data age {age_seconds}s");
+    } else if confidence < config.min_confidence {
+        direction = "HOLD".to_string();
+        reason = format!("hold low confidence {confidence:.4}");
+    } else if volatility < 0.00012 {
+        direction = "HOLD".to_string();
+        reason = format!("hold low volatility {volatility:.6}");
+    } else if mark_index_basis.abs() > 0.0008 || trade_index_basis.abs() > 0.0012 {
+        direction = "HOLD".to_string();
+        reason = format!(
+            "hold basis abnormal mark_index {mark_index_basis:.6} trade_index {trade_index_basis:.6}"
+        );
+    }
+    let cycle_start = millis_to_utc(snapshot.latest_price_time_ms)?;
+    Ok(PredictionDecision {
+        direction,
+        confidence,
+        predicted_return,
+        entry_price: snapshot.latest_price,
+        score,
+        cycle_start,
+        cycle_end: cycle_start + Duration::seconds(DEFAULT_PERIOD_SECONDS as i64),
+        signal_cooldown_seconds: config.signal_cooldown_seconds,
+        market_source: snapshot.latest_source.clone(),
+        market_age_seconds: age_seconds,
+        market_candles: candles.len(),
+        reason,
+        feature_snapshot: json!({
+            "market_source": snapshot.latest_source,
+            "latest_mark_price": snapshot.latest_mark_price,
+            "latest_trade_price": snapshot.latest_trade_price,
+            "latest_futures_kline_price": snapshot.latest_futures_kline_price,
+            "last_message_at": snapshot.last_message_at,
+            "latest_price_time_ms": snapshot.latest_price_time_ms,
+            "latest_candle_close_time_ms": latest.close_time_ms,
+            "mark_index_basis": mark_index_basis,
+            "trade_index_basis": trade_index_basis,
+            "futures_kline_index_basis": futures_kline_index_basis,
+            "basis_score": basis_score,
+            "live_ret_1": live_ret_1,
+            "live_ret_3": live_ret_3,
+            "ret_1": ret_1,
+            "ret_3": ret_3,
+            "ret_5": ret_5,
+            "ret_10": ret_10,
+            "ret_30": ret_30,
+            "boll_pos": boll_pos,
+            "boll_width": boll_width,
+            "volume_z": volume_z,
+            "volatility": volatility,
+            "body_ratio": body_ratio,
+            "age_seconds": age_seconds
+        }),
+    })
+}
+
+fn json_i64(value: &serde_json::Value) -> Result<i64, AppError> {
+    value
+        .as_i64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<i64>().ok()))
+        .ok_or_else(|| AppError::bad_request("PREDICTION_DATA_INVALID", "invalid int"))
+}
+
+fn json_f64(value: &serde_json::Value) -> Result<f64, AppError> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|value| value.parse::<f64>().ok()))
+        .filter(|value| value.is_finite())
+        .ok_or_else(|| AppError::bad_request("PREDICTION_DATA_INVALID", "invalid number"))
+}
+
+fn millis_to_utc(value: i64) -> Result<DateTime<Utc>, AppError> {
+    Utc.timestamp_millis_opt(value)
+        .single()
+        .ok_or_else(|| AppError::bad_request("PREDICTION_DATA_INVALID", "invalid timestamp"))
+}
+
+fn return_n(values: &[f64], n: usize) -> f64 {
+    if values.len() <= n {
+        0.0
+    } else {
+        ratio_delta(values[values.len() - 1], values[values.len() - 1 - n])
+    }
+}
+
+fn ratio_delta(current: f64, previous: f64) -> f64 {
+    if previous.abs() < f64::EPSILON {
+        0.0
+    } else {
+        current / previous - 1.0
+    }
+}
+
+fn ema_last(values: &[f64], period: usize) -> f64 {
+    let alpha = 2.0 / (period as f64 + 1.0);
+    values
+        .iter()
+        .copied()
+        .fold(values[0], |ema, value| alpha * value + (1.0 - alpha) * ema)
+}
+
+fn bollinger_position_width(values: &[f64], period: usize) -> (f64, f64) {
+    let window = &values[values.len() - period..];
+    let mean = average(window);
+    let stdev = stddev(window, mean);
+    let upper = mean + 2.0 * stdev;
+    let lower = mean - 2.0 * stdev;
+    let width = if mean.abs() < f64::EPSILON {
+        0.0
+    } else {
+        (upper - lower) / mean
+    };
+    let position = if (upper - lower).abs() < f64::EPSILON {
+        0.5
+    } else {
+        clamp(
+            (values[values.len() - 1] - lower) / (upper - lower),
+            0.0,
+            1.0,
+        )
+    };
+    (position, width)
+}
+
+fn realized_volatility(values: &[f64], period: usize) -> f64 {
+    let returns = values[values.len() - period - 1..]
+        .windows(2)
+        .map(|pair| ratio_delta(pair[1], pair[0]))
+        .collect::<Vec<_>>();
+    stddev(&returns, average(&returns))
+}
+
+fn z_score_last(values: &[f64], period: usize) -> f64 {
+    let window = &values[values.len() - period..];
+    let mean = average(window);
+    let stdev = stddev(window, mean);
+    if stdev <= f64::EPSILON {
+        0.0
+    } else {
+        (window[window.len() - 1] - mean) / stdev
+    }
+}
+
+fn candle_body_ratio(candle: &MarketCandle) -> f64 {
+    let range = candle.high - candle.low;
+    if range <= f64::EPSILON {
+        0.0
+    } else {
+        clamp((candle.close - candle.open).abs() / range, 0.0, 1.0)
+    }
+}
+
+fn average(values: &[f64]) -> f64 {
+    values.iter().sum::<f64>() / values.len() as f64
+}
+
+fn stddev(values: &[f64], mean: f64) -> f64 {
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+fn clamp(value: f64, min: f64, max: f64) -> f64 {
+    value.max(min).min(max)
+}
+
+fn sign(value: f64) -> f64 {
+    if value > 0.0 {
+        1.0
+    } else if value < 0.0 {
+        -1.0
+    } else {
+        0.0
+    }
+}
+
 async fn binance_income_events_with_client(
     api_key: &str,
     api_secret: &str,
@@ -3416,10 +4817,12 @@ async fn ws_handler(
             "only android sessions can connect to signal websocket",
         ));
     }
-    Ok(ws.on_upgrade(move |socket| websocket_loop(socket, state, session.user_id)))
+    verify_app_request_signature(&state, &headers, &session).await?;
+    Ok(ws.on_upgrade(move |socket| websocket_loop(socket, state, session)))
 }
 
-async fn websocket_loop(mut socket: WebSocket, state: SharedState, user_id: Uuid) {
+async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: SessionRecord) {
+    let user_id = session.user_id;
     let mut rx = state.signal_tx.subscribe();
     let ws_connection_id = Uuid::now_v7();
     let _ = socket
@@ -3435,6 +4838,19 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, user_id: Uuid
         ))
         .await;
     while let Ok(signal) = rx.recv().await {
+        if !session_device_is_current(&state, &session).await {
+            let _ = socket
+                .send(Message::Text(
+                    json!({
+                        "type": "connection.closed",
+                        "code": "AUTH_SESSION_REVOKED",
+                        "message": "账号会话已失效，请重新登录"
+                    })
+                    .to_string(),
+                ))
+                .await;
+            break;
+        }
         let payload = authorize_signal_for_user(&state, user_id, &signal).await;
         let delivery_id = Uuid::now_v7();
         let sent_at = Utc::now();
@@ -3501,7 +4917,8 @@ async fn admin_overview(
 ) -> Result<Json<serde_json::Value>, AppError> {
     ensure_admin(&state, &headers).await?;
     if let Some(pool) = state.db.as_ref() {
-        let overview = db_admin_overview(pool, state.started_at).await?;
+        let prediction = state.prediction_runtime.read().await.clone();
+        let overview = db_admin_overview(pool, state.started_at, prediction).await?;
         return Ok(Json(overview));
     }
     let stats = build_stats(&state).await;
@@ -3548,11 +4965,49 @@ async fn admin_emit_signal(
     };
     let signal = SignalCore::new(direction, stake, confidence);
     if let Some(pool) = state.db.as_ref() {
-        db_insert_signal(pool, &signal).await?;
+        if !db_insert_signal(pool, &signal).await? {
+            return Err(AppError::conflict(
+                "SIGNAL_CYCLE_EXISTS",
+                "signal already exists for this cycle",
+            ));
+        }
     }
     state.signals.write().await.push(signal.clone());
     let _ = state.signal_tx.send(signal.clone());
     Ok(Json(signal_api_response(&signal)))
+}
+
+async fn admin_prediction_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<PredictionSettings>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    Ok(Json(load_prediction_settings(&state).await))
+}
+
+async fn admin_save_prediction_settings(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<PredictionSettings>,
+) -> Result<Json<PredictionSettings>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    validate_prediction_settings(&req)?;
+    if let Some(pool) = state.db.as_ref() {
+        db_save_prediction_settings(pool, &req).await?;
+        return Ok(Json(db_load_prediction_settings(pool).await?));
+    }
+    Ok(Json(req))
+}
+
+async fn admin_prediction_observations(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+) -> Result<Json<Vec<PredictionObservationRecord>>, AppError> {
+    ensure_admin(&state, &headers).await?;
+    if let Some(pool) = state.db.as_ref() {
+        return Ok(Json(db_prediction_observations(pool, 200).await?));
+    }
+    Ok(Json(Vec::new()))
 }
 
 async fn admin_signals(
@@ -3818,39 +5273,65 @@ async fn create_session(
 ) -> Result<AuthResponse, AppError> {
     let access_token = new_token("access");
     let refresh_token = new_token("refresh");
+    let app_session_key = new_token("app-key");
     let expires_in = 3600;
     let expires_at = Utc::now() + Duration::seconds(expires_in);
     if let Some(pool) = state.db.as_ref() {
+        let session_version = db_user_session_version(pool, user_id).await?;
         sqlx::query(
             r#"
             insert into auth_sessions
-              (access_token, user_id, device_fingerprint, refresh_token, client_type, expires_at)
-            values ($1, $2, $3, $4, $5, $6)
+              (access_token, user_id, device_fingerprint, refresh_token, app_session_key, client_type, session_version, expires_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8)
             "#,
         )
         .bind(&access_token)
         .bind(user_id)
         .bind(device)
         .bind(&refresh_token)
+        .bind(&app_session_key)
         .bind(client_type.as_str())
+        .bind(session_version)
         .bind(expires_at)
         .execute(pool)
         .await
         .map_err(AppError::from_sqlx)?;
+        state.sessions.write().await.insert(
+            access_token.clone(),
+            SessionRecord {
+                user_id,
+                device_fingerprint: device.to_string(),
+                refresh_token: refresh_token.clone(),
+                app_session_key: app_session_key.clone(),
+                client_type,
+                session_version,
+                expires_at,
+            },
+        );
+        return Ok(AuthResponse {
+            access_token,
+            refresh_token,
+            app_session_key,
+            expires_in,
+        });
     }
+    let session_version = load_user_session_version(state, user_id).await?;
     state.sessions.write().await.insert(
         access_token.clone(),
         SessionRecord {
             user_id,
             device_fingerprint: device.to_string(),
             refresh_token: refresh_token.clone(),
+            app_session_key: app_session_key.clone(),
             client_type,
+            session_version,
             expires_at,
         },
     );
     Ok(AuthResponse {
         access_token,
         refresh_token,
+        app_session_key,
         expires_in,
     })
 }
@@ -3956,7 +5437,15 @@ async fn require_dapp_user(state: &SharedState, headers: &HeaderMap) -> Result<U
 }
 
 async fn require_android_user(state: &SharedState, headers: &HeaderMap) -> Result<Uuid, AppError> {
-    require_client(state, headers, &[ClientType::Android]).await
+    let session = current_session(state, headers).await?;
+    if session.client_type != ClientType::Android {
+        return Err(AppError::forbidden(
+            "CLIENT_TYPE_FORBIDDEN",
+            "token is not allowed to call this endpoint",
+        ));
+    }
+    verify_app_request_signature(state, headers, &session).await?;
+    Ok(session.user_id)
 }
 
 async fn authenticate_token(state: &SharedState, token: &str) -> Result<SessionRecord, AppError> {
@@ -3981,7 +5470,54 @@ async fn authenticate_token(state: &SharedState, token: &str) -> Result<SessionR
             "token expired",
         ));
     }
+    if !session_device_is_current(state, &session).await {
+        return Err(AppError::unauthorized(
+            "AUTH_SESSION_REVOKED",
+            "session is no longer active",
+        ));
+    }
     Ok(session)
+}
+
+async fn session_device_is_current(state: &SharedState, session: &SessionRecord) -> bool {
+    if let Some(pool) = state.db.as_ref() {
+        let Some(user) = db_user_by_id(pool, session.user_id).await.ok().flatten() else {
+            return false;
+        };
+        if user.session_version != session.session_version {
+            return false;
+        }
+        if session.client_type == ClientType::Android {
+            return user.active_device_fingerprint.as_deref()
+                == Some(session.device_fingerprint.as_str());
+        }
+        return true;
+    }
+    let users = state.users.read().await;
+    let Some(user) = users.get(&session.user_id) else {
+        return false;
+    };
+    if user.session_version != session.session_version {
+        return false;
+    }
+    if session.client_type == ClientType::Android {
+        return user.active_device_fingerprint.as_deref()
+            == Some(session.device_fingerprint.as_str());
+    }
+    true
+}
+
+async fn load_user_session_version(state: &SharedState, user_id: Uuid) -> Result<i32, AppError> {
+    if let Some(user) = state.users.read().await.get(&user_id) {
+        return Ok(user.session_version);
+    }
+    if let Some(pool) = state.db.as_ref() {
+        return db_user_session_version(pool, user_id).await;
+    }
+    Err(AppError::unauthorized(
+        "AUTH_INVALID_USER",
+        "user account not found",
+    ))
 }
 
 fn bearer_token(headers: &HeaderMap) -> Option<String> {
@@ -3992,6 +5528,78 @@ fn bearer_token(headers: &HeaderMap) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+async fn verify_app_request_signature(
+    state: &SharedState,
+    headers: &HeaderMap,
+    session: &SessionRecord,
+) -> Result<(), AppError> {
+    let timestamp = header_str(headers, "x-es-timestamp")?;
+    let nonce = header_str(headers, "x-es-nonce")?;
+    let signature = header_str(headers, "x-es-signature")?;
+    let ts = timestamp.parse::<i64>().map_err(|_| {
+        AppError::unauthorized("APP_SIGNATURE_INVALID", "invalid app request signature")
+    })?;
+    let now_ms = Utc::now().timestamp_millis();
+    if (now_ms - ts).abs() > 60_000 {
+        return Err(AppError::unauthorized(
+            "APP_SIGNATURE_EXPIRED",
+            "app request signature expired",
+        ));
+    }
+    if nonce.len() < 16 || nonce.len() > 96 {
+        return Err(AppError::unauthorized(
+            "APP_SIGNATURE_INVALID",
+            "invalid app request signature",
+        ));
+    }
+    let payload = format!("android:{timestamp}:{nonce}");
+    let expected = hmac_sha256_hex(session.app_session_key.as_bytes(), payload.as_bytes());
+    if !constant_time_eq(expected.as_bytes(), signature.as_bytes()) {
+        return Err(AppError::unauthorized(
+            "APP_SIGNATURE_INVALID",
+            "invalid app request signature",
+        ));
+    }
+    let nonce_key = format!("{}:{nonce}", session.user_id);
+    let mut nonces = state.app_signature_nonces.write().await;
+    nonces.retain(|_, expires_at| *expires_at > Utc::now());
+    if nonces.contains_key(&nonce_key) {
+        return Err(AppError::unauthorized(
+            "APP_SIGNATURE_REPLAYED",
+            "app request signature already used",
+        ));
+    }
+    nonces.insert(nonce_key, Utc::now() + Duration::seconds(60));
+    Ok(())
+}
+
+fn header_str<'a>(headers: &'a HeaderMap, name: &str) -> Result<&'a str, AppError> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            AppError::unauthorized("APP_SIGNATURE_MISSING", "missing app request signature")
+        })
+}
+
+fn hmac_sha256_hex(key: &[u8], payload: &[u8]) -> String {
+    let mut mac = <HmacSha256 as Mac>::new_from_slice(key).expect("hmac accepts any key length");
+    mac.update(payload);
+    hex::encode(mac.finalize().into_bytes())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+        == 0
 }
 
 async fn ensure_admin(
@@ -4033,12 +5641,7 @@ async fn ensure_admin(
 fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
     let account = account_from_auth(req)?;
     normalize_wallet_address(&account)?;
-    if req.password.len() < 6 {
-        return Err(AppError::bad_request(
-            "AUTH_PASSWORD_WEAK",
-            "password must be at least 6 characters",
-        ));
-    }
+    validate_password(&req.password)?;
     if req.device_fingerprint.trim().len() < 8 {
         return Err(AppError::bad_request(
             "AUTH_DEVICE_INVALID",
@@ -4047,6 +5650,16 @@ fn validate_auth_request(req: &AuthRequest) -> Result<(), AppError> {
     }
     if let Some(code) = req.referral_code.as_deref() {
         normalize_referral_code(code)?;
+    }
+    Ok(())
+}
+
+fn validate_password(password: &str) -> Result<(), AppError> {
+    if password.len() < 6 {
+        return Err(AppError::bad_request(
+            "AUTH_PASSWORD_WEAK",
+            "password must be at least 6 characters",
+        ));
     }
     Ok(())
 }
@@ -4112,6 +5725,34 @@ fn validate_platform_trading_settings(settings: &PlatformTradingSettings) -> Res
         return Err(AppError::bad_request(
             "PLATFORM_SETTING_OUT_OF_RANGE",
             "min_stake_usdt cannot exceed max_single_stake_usdt",
+        ));
+    }
+    Ok(())
+}
+
+fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), AppError> {
+    if settings.interval_seconds < 1 || settings.interval_seconds > 60 {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "interval_seconds must be between 1 and 60",
+        ));
+    }
+    if settings.up_threshold <= Decimal::ZERO {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "up_threshold must be positive",
+        ));
+    }
+    if settings.down_threshold >= Decimal::ZERO {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "down_threshold must be negative",
+        ));
+    }
+    if settings.min_confidence < Decimal::ZERO || settings.min_confidence > dec!(0.99) {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "min_confidence must be between 0 and 0.99",
         ));
     }
     Ok(())
@@ -4185,6 +5826,15 @@ async fn load_platform_settings(state: &SharedState) -> PlatformTradingSettings 
     PlatformTradingSettings::default()
 }
 
+async fn load_prediction_settings(state: &SharedState) -> PredictionSettings {
+    if let Some(pool) = state.db.as_ref() {
+        if let Ok(settings) = db_load_prediction_settings(pool).await {
+            return settings;
+        }
+    }
+    PredictionSettings::default()
+}
+
 async fn load_balance(state: &SharedState, user_id: Uuid) -> BalanceRecord {
     if let Some(pool) = state.db.as_ref() {
         if let Ok(Some(balance)) = db_load_balance(pool, user_id).await {
@@ -4214,6 +5864,53 @@ async fn load_exchange_available_balance(
         return Ok(None);
     };
     db_exchange_available_balance(pool, user_id).await
+}
+
+async fn load_exchange_balance_snapshot(
+    state: &SharedState,
+    user_id: Uuid,
+) -> Result<Option<ExchangeBalanceSnapshot>, AppError> {
+    let Some(pool) = state.db.as_ref() else {
+        return Ok(None);
+    };
+    db_exchange_balance_snapshot(pool, user_id).await
+}
+
+fn balance_cache_fresh(updated_at: Option<DateTime<Utc>>) -> bool {
+    updated_at
+        .map(|value| Utc::now() - value <= Duration::seconds(ACCOUNT_BALANCE_CACHE_TTL_SECONDS))
+        .unwrap_or(false)
+}
+
+fn account_match_from_balances(
+    observed_balance: Option<Decimal>,
+    exchange_available: Option<Decimal>,
+) -> AccountMatch {
+    match (observed_balance, exchange_available) {
+        (Some(observed), Some(exchange)) => {
+            let delta = (observed - exchange).abs();
+            AccountMatch {
+                status: if delta <= ACCOUNT_BALANCE_TOLERANCE_USDT {
+                    "matched".to_string()
+                } else {
+                    "mismatch".to_string()
+                },
+                delta: Some(delta),
+            }
+        }
+        (None, Some(_)) => AccountMatch {
+            status: "observed_balance_missing".to_string(),
+            delta: None,
+        },
+        (Some(_), None) => AccountMatch {
+            status: "exchange_balance_missing".to_string(),
+            delta: None,
+        },
+        (None, None) => AccountMatch {
+            status: "unknown".to_string(),
+            delta: None,
+        },
+    }
 }
 
 async fn display_signal_for_user(
@@ -4248,6 +5945,9 @@ async fn display_signal_for_user(
         reservation_id: None,
         fee_reserve_usdt: money(Decimal::ZERO),
         authorization_status: "not_reserved".to_string(),
+        account_match_status: "not_checked".to_string(),
+        observed_balance_usdt: None,
+        account_balance_delta_usdt: None,
         balance_available_after_reserve: money(balance.available),
         model_version: signal.model_version.clone(),
     }
@@ -4261,7 +5961,7 @@ async fn authorize_signal_for_user(
     let trading = load_trading_settings(state, user_id).await;
     let automation = load_automation_settings(state, user_id).await;
     let balance = load_balance(state, user_id).await;
-    let exchange_available = match load_exchange_available_balance(state, user_id).await {
+    let exchange_snapshot = match load_exchange_balance_snapshot(state, user_id).await {
         Ok(value) => value,
         Err(err) => {
             return signal_response_with_status(
@@ -4274,14 +5974,26 @@ async fn authorize_signal_for_user(
             )
         }
     };
+    let exchange_available = exchange_snapshot
+        .as_ref()
+        .map(|snapshot| snapshot.available);
     let stake_base = exchange_available.unwrap_or(Decimal::ZERO);
     let stake = calculated_stake(stake_base, &trading, None);
     let expected_profit = stake * DEFAULT_PAYOUT_RATIO;
     let fee_reserve = expected_profit * PROFIT_SHARE_RATE;
 
     let mut status = "reserved".to_string();
-    if exchange_available.is_none() {
+    if exchange_snapshot.is_none() {
         status = "exchange_balance_missing".to_string();
+    }
+    if status == "reserved"
+        && !balance_cache_fresh(
+            exchange_snapshot
+                .as_ref()
+                .and_then(|snapshot| snapshot.updated_at),
+        )
+    {
+        status = "exchange_balance_stale".to_string();
     }
     if status == "reserved" && stake_base < MIN_EVENT_STAKE {
         status = "exchange_balance_insufficient".to_string();
@@ -4300,12 +6012,22 @@ async fn authorize_signal_for_user(
         Some(page) => Some(page),
         None => state.page_states.read().await.get(&user_id).cloned(),
     };
+    let mut account_match = AccountMatch {
+        status: "unknown".to_string(),
+        delta: None,
+    };
     if status == "reserved" {
-        match page {
+        match page.as_ref() {
             None => status = "page_state_missing".to_string(),
             Some(page) if !page_is_fresh(&page) => status = "page_state_stale".to_string(),
             Some(page) if !page_is_fresh_and_ready(&page) => status = "page_not_ready".to_string(),
-            Some(_) => {}
+            Some(page) => {
+                account_match =
+                    account_match_from_balances(page.observed_balance_usdt, exchange_available);
+                if account_match.status != "matched" {
+                    status = account_match.status.clone();
+                }
+            }
         }
     }
     if status == "reserved" && balance.available < fee_reserve {
@@ -4409,6 +6131,12 @@ async fn authorize_signal_for_user(
         reservation_id: reservation_id.map(|id| id.to_string()),
         fee_reserve_usdt: money(fee_reserve),
         authorization_status: status,
+        account_match_status: account_match.status,
+        observed_balance_usdt: page
+            .as_ref()
+            .and_then(|page| page.observed_balance_usdt)
+            .map(money),
+        account_balance_delta_usdt: account_match.delta.map(money),
         balance_available_after_reserve: money(balance_after),
         model_version: signal.model_version.clone(),
     }
@@ -4433,6 +6161,9 @@ fn signal_api_response(signal: &SignalCore) -> SignalApiResponse {
         reservation_id: None,
         fee_reserve_usdt: money(signal.suggested_stake * DEFAULT_PAYOUT_RATIO * PROFIT_SHARE_RATE),
         authorization_status: "admin_preview".to_string(),
+        account_match_status: "not_checked".to_string(),
+        observed_balance_usdt: None,
+        account_balance_delta_usdt: None,
         balance_available_after_reserve: money(Decimal::ZERO),
         model_version: signal.model_version.clone(),
     }
@@ -4466,6 +6197,9 @@ fn signal_response_with_status(
         reservation_id: None,
         fee_reserve_usdt: money(fee_reserve),
         authorization_status: status.to_string(),
+        account_match_status: "not_checked".to_string(),
+        observed_balance_usdt: None,
+        account_balance_delta_usdt: None,
         balance_available_after_reserve: money(balance_after),
         model_version: signal.model_version.clone(),
     }
@@ -4990,12 +6724,27 @@ async fn db_user_by_wallet(
 ) -> Result<Option<UserRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at
+        select id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at
         from users
         where wallet_address = $1
         "#,
     )
     .bind(wallet_address)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(user_from_row))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_user_by_id(pool: &PgPool, user_id: Uuid) -> Result<Option<UserRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at
+        from users
+        where id = $1
+        "#,
+    )
+    .bind(user_id)
     .fetch_optional(pool)
     .await
     .map(|row| row.map(user_from_row))
@@ -5009,9 +6758,51 @@ fn user_from_row(row: sqlx::postgres::PgRow) -> UserRecord {
         password_hash: row.get("password_hash"),
         status: row.get("status"),
         active_device_fingerprint: row.get("active_device_fingerprint"),
+        session_version: row.get("session_version"),
         created_at: row.get("created_at"),
         updated_at: row.get("updated_at"),
     }
+}
+
+async fn db_user_session_version(pool: &PgPool, user_id: Uuid) -> Result<i32, AppError> {
+    sqlx::query("select session_version from users where id = $1")
+        .bind(user_id)
+        .fetch_optional(pool)
+        .await
+        .map_err(AppError::from_sqlx)?
+        .map(|row| row.get("session_version"))
+        .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
+}
+
+async fn db_change_user_password(
+    pool: &PgPool,
+    user_id: Uuid,
+    password_hash: &str,
+) -> Result<(), AppError> {
+    let now = Utc::now();
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    sqlx::query(
+        r#"
+        update users
+        set password_hash = $2,
+            session_version = session_version + 1,
+            active_device_fingerprint = null,
+            updated_at = $3
+        where id = $1
+        "#,
+    )
+    .bind(user_id)
+    .bind(password_hash)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    sqlx::query("delete from auth_sessions where user_id = $1")
+        .bind(user_id)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    tx.commit().await.map_err(AppError::from_sqlx)
 }
 
 async fn db_user_wallet_address(pool: &PgPool, user_id: Uuid) -> Result<String, AppError> {
@@ -5164,10 +6955,10 @@ async fn db_session_by_token(
 ) -> Result<Option<SessionRecord>, AppError> {
     let sql = match column {
         "access_token" => {
-            "select user_id, device_fingerprint, refresh_token, client_type, expires_at from auth_sessions where access_token = $1"
+            "select user_id, device_fingerprint, refresh_token, app_session_key, client_type, session_version, expires_at from auth_sessions where access_token = $1"
         }
         "refresh_token" => {
-            "select user_id, device_fingerprint, refresh_token, client_type, expires_at from auth_sessions where refresh_token = $1"
+            "select user_id, device_fingerprint, refresh_token, app_session_key, client_type, session_version, expires_at from auth_sessions where refresh_token = $1"
         }
         _ => return Ok(None),
     };
@@ -5180,8 +6971,10 @@ async fn db_session_by_token(
                 user_id: row.get("user_id"),
                 device_fingerprint: row.get("device_fingerprint"),
                 refresh_token: row.get("refresh_token"),
+                app_session_key: row.get("app_session_key"),
                 client_type: client_type_from_str(row.get::<String, _>("client_type").as_str())
                     .unwrap_or(ClientType::Android),
+                session_version: row.get("session_version"),
                 expires_at: row.get("expires_at"),
             })
         })
@@ -5284,6 +7077,59 @@ async fn db_save_platform_trading_settings(
     .map_err(AppError::from_sqlx)
 }
 
+async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings, AppError> {
+    sqlx::query(
+        r#"
+        select enabled, interval_seconds, up_threshold, down_threshold, min_confidence, updated_at
+        from prediction_settings
+        where id = true
+        "#,
+    )
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| PredictionSettings {
+            enabled: row.get("enabled"),
+            interval_seconds: row.get("interval_seconds"),
+            up_threshold: row.get("up_threshold"),
+            down_threshold: row.get("down_threshold"),
+            min_confidence: row.get("min_confidence"),
+            updated_at: row.get("updated_at"),
+        })
+        .unwrap_or_default()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_save_prediction_settings(
+    pool: &PgPool,
+    settings: &PredictionSettings,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into prediction_settings
+          (id, enabled, interval_seconds, up_threshold, down_threshold, min_confidence, updated_at)
+        values (true, $1, $2, $3, $4, $5, now())
+        on conflict (id) do update set
+          enabled = excluded.enabled,
+          interval_seconds = excluded.interval_seconds,
+          up_threshold = excluded.up_threshold,
+          down_threshold = excluded.down_threshold,
+          min_confidence = excluded.min_confidence,
+          updated_at = now()
+        "#,
+    )
+    .bind(settings.enabled)
+    .bind(settings.interval_seconds)
+    .bind(settings.up_threshold)
+    .bind(settings.down_threshold)
+    .bind(settings.min_confidence)
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
 async fn db_load_automation_settings(
     pool: &PgPool,
     user_id: Uuid,
@@ -5370,7 +7216,8 @@ async fn db_load_page_state(
     sqlx::query(
         r#"
         select page_ready, screen_name, confidence, package_name, amount_field_found,
-               up_button_found, down_button_found, observed_at, updated_at
+               up_button_found, down_button_found, observed_balance_usdt,
+               account_match_status, account_balance_delta_usdt, observed_at, updated_at
         from automation_page_states
         where user_id = $1
         "#,
@@ -5387,6 +7234,9 @@ async fn db_load_page_state(
             amount_field_found: row.get("amount_field_found"),
             up_button_found: row.get("up_button_found"),
             down_button_found: row.get("down_button_found"),
+            observed_balance_usdt: row.get("observed_balance_usdt"),
+            account_match_status: row.get("account_match_status"),
+            account_balance_delta_usdt: row.get("account_balance_delta_usdt"),
             observed_at: row.get("observed_at"),
             updated_at: row.get("updated_at"),
         })
@@ -5403,8 +7253,9 @@ async fn db_save_page_state(
         r#"
         insert into automation_page_states
           (user_id, page_ready, screen_name, confidence, package_name, amount_field_found,
-           up_button_found, down_button_found, observed_at, updated_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+           up_button_found, down_button_found, observed_balance_usdt, account_match_status,
+           account_balance_delta_usdt, observed_at, updated_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
         on conflict (user_id) do update set
           page_ready = excluded.page_ready,
           screen_name = excluded.screen_name,
@@ -5413,6 +7264,9 @@ async fn db_save_page_state(
           amount_field_found = excluded.amount_field_found,
           up_button_found = excluded.up_button_found,
           down_button_found = excluded.down_button_found,
+          observed_balance_usdt = excluded.observed_balance_usdt,
+          account_match_status = excluded.account_match_status,
+          account_balance_delta_usdt = excluded.account_balance_delta_usdt,
           observed_at = excluded.observed_at,
           updated_at = excluded.updated_at
         "#,
@@ -5425,6 +7279,9 @@ async fn db_save_page_state(
     .bind(page.amount_field_found)
     .bind(page.up_button_found)
     .bind(page.down_button_found)
+    .bind(page.observed_balance_usdt)
+    .bind(&page.account_match_status)
+    .bind(page.account_balance_delta_usdt)
     .bind(page.observed_at)
     .bind(page.updated_at)
     .execute(pool)
@@ -5550,11 +7407,14 @@ async fn db_exchange_credential_status(
 ) -> Result<Option<ExchangeCredentialStatus>, AppError> {
     sqlx::query(
         r#"
-        select provider, can_read_account, verification_status,
-               balance_available_usdt, balance_wallet_usdt, balance_updated_at,
+        select c.provider, c.can_read_account, c.verification_status,
+               c.balance_available_usdt, c.balance_wallet_usdt,
+               p.observed_balance_usdt, p.account_match_status, p.account_balance_delta_usdt,
+               c.balance_updated_at,
                last_verified_at, last_error, updated_at
-        from user_exchange_credentials
-        where user_id = $1 and provider = $2
+        from user_exchange_credentials c
+        left join automation_page_states p on p.user_id = c.user_id
+        where c.user_id = $1 and c.provider = $2
         "#,
     )
     .bind(user_id)
@@ -5577,7 +7437,19 @@ async fn db_exchange_credential_status(
                 .ok()
                 .flatten()
                 .map(money),
+            account_match_status: row.get("account_match_status"),
+            observed_balance_usdt: row
+                .try_get::<Option<Decimal>, _>("observed_balance_usdt")
+                .ok()
+                .flatten()
+                .map(money),
+            account_balance_delta_usdt: row
+                .try_get::<Option<Decimal>, _>("account_balance_delta_usdt")
+                .ok()
+                .flatten()
+                .map(money),
             balance_updated_at: row.get("balance_updated_at"),
+            balance_cache_fresh: balance_cache_fresh(row.get("balance_updated_at")),
             last_verified_at: row.get("last_verified_at"),
             last_error: row.get("last_error"),
             updated_at: Some(row.get("updated_at")),
@@ -5672,6 +7544,36 @@ async fn db_exchange_available_balance(
     .fetch_optional(pool)
     .await
     .map(|row| row.and_then(|row| row.get("balance_available_usdt")))
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_exchange_balance_snapshot(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<Option<ExchangeBalanceSnapshot>, AppError> {
+    sqlx::query(
+        r#"
+        select balance_available_usdt, balance_updated_at
+        from user_exchange_credentials
+        where user_id = $1
+          and provider = $2
+          and verification_status = 'verified'
+          and can_read_account = true
+        "#,
+    )
+    .bind(user_id)
+    .bind(BINANCE_PROVIDER)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.and_then(|row| {
+            row.get::<Option<Decimal>, _>("balance_available_usdt")
+                .map(|available| ExchangeBalanceSnapshot {
+                    available,
+                    updated_at: row.get("balance_updated_at"),
+                })
+        })
+    })
     .map_err(AppError::from_sqlx)
 }
 
@@ -5770,7 +7672,7 @@ async fn db_mark_exchange_error(
     .map_err(AppError::from_sqlx)
 }
 
-async fn db_insert_signal(pool: &PgPool, signal: &SignalCore) -> Result<(), AppError> {
+async fn db_insert_signal(pool: &PgPool, signal: &SignalCore) -> Result<bool, AppError> {
     sqlx::query(
         r#"
         insert into signals
@@ -5794,8 +7696,116 @@ async fn db_insert_signal(pool: &PgPool, signal: &SignalCore) -> Result<(), AppE
     .bind(signal.created_at)
     .execute(pool)
     .await
+    .map(|result| result.rows_affected() > 0)
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_prediction_audit(
+    pool: &PgPool,
+    signal: &SignalCore,
+    decision: &PredictionDecision,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into prediction_audit_logs
+          (id, signal_id, source, symbol, period_seconds, model_version, direction,
+           confidence, predicted_return, entry_price, suggested_stake, score,
+           feature_snapshot, rule_hits, reason, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, '[]'::jsonb, $14, $15)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind(signal.id)
+    .bind("strategy_loop")
+    .bind(&signal.symbol)
+    .bind(signal.period_seconds)
+    .bind(&signal.model_version)
+    .bind(&signal.direction)
+    .bind(signal.confidence)
+    .bind(signal.predicted_return)
+    .bind(signal.entry_price)
+    .bind(signal.suggested_stake)
+    .bind(decimal_from_f64(decision.score, 10))
+    .bind(&decision.feature_snapshot)
+    .bind(&decision.reason)
+    .bind(signal.created_at)
+    .execute(pool)
+    .await
     .map(|_| ())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_insert_prediction_observation(
+    pool: &PgPool,
+    decision: &PredictionDecision,
+) -> Result<(), AppError> {
+    sqlx::query(
+        r#"
+        insert into prediction_observations
+          (id, source, symbol, period_seconds, model_version, direction, confidence,
+           predicted_return, entry_price, score, feature_snapshot, reason, created_at)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+        "#,
+    )
+    .bind(Uuid::now_v7())
+    .bind("strategy_loop")
+    .bind(DEFAULT_SYMBOL)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .bind("score-v1")
+    .bind(&decision.direction)
+    .bind(decimal_from_f64(decision.confidence, 6))
+    .bind(decimal_from_f64(decision.predicted_return, 10))
+    .bind(decimal_from_f64(decision.entry_price, 8))
+    .bind(decimal_from_f64(decision.score, 10))
+    .bind(&decision.feature_snapshot)
+    .bind(&decision.reason)
+    .bind(Utc::now())
+    .execute(pool)
+    .await
+    .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_prediction_observations(
+    pool: &PgPool,
+    limit: i64,
+) -> Result<Vec<PredictionObservationRecord>, AppError> {
+    sqlx::query(
+        r#"
+        select id, source, symbol, period_seconds, model_version, direction, confidence,
+               predicted_return, entry_price, score, feature_snapshot, reason, created_at
+        from prediction_observations
+        order by created_at desc
+        limit $1
+        "#,
+    )
+    .bind(limit)
+    .fetch_all(pool)
+    .await
+    .map(|rows| {
+        rows.into_iter()
+            .map(prediction_observation_from_row)
+            .collect()
+    })
+    .map_err(AppError::from_sqlx)
+}
+
+fn prediction_observation_from_row(row: sqlx::postgres::PgRow) -> PredictionObservationRecord {
+    PredictionObservationRecord {
+        id: row.get("id"),
+        source: row.get("source"),
+        symbol: row.get("symbol"),
+        period_seconds: row.get("period_seconds"),
+        model_version: row.get("model_version"),
+        direction: row.get("direction"),
+        confidence: row.get("confidence"),
+        predicted_return: row.get("predicted_return"),
+        entry_price: row.get("entry_price"),
+        score: row.get("score"),
+        feature_snapshot: row.get("feature_snapshot"),
+        reason: row.get("reason"),
+        created_at: row.get("created_at"),
+    }
 }
 
 async fn db_latest_signal(pool: &PgPool) -> Result<Option<SignalCore>, AppError> {
@@ -7794,8 +9804,9 @@ async fn db_apply_referral_rewards_tx(
 async fn db_admin_overview(
     pool: &PgPool,
     started_at: DateTime<Utc>,
+    prediction_runtime: PredictionRuntimeStatus,
 ) -> Result<serde_json::Value, AppError> {
-    let stats = db_build_stats(pool, started_at).await?;
+    let stats = db_build_stats(pool, started_at, prediction_runtime).await?;
     let users_total = db_count(pool, "users").await?;
     let ready_pages = db_ready_pages(pool).await?;
     let orders = db_admin_orders(pool).await?;
@@ -7814,6 +9825,7 @@ async fn db_admin_overview(
 async fn db_build_stats(
     pool: &PgPool,
     started_at: DateTime<Utc>,
+    prediction_runtime: PredictionRuntimeStatus,
 ) -> Result<StatsResponse, AppError> {
     let reports = db_admin_reports(pool).await?;
     let wins = reports
@@ -7834,6 +9846,7 @@ async fn db_build_stats(
         .await?
         .map(|signal| SignalApiResponse {
             trade_authorized: false,
+            account_match_status: "not_checked".to_string(),
             ..signal_api_response(&signal)
         });
     Ok(StatsResponse {
@@ -7847,7 +9860,65 @@ async fn db_build_stats(
         hit_rate,
         uptime_seconds: (Utc::now() - started_at).num_seconds(),
         latest_signal,
+        prediction: prediction_status(&prediction_runtime),
     })
+}
+
+async fn db_app_runtime_summary(
+    pool: &PgPool,
+    user_id: Uuid,
+) -> Result<AppRuntimeSummary, AppError> {
+    let orders_total =
+        sqlx::query("select count(*) as count from event_contract_orders where user_id = $1")
+            .bind(user_id)
+            .fetch_one(pool)
+            .await
+            .map(|row| row.get::<i64, _>("count") as usize)
+            .map_err(AppError::from_sqlx)?;
+    let report_row = sqlx::query(
+        r#"
+        select
+          count(*) filter (where upper(result) = 'WIN') as wins,
+          count(*) filter (where upper(result) = 'LOSS') as losses
+        from execution_reports
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let wins = report_row.get::<i64, _>("wins") as usize;
+    let losses = report_row.get::<i64, _>("losses") as usize;
+    let pnl = sqlx::query(
+        r#"
+        select coalesce(sum(gross_profit), 0) as pnl
+        from settlements
+        where user_id = $1
+        "#,
+    )
+    .bind(user_id)
+    .fetch_one(pool)
+    .await
+    .map(|row| row.get::<Decimal, _>("pnl"))
+    .map_err(AppError::from_sqlx)?;
+    Ok(AppRuntimeSummary {
+        orders_total,
+        wins,
+        losses,
+        win_rate: hit_rate_string(wins, losses),
+        pnl_usdt: money(pnl),
+        pending_settlements: orders_total.saturating_sub(wins + losses),
+    })
+}
+
+fn hit_rate_string(wins: usize, losses: usize) -> String {
+    let settled = wins + losses;
+    if settled == 0 {
+        "0".to_string()
+    } else {
+        format!("{:.4}", wins as f64 / settled as f64)
+    }
 }
 
 async fn db_count(pool: &PgPool, table: &str) -> Result<i64, AppError> {
@@ -7889,7 +9960,7 @@ async fn db_ready_pages(pool: &PgPool) -> Result<i64, AppError> {
 async fn db_admin_users(pool: &PgPool) -> Result<Vec<AdminUserRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, wallet_address, password_hash, status, active_device_fingerprint, created_at, updated_at
+        select id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at
         from users
         order by created_at desc
         limit 200
@@ -8092,7 +10163,9 @@ async fn db_admin_page_states(
     sqlx::query(
         r#"
         select user_id, page_ready, screen_name, confidence, package_name,
-               amount_field_found, up_button_found, down_button_found, observed_at, updated_at
+               amount_field_found, up_button_found, down_button_found,
+               observed_balance_usdt, account_match_status, account_balance_delta_usdt,
+               observed_at, updated_at
         from automation_page_states
         order by updated_at desc
         limit 500
@@ -8113,6 +10186,9 @@ async fn db_admin_page_states(
                         amount_field_found: row.get("amount_field_found"),
                         up_button_found: row.get("up_button_found"),
                         down_button_found: row.get("down_button_found"),
+                        observed_balance_usdt: row.get("observed_balance_usdt"),
+                        account_match_status: row.get("account_match_status"),
+                        account_balance_delta_usdt: row.get("account_balance_delta_usdt"),
                         observed_at: row.get("observed_at"),
                         updated_at: row.get("updated_at"),
                     },
@@ -8149,6 +10225,7 @@ async fn build_stats(state: &SharedState) -> StatsResponse {
             .cloned()
             .map(|signal| SignalApiResponse {
                 trade_authorized: false,
+                account_match_status: "not_checked".to_string(),
                 ..signal_api_response(&signal)
             });
     StatsResponse {
@@ -8162,6 +10239,28 @@ async fn build_stats(state: &SharedState) -> StatsResponse {
         hit_rate,
         uptime_seconds: (Utc::now() - state.started_at).num_seconds(),
         latest_signal,
+        prediction: prediction_status(&*state.prediction_runtime.read().await),
+    }
+}
+
+fn prediction_status(runtime: &PredictionRuntimeStatus) -> PredictionStatus {
+    PredictionStatus {
+        enabled: runtime.enabled,
+        mode: "strategy_loop".to_string(),
+        status: runtime.status.clone(),
+        last_evaluated_at: runtime.last_evaluated_at,
+        last_signal_at: runtime.last_signal_at,
+        last_signal_age_seconds: runtime
+            .last_signal_at
+            .map(|created_at| (Utc::now() - created_at).num_seconds()),
+        last_direction: runtime.last_direction.clone(),
+        last_score: runtime.last_score.map(|value| format!("{value:.4}")),
+        last_confidence: runtime.last_confidence.map(|value| format!("{value:.4}")),
+        market_source: runtime.market_source.clone(),
+        market_age_seconds: runtime.market_age_seconds,
+        market_candles: runtime.market_candles,
+        message: runtime.message.clone(),
+        last_error: runtime.last_error.clone(),
     }
 }
 
@@ -8190,6 +10289,14 @@ fn client_type_from_str(value: &str) -> Option<ClientType> {
         "android" => Some(ClientType::Android),
         "dapp" => Some(ClientType::Dapp),
         _ => None,
+    }
+}
+
+fn active_device_for_client(client_type: ClientType, device: &str) -> Option<String> {
+    if client_type == ClientType::Android {
+        Some(device.to_string())
+    } else {
+        None
     }
 }
 
@@ -8442,6 +10549,11 @@ fn decimal(value: Decimal) -> String {
 
 fn money(value: Decimal) -> String {
     value.round_dp(8).normalize().to_string()
+}
+
+fn decimal_from_f64(value: f64, scale: u32) -> Decimal {
+    let scale = scale as usize;
+    Decimal::from_str(&format!("{value:.scale$}")).unwrap_or(Decimal::ZERO)
 }
 
 #[derive(Debug)]

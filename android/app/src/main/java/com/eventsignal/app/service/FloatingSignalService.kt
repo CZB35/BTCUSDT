@@ -212,16 +212,18 @@ class FloatingSignalService : Service() {
     private fun refreshOverlayText() {
         val view = overlayView ?: return
         val signal = stateStore.loadSignal()
-        val settings = stateStore.loadSettings()
         val debug = stateStore.loadDebugState()
         val connection = stateStore.loadConnectionState()
+        val summary = stateStore.loadRuntimeSummary()
         val signalText = view.findViewWithTag<TextView>("signal")
         val statusText = view.findViewWithTag<TextView>("status")
-        signalText.text = "\u4fe1\u53f7\uff1a${signal?.direction ?: "-"}  ${signal?.suggestedStake ?: "-"}U  ${settings.executionMode}"
+        signalText.text =
+            "下单:${summary.ordersTotal}次  胜率:${percent(summary.winRate)}(${summary.wins}/${summary.wins + summary.losses})\n" +
+            "盈亏:${summary.pnlUsdt}U  余额:${debug.observedBalanceUsdt ?: "-"}U"
         statusText.text =
-            "\u8bc6\u522b\uff1a${recognitionLabel(debug)} ${debug.screenName} ${"%.2f".format(debug.confidence)}\n" +
-            "WS\uff1a${wsLabel(connection)}  \u6846${yesNo(debug.amountFieldFound)} \u6da8${yesNo(debug.upButtonFound)} \u8dcc${yesNo(debug.downButtonFound)}\n" +
-            "\u52a8\u4f5c\uff1a${debug.lastAction}  " +
+            "下次:${signal?.suggestedStake ?: "-"}U  待结算:${summary.pendingSettlements}笔\n" +
+            "识别:${recognitionLabel(debug)}  WS:${wsLabel(connection)}\n" +
+            "状态:${runtimeStatusLabel(stateStore.loadLastStatus())}  " +
             if (AutomationRuntime.running) "\u8fd0\u884c\u4e2d" else "\u5df2\u505c"
     }
 
@@ -239,6 +241,23 @@ class FloatingSignalService : Service() {
     }
 
     private fun yesNo(value: Boolean): String = if (value) "\u662f" else "\u5426"
+
+    private fun percent(raw: String): String =
+        raw.toDoubleOrNull()?.let { "${(it * 100).toInt()}%" } ?: "0%"
+
+    private fun runtimeStatusLabel(status: String): String = when {
+        status.startsWith("ws_signal_execute") -> "收到信号"
+        status == "ws_signal_not_authorized_fee_reserve_insufficient" -> "预扣不足"
+        status == "ws_signal_not_authorized_account_gate" -> "校验失败"
+        status == "ws_signal_not_authorized" -> "未授权"
+        status == "trading_account_not_verified" -> "未验证"
+        status.startsWith("confirmed") -> "已确认"
+        status.startsWith("order_reported") -> "已上报"
+        status.startsWith("amount_prepared_waiting_confirmation") -> "待确认"
+        status.startsWith("action_button_not_found") -> "按钮缺失"
+        status.startsWith("action_click_failed") -> "点击失败"
+        else -> status
+    }
 
     private fun Button.styleOverlayButton() {
         textSize = 11f

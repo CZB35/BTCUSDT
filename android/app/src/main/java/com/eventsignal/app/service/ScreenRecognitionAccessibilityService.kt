@@ -88,6 +88,7 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
             amountFieldFound = screen.amountFieldFound,
             upButtonFound = screen.upButtonFound,
             downButtonFound = screen.downButtonFound,
+            observedBalanceUsdt = screen.observedBalanceUsdt,
             observedAt = Instant.now().toString(),
         )
         if (!pageGateReportInFlight.compareAndSet(false, true)) return
@@ -171,6 +172,7 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
                 amountFieldFound = screen.amountFieldFound,
                 upButtonFound = screen.upButtonFound,
                 downButtonFound = screen.downButtonFound,
+                observedBalanceUsdt = screen.observedBalanceUsdt,
                 lastAction = action,
                 visibleText = screen.visibleText.take(12),
             ),

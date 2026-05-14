@@ -25,6 +25,7 @@ import "./styles.css";
 type AdminView =
   | "overview"
   | "settings"
+  | "prediction"
   | "signals"
   | "workers"
   | "users"
@@ -45,11 +46,54 @@ type AdminOverview = {
     hit_rate: string;
     uptime_seconds: number;
     latest_signal?: SignalRecord;
+    prediction?: PredictionStatus;
   };
   ready_pages: number;
   orders: OrderRecord[];
   reports: ReportRecord[];
   settlements: SettlementRecord[];
+};
+
+type PredictionStatus = {
+  enabled: boolean;
+  mode: string;
+  status: string;
+  last_evaluated_at?: string | null;
+  last_signal_at?: string | null;
+  last_signal_age_seconds?: number | null;
+  last_direction?: string | null;
+  last_score?: string | null;
+  last_confidence?: string | null;
+  market_source?: string | null;
+  market_age_seconds?: number | null;
+  market_candles?: number;
+  message: string;
+  last_error?: string | null;
+};
+
+type PredictionSettings = {
+  enabled: boolean;
+  interval_seconds: number;
+  up_threshold: string;
+  down_threshold: string;
+  min_confidence: string;
+  updated_at?: string | null;
+};
+
+type PredictionObservation = {
+  id: string;
+  source: string;
+  symbol: string;
+  period_seconds: number;
+  model_version: string;
+  direction: string;
+  confidence: string;
+  predicted_return: string;
+  entry_price: string;
+  score?: string | null;
+  feature_snapshot: Record<string, unknown>;
+  reason?: string | null;
+  created_at: string;
 };
 
 type SignalRecord = {
@@ -178,6 +222,9 @@ type PageStateRecord = {
   amount_field_found: boolean;
   up_button_found: boolean;
   down_button_found: boolean;
+  observed_balance_usdt?: string | null;
+  account_match_status?: string | null;
+  account_balance_delta_usdt?: string | null;
   observed_at: string;
   updated_at: string;
 };
@@ -238,6 +285,14 @@ function App() {
   const [settlements, setSettlements] = useState<SettlementRecord[]>([]);
   const [pageStates, setPageStates] = useState<PageStateRecord[]>([]);
   const [exchangeWorkers, setExchangeWorkers] = useState<ExchangeWorkerSlot[]>([]);
+  const [predictionSettings, setPredictionSettings] = useState<PredictionSettings>({
+    enabled: true,
+    interval_seconds: 5,
+    up_threshold: "2.6",
+    down_threshold: "-2.6",
+    min_confidence: "0.62"
+  });
+  const [predictionObservations, setPredictionObservations] = useState<PredictionObservation[]>([]);
   const [workerName, setWorkerName] = useState("");
   const [workerShardTotal, setWorkerShardTotal] = useState("3");
   const [workerShardIndex, setWorkerShardIndex] = useState("0");
@@ -290,10 +345,12 @@ function App() {
 
   async function loadAll(nextToken = token) {
     setStatus("正在刷新");
-    const [nextOverview, nextSettings, nextSignals, nextWorkers, nextUsers, nextDeposits, nextWithdrawals, nextLedger, nextOrders, nextReports, nextSettlements, nextPageStates] =
+    const [nextOverview, nextSettings, nextPredictionSettings, nextPredictionObservations, nextSignals, nextWorkers, nextUsers, nextDeposits, nextWithdrawals, nextLedger, nextOrders, nextReports, nextSettlements, nextPageStates] =
       await Promise.all([
         adminFetch<AdminOverview>("/v1/admin/overview", nextToken),
         adminFetch<PlatformTradingSettings>("/v1/admin/trading-settings", nextToken),
+        adminFetch<PredictionSettings>("/v1/admin/prediction-settings", nextToken),
+        adminFetch<PredictionObservation[]>("/v1/admin/prediction-observations", nextToken),
         adminFetch<SignalRecord[]>("/v1/admin/signals", nextToken),
         adminFetch<ExchangeWorkerSlot[]>("/v1/admin/exchange-workers", nextToken),
         adminFetch<UserRecord[]>("/v1/admin/users", nextToken),
@@ -308,6 +365,8 @@ function App() {
 
     if (nextOverview) setOverview(nextOverview);
     if (nextSettings) setTradingSettings(nextSettings);
+    if (nextPredictionSettings) setPredictionSettings(nextPredictionSettings);
+    if (nextPredictionObservations) setPredictionObservations(nextPredictionObservations);
     if (nextSignals) setSignals(nextSignals);
     if (nextWorkers) setExchangeWorkers(nextWorkers);
     if (nextUsers) setUsers(nextUsers);
@@ -326,6 +385,18 @@ function App() {
       );
     }
     setStatus("已连接");
+  }
+
+  async function loadPredictionLive(nextToken = token) {
+    if (!nextToken.trim()) return;
+    const [nextOverview, nextPredictionSettings, nextPredictionObservations] = await Promise.all([
+      adminFetch<AdminOverview>("/v1/admin/overview", nextToken),
+      adminFetch<PredictionSettings>("/v1/admin/prediction-settings", nextToken),
+      adminFetch<PredictionObservation[]>("/v1/admin/prediction-observations", nextToken)
+    ]);
+    if (nextOverview) setOverview(nextOverview);
+    if (nextPredictionSettings) setPredictionSettings(nextPredictionSettings);
+    if (nextPredictionObservations) setPredictionObservations(nextPredictionObservations);
   }
 
   async function adminLogin(event?: FormEvent) {
@@ -388,6 +459,23 @@ function App() {
     const data = await res.json();
     setTradingSettings(data);
     setStatus("比例已保存");
+  }
+
+  async function savePredictionSettings(next: PredictionSettings) {
+    setStatus("正在保存预测配置");
+    const res = await fetch(`${API_BASE}/v1/admin/prediction-settings`, {
+      method: "PUT",
+      headers: adminHeaders(),
+      body: JSON.stringify(next)
+    });
+    if (!res.ok) {
+      setStatus(`预测配置保存失败 ${res.status}`);
+      return;
+    }
+    const data = await res.json();
+    setPredictionSettings(data);
+    await loadAll();
+    setStatus(data.enabled ? "预测已启用" : "预测已关闭");
   }
 
   async function saveExchangeWorker(next: Partial<ExchangeWorkerSlot> & { shard_total?: number; shard_index?: number; enabled?: boolean }) {
@@ -535,6 +623,13 @@ function App() {
     return () => window.clearInterval(id);
   }, [token]);
 
+  useEffect(() => {
+    if (!token.trim() || view !== "prediction") return;
+    loadPredictionLive(token).catch(() => undefined);
+    const id = window.setInterval(() => loadPredictionLive(token).catch(() => undefined), 1000);
+    return () => window.clearInterval(id);
+  }, [token, view]);
+
   if (!loggedIn) {
     return (
       <div className="login-page">
@@ -585,6 +680,7 @@ function App() {
           <NavItem active={view === "withdrawals"} icon={<ArrowDownRight size={18} />} label="提现" onClick={() => setView("withdrawals")} />
           <NavItem active={view === "overview"} icon={<Activity size={18} />} label="总览" onClick={() => setView("overview")} />
           <NavItem active={view === "settings"} icon={<SlidersHorizontal size={18} />} label="设置" onClick={() => setView("settings")} />
+          <NavItem active={view === "prediction"} icon={<Zap size={18} />} label="预测" onClick={() => setView("prediction")} />
           <NavItem active={view === "signals"} icon={<Radio size={18} />} label="信号" onClick={() => setView("signals")} />
           <NavItem active={view === "users"} icon={<Users size={18} />} label="用户" onClick={() => setView("users")} />
           <NavItem active={view === "deposits"} icon={<CreditCard size={18} />} label="充值" onClick={() => setView("deposits")} />
@@ -623,6 +719,14 @@ function App() {
         )}
         {view === "settings" && (
           <SettingsPage settings={tradingSettings} onSave={saveTradingSettings} />
+        )}
+        {view === "prediction" && (
+          <PredictionPage
+            settings={predictionSettings}
+            runtime={overview?.stats.prediction}
+            observations={predictionObservations}
+            onSave={savePredictionSettings}
+          />
         )}
         {view === "settings" && (
           <ExchangeWorkersPage
@@ -695,6 +799,21 @@ function OverviewPage({
       </section>
 
       <section className="split">
+        <div className="panel">
+          <div className="panel-title">
+            <div>
+              <h2>预测状态</h2>
+              <p>服务器端信号生成任务状态。</p>
+            </div>
+          </div>
+          <dl>
+            <div><dt>模式</dt><dd>{predictionModeLabel(overview?.stats.prediction?.mode)}</dd></div>
+            <div><dt>状态</dt><dd><StatusPill active={Boolean(overview?.stats.prediction?.enabled)}>{predictionStatusLabel(overview?.stats.prediction)}</StatusPill></dd></div>
+            <div><dt>最近信号</dt><dd>{shortTime(overview?.stats.prediction?.last_signal_at)}</dd></div>
+            <div><dt>说明</dt><dd>{overview?.stats.prediction?.message || "暂无状态"}</dd></div>
+          </dl>
+        </div>
+
         <div className="panel">
           <div className="panel-title">
             <div>
@@ -912,6 +1031,123 @@ function SettingsPage({
   );
 }
 
+function PredictionPage({
+  settings,
+  runtime,
+  observations,
+  onSave
+}: {
+  settings: PredictionSettings;
+  runtime?: PredictionStatus;
+  observations: PredictionObservation[];
+  onSave: (settings: PredictionSettings) => void;
+}) {
+  const [draft, setDraft] = useState(settings);
+  useEffect(() => {
+    setDraft(settings);
+  }, [settings]);
+
+  return (
+    <>
+      <section className="connection">
+        <label className="switch-line">
+          <input
+            type="checkbox"
+            checked={draft.enabled}
+            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+          />
+          <span>启用自动预测循环</span>
+        </label>
+        <label>
+          检查间隔（秒）
+          <input
+            value={draft.interval_seconds}
+            onChange={(event) => setDraft({ ...draft, interval_seconds: Number(event.target.value) || 5 })}
+          />
+        </label>
+        <label>
+          看涨阈值
+          <input value={draft.up_threshold} onChange={(event) => setDraft({ ...draft, up_threshold: event.target.value })} />
+        </label>
+        <label>
+          看跌阈值
+          <input value={draft.down_threshold} onChange={(event) => setDraft({ ...draft, down_threshold: event.target.value })} />
+        </label>
+        <label>
+          最低置信度
+          <input value={draft.min_confidence} onChange={(event) => setDraft({ ...draft, min_confidence: event.target.value })} />
+        </label>
+        <button className="primary" onClick={() => onSave(draft)}>
+          <Power size={18} />
+          保存预测配置
+        </button>
+      </section>
+
+      <section className="split">
+        <div className="panel">
+          <div className="panel-title">
+            <div>
+              <h2>运行状态</h2>
+              <p>后端预测循环实时状态。</p>
+            </div>
+          </div>
+          <dl>
+            <div><dt>状态</dt><dd><StatusPill active={Boolean(runtime?.enabled)}>{predictionStatusLabel(runtime)}</StatusPill></dd></div>
+            <div><dt>最近评估</dt><dd>{shortTime(runtime?.last_evaluated_at)}</dd></div>
+            <div><dt>最近信号</dt><dd>{shortTime(runtime?.last_signal_at)}</dd></div>
+            <div><dt>方向</dt><dd>{labelDirection(runtime?.last_direction || undefined)}</dd></div>
+            <div><dt>分数</dt><dd>{runtime?.last_score || "-"}</dd></div>
+            <div><dt>置信度</dt><dd>{runtime?.last_confidence || "-"}</dd></div>
+            <div><dt>行情源</dt><dd>{runtime?.market_source || "-"}</dd></div>
+            <div><dt>行情延迟</dt><dd>{runtime?.market_age_seconds ?? "-"} 秒</dd></div>
+            <div><dt>K线预热</dt><dd>{runtime?.market_candles ?? 0} 根</dd></div>
+            <div><dt>说明</dt><dd>{runtime?.message || "-"}</dd></div>
+            <div><dt>错误</dt><dd>{runtime?.last_error || "-"}</dd></div>
+          </dl>
+        </div>
+      </section>
+
+      <section className="panel">
+        <div className="panel-title">
+          <div>
+            <h2>预测运行记录</h2>
+            <p>包含 HOLD 和实际下发前的每次策略评估。</p>
+          </div>
+        </div>
+        <DataTable
+          columns={["时间", "方向", "分数", "置信度", "价格", "原因"]}
+          pageSize={20}
+          rows={observations.map((row) => ({
+            id: row.id,
+            cells: [
+              shortTime(row.created_at),
+              <ToneText tone={directionTone(row.direction)}>{labelDirection(row.direction)}</ToneText>,
+              row.score || "-",
+              row.confidence,
+              row.entry_price,
+              row.reason || "-"
+            ],
+            details: {
+              时间: shortTime(row.created_at),
+              来源: row.source,
+              交易对: row.symbol,
+              周期: `${row.period_seconds}s`,
+              模型: row.model_version,
+              方向: labelDirection(row.direction),
+              分数: row.score || "-",
+              置信度: row.confidence,
+              预测收益: row.predicted_return,
+              入场价: row.entry_price,
+              原因: row.reason || "-",
+              特征: JSON.stringify(row.feature_snapshot)
+            }
+          }))}
+        />
+      </section>
+    </>
+  );
+}
+
 function ExchangeWorkersPage({
   workers,
   draft,
@@ -1093,23 +1329,27 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
           </div>
         </div>
         <DataTable
-          columns={["用户", "页面", "识别", "金额框", "上涨", "下跌", "包名", "更新时间"]}
+          columns={["用户", "页面", "识别", "账号", "页面余额", "差值", "更新时间"]}
           rows={pageStates.map((state) => ({
             id: `${state.user_id}-${state.updated_at}`,
             cells: [
               shortId(state.user_id, 8),
               state.screen_name,
               <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
-              yesNo(state.amount_field_found),
-              yesNo(state.up_button_found),
-              yesNo(state.down_button_found),
-              state.package_name,
+              <StatusPill active={state.account_match_status === "matched"}>
+                {accountMatchText(state.account_match_status)}
+              </StatusPill>,
+              state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
+              state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
               shortTime(state.updated_at)
             ],
             details: {
               用户ID: state.user_id,
               页面: state.screen_name,
               识别通过: yesNo(state.page_ready),
+              账号一致性: accountMatchText(state.account_match_status),
+              页面余额: state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
+              余额差值: state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
               置信度: percent(state.confidence),
               金额框: yesNo(state.amount_field_found),
               上涨按钮: yesNo(state.up_button_found),
@@ -1538,6 +1778,7 @@ function stopRowClick(event: MouseEvent, action: () => void) {
 
 function viewTitle(view: AdminView) {
   if (view === "settings") return "交易设置";
+  if (view === "prediction") return "预测控制";
   if (view === "signals") return "信号管理";
   if (view === "users") return "用户与页面闸门";
   if (view === "deposits") return "充值与流水";
@@ -1548,6 +1789,7 @@ function viewTitle(view: AdminView) {
 
 function viewSubtitle(view: AdminView) {
   if (view === "settings") return "配置所有用户的 U 本位余额下单比例和 5U 到 250U 限制。";
+  if (view === "prediction") return "控制后端自动预测开关、阈值，并查看实时运行记录。";
   if (view === "signals") return "下发测试信号并查看历史信号。";
   if (view === "users") return "查看钱包账号、登录设备和页面识别状态。";
   if (view === "deposits") return "查看链上充值校验、入账状态和余额流水。";
@@ -1561,6 +1803,25 @@ function labelDirection(direction?: string) {
   if (direction === "DOWN") return "看跌";
   if (direction === "HOLD") return "观望";
   return "-";
+}
+
+function predictionModeLabel(mode?: string) {
+  if (mode === "strategy_loop") return "策略自动预测";
+  if (mode === "manual_signal") return "手动信号";
+  return mode || "-";
+}
+
+function predictionStatusLabel(prediction?: PredictionStatus) {
+  if (!prediction) return "-";
+  if (prediction.status === "running") return "运行中";
+  if (prediction.status === "holding") return "观望";
+  if (prediction.status === "matched") return "命中";
+  if (prediction.status === "sent") return "已下发";
+  if (prediction.status === "signal_ready") return "命中";
+  if (prediction.status === "duplicate_skipped") return "已跳过重复";
+  if (prediction.status === "disabled") return "未启用";
+  if (prediction.status === "error") return "异常";
+  return prediction.status || "-";
 }
 
 function stakePercentLabel(value?: string) {
@@ -1596,6 +1857,21 @@ function percent(value?: string) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return value || "-";
   return `${(parsed * 100).toFixed(0)}%`;
+}
+
+function formatNumber(value?: string | null) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return value || "-";
+  return parsed.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}
+
+function accountMatchText(status?: string | null) {
+  if (status === "matched") return "一致";
+  if (status === "mismatch") return "疑似不一致";
+  if (status === "observed_balance_missing") return "未识别余额";
+  if (status === "exchange_balance_missing") return "未绑定API余额";
+  if (status === "exchange_balance_stale") return "等待余额刷新";
+  return "未校验";
 }
 
 function duration(seconds: number) {

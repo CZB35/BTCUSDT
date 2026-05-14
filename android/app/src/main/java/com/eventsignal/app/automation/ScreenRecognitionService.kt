@@ -20,6 +20,7 @@ class ScreenRecognitionService {
         val amountFieldFound = findAmountField(nodes, profile) != null
         val upButtonFound = findDirectionButton(nodes, profile.upButtonKeywords) != null
         val downButtonFound = findDirectionButton(nodes, profile.downButtonKeywords) != null
+        val observedBalanceUsdt = extractObservedBalanceUsdt(texts)
         val structure = detectEventContractStructure(texts, amountFieldFound, upButtonFound, downButtonFound)
         val confidence = pageConfidence(packageName, structure, profile)
 
@@ -32,6 +33,7 @@ class ScreenRecognitionService {
             amountFieldFound = amountFieldFound,
             upButtonFound = upButtonFound,
             downButtonFound = downButtonFound,
+            observedBalanceUsdt = observedBalanceUsdt,
             visibleText = texts.take(40),
         )
     }
@@ -141,6 +143,17 @@ class ScreenRecognitionService {
                 keywords.any { keyword -> node.textForMatching.contains(keyword, ignoreCase = true) }
         }
 
+    private fun extractObservedBalanceUsdt(texts: List<String>): String? {
+        val normalized = texts.joinToString(" ") { it.replace(",", "") }
+        val patterns = listOf(
+            Regex("""U\s*本\s*位\s*合\s*约\s*([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
+            Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
+        )
+        return patterns.firstNotNullOfOrNull { pattern ->
+            pattern.find(normalized)?.groupValues?.getOrNull(1)
+        }
+    }
+
     private fun AccessibilityNodeInfo.toSnapshot(): NodeSnapshot =
         NodeSnapshot(
             textForMatching = listOfNotNull(
@@ -188,6 +201,7 @@ data class RecognizedScreen(
     val amountFieldFound: Boolean,
     val upButtonFound: Boolean,
     val downButtonFound: Boolean,
+    val observedBalanceUsdt: String?,
     val visibleText: List<String>,
 ) {
     companion object {
@@ -200,6 +214,7 @@ data class RecognizedScreen(
             amountFieldFound = false,
             upButtonFound = false,
             downButtonFound = false,
+            observedBalanceUsdt = null,
             visibleText = emptyList(),
         )
     }

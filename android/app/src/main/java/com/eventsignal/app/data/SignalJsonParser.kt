@@ -28,6 +28,9 @@ object SignalJsonParser {
             reservationId = obj["reservation_id"].asTextOrNull(),
             feeReserveUsdt = obj["fee_reserve_usdt"].asTextOrNull(),
             authorizationStatus = obj["authorization_status"].asTextOrNull(),
+            accountMatchStatus = obj["account_match_status"].asTextOrNull(),
+            observedBalanceUsdt = obj["observed_balance_usdt"].asTextOrNull(),
+            accountBalanceDeltaUsdt = obj["account_balance_delta_usdt"].asTextOrNull(),
             cycleEnd = obj["cycle_end"].asTextOrNull(),
         )
     }

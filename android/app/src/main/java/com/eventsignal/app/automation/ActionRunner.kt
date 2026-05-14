@@ -8,6 +8,7 @@ import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.EventContractOrderRequest
 import com.eventsignal.app.domain.SignalSnapshot
+import com.eventsignal.app.service.AutomationRuntime
 import java.time.Instant
 
 class ActionRunner(
@@ -30,7 +31,7 @@ class ActionRunner(
             return
         }
         if (!signal.tradeAuthorized) {
-            stateStore.saveLastStatus("signal_not_authorized:${signal.authorizationStatus ?: "-"}")
+            pauseForUnauthorizedSignal(signal)
             return
         }
         if (stateStore.hasExecuted(signalId)) {
@@ -68,6 +69,7 @@ class ActionRunner(
                 amountFieldFound = amountField != null,
                 upButtonFound = upButton != null,
                 downButtonFound = downButton != null,
+                observedBalanceUsdt = screen.observedBalanceUsdt,
                 lastAction = "识别完成",
                 visibleText = screen.visibleText.take(12),
             ),
@@ -90,15 +92,15 @@ class ActionRunner(
 
         val button = if (direction == "UP") upButton else downButton
         if (button == null) {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到${if (direction == "UP") "看涨" else "看跌"}按钮")
-            stateStore.saveLastStatus("direction_button_not_found:$direction")
+            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到执行按钮")
+            stateStore.saveLastStatus("action_button_not_found")
             return
         }
         if (click(button)) {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已点击${if (direction == "UP") "看涨" else "看跌"}，等待确认")
+            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已点击执行按钮，等待确认")
             if (clickConfirm(profile)) {
                 stateStore.markExecuted(signalId)
-                saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已确认${if (direction == "UP") "看涨" else "看跌"}")
+                saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已确认下单")
                 submitOrderReport(
                     signal = signal,
                     signalId = signalId,
@@ -107,14 +109,33 @@ class ActionRunner(
                     profile = profile,
                     screen = screen,
                 )
-                stateStore.saveLastStatus("confirmed:$direction:$amount:${screen.confidence}")
+                stateStore.saveLastStatus("confirmed:$amount:${screen.confidence}")
             } else {
-                stateStore.saveLastStatus("confirm_button_not_found:$direction:$amount")
+                stateStore.saveLastStatus("confirm_button_not_found:$amount")
                 saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到确认按钮")
             }
         } else {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "按钮点击失败")
-            stateStore.saveLastStatus("direction_click_failed:$direction")
+            stateStore.saveLastStatus("action_click_failed")
+        }
+    }
+
+    private fun pauseForUnauthorizedSignal(signal: SignalSnapshot) {
+        when (signal.authorizationStatus) {
+            "fee_reserve_insufficient" -> {
+                AutomationRuntime.stop()
+                stateStore.saveLastStatus("signal_not_authorized_fee_reserve_insufficient")
+            }
+            "mismatch",
+            "observed_balance_missing",
+            "exchange_balance_missing",
+            "exchange_balance_stale",
+            "unknown",
+            -> {
+                AutomationRuntime.stop()
+                stateStore.saveLastStatus("signal_not_authorized_account_gate")
+            }
+            else -> stateStore.saveLastStatus("signal_not_authorized")
         }
     }
 
@@ -151,7 +172,7 @@ class ActionRunner(
             reportedAt = Instant.now().toString(),
         )
         repository.submitEventContractOrder(order)
-            .onSuccess { stateStore.saveLastStatus("order_reported:$direction:$amount") }
+            .onSuccess { stateStore.saveLastStatus("order_reported:$amount") }
             .onFailure { stateStore.saveLastStatus("order_report_failed:${it.message}") }
     }
 
@@ -174,6 +195,7 @@ class ActionRunner(
                 amountFieldFound = amountFieldFound,
                 upButtonFound = upButtonFound,
                 downButtonFound = downButtonFound,
+                observedBalanceUsdt = screen.observedBalanceUsdt,
                 lastAction = action,
                 visibleText = screen.visibleText.take(12),
             ),

@@ -14,6 +14,7 @@ data class AutomationDebugState(
     val amountFieldFound: Boolean = false,
     val upButtonFound: Boolean = false,
     val downButtonFound: Boolean = false,
+    val observedBalanceUsdt: String? = null,
     val lastAction: String = "-",
     val visibleText: List<String> = emptyList(),
     val updatedAtMs: Long = 0,

@@ -45,6 +45,7 @@ class AutomationForegroundService : Service() {
         )
         AutomationRuntime.running = true
         startSignalSocket()
+        startRuntimeSummaryLoop()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -124,7 +125,33 @@ class AutomationForegroundService : Service() {
         }
     }
 
+    private var summaryLoopStarted = false
+
+    private fun startRuntimeSummaryLoop() {
+        if (summaryLoopStarted) return
+        summaryLoopStarted = true
+        scope.launch {
+            val repository = EventSignalRepository(applicationContext)
+            while (isActive) {
+                repository.loadAppRuntimeSummary()
+                    .onFailure { stateStore.saveLastStatus("runtime_summary_failed:${it.javaClass.simpleName}") }
+                delay(5_000)
+            }
+        }
+    }
+
     private fun handleSocketMessage(text: String) {
+        if (text.contains("\"connection.closed\"")) {
+            if (text.contains("AUTH_SESSION_REVOKED") || text.contains("DEVICE_SESSION_REPLACED")) {
+                EventSignalRepository(applicationContext).logout()
+                stateStore.saveConnectionState("auth_required")
+                stateStore.saveLastStatus("ws_session_revoked")
+                stopSelf()
+                return
+            }
+            stateStore.saveLastStatus("ws_closed_by_server")
+            return
+        }
         if (!text.contains("\"signal.created\"")) return
         val signal = runCatching { SignalJsonParser.parse(text) }
             .onFailure { stateStore.saveLastStatus("ws_signal_parse_failed:${it.javaClass.simpleName}") }
@@ -136,11 +163,26 @@ class AutomationForegroundService : Service() {
             return
         }
         if (signal.direction.uppercase() !in setOf("UP", "DOWN")) {
-            stateStore.saveLastStatus("ws_signal_ignored_direction:${signal.direction}")
+            stateStore.saveLastStatus("ws_signal_ignored")
             return
         }
         if (!signal.tradeAuthorized) {
-            stateStore.saveLastStatus("ws_signal_not_authorized:${signal.authorizationStatus ?: "-"}")
+            when (signal.authorizationStatus) {
+                "fee_reserve_insufficient" -> {
+                    AutomationRuntime.stop()
+                    stateStore.saveLastStatus("ws_signal_not_authorized_fee_reserve_insufficient")
+                }
+                "mismatch",
+                "observed_balance_missing",
+                "exchange_balance_missing",
+                "exchange_balance_stale",
+                "unknown",
+                -> {
+                    AutomationRuntime.stop()
+                    stateStore.saveLastStatus("ws_signal_not_authorized_account_gate")
+                }
+                else -> stateStore.saveLastStatus("ws_signal_not_authorized")
+            }
             return
         }
         stateStore.saveSignal(signal)
@@ -169,6 +211,7 @@ class AutomationForegroundService : Service() {
                         "up_button_found" to debug.upButtonFound.toString(),
                         "down_button_found" to debug.downButtonFound.toString(),
                         "safe_to_act" to debug.safeToAct.toString(),
+                        "observed_balance_usdt" to (debug.observedBalanceUsdt ?: "-"),
                     ),
                 ),
             )

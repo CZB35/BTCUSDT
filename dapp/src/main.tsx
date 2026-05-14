@@ -4,10 +4,10 @@ import { createRoot } from "react-dom/client";
 import { ethers } from "ethers";
 import { createAppKit, useAppKit, useAppKitAccount, useAppKitProvider } from "@reown/appkit/react";
 import { EthersAdapter } from "@reown/appkit-adapter-ethers";
-import { ArrowDownToLine, ArrowUpFromLine, Copy, CreditCard, Home, Link2, RefreshCw, Share2, Wallet } from "lucide-react";
+import { ArrowDownToLine, ArrowUpFromLine, Copy, CreditCard, Home, KeyRound, Link2, LogIn, RefreshCw, Share2, UserPlus, Wallet } from "lucide-react";
 import "./styles.css";
 
-type Tab = "home" | "deposit" | "trade" | "referral" | "withdraw";
+type Tab = "home" | "deposit" | "trade" | "referral" | "withdraw" | "security";
 
 type Balance = {
   asset: string;
@@ -165,27 +165,38 @@ function App() {
   const [txHash, setTxHash] = useState("");
   const [withdrawAmount, setWithdrawAmount] = useState("");
   const [withdrawAddress, setWithdrawAddress] = useState("");
+  const [newPassword, setNewPassword] = useState("");
 
   const shortAddress = useMemo(() => shortId(address || ""), [address]);
+  const loggedIn = token.trim().length > 0;
 
-  function headers() {
+  function headers(nextToken = token) {
     return {
       "content-type": "application/json",
-      ...(token ? { authorization: `Bearer ${token}` } : {})
+      ...(nextToken ? { authorization: `Bearer ${nextToken}` } : {})
     };
   }
 
-  async function request<T>(path: string, options: RequestInit = {}): Promise<T> {
-    const res = await fetch(`${API_BASE}${path}`, { ...options, headers: { ...headers(), ...(options.headers || {}) } });
-    if (!res.ok) throw new Error(await res.text());
+  async function request<T>(path: string, options: RequestInit = {}, nextToken = token): Promise<T> {
+    const res = await fetch(`${API_BASE}${path}`, { ...options, headers: { ...headers(nextToken), ...(options.headers || {}) } });
+    if (!res.ok) {
+      const text = await res.text();
+      throw new Error(friendlyErrorFromBody(text, res.status));
+    }
     return res.json();
   }
 
   async function login(path: "/v1/auth/login" | "/v1/auth/register") {
     if (!address) {
+      setStatus("请先连接钱包");
       await open({ view: "Connect" });
       return;
     }
+    if (password.trim().length < 6) {
+      setStatus("密码至少 6 位");
+      return;
+    }
+    setStatus(path === "/v1/auth/login" ? "正在登录" : "正在注册");
     const data = await request<{ access_token: string }>(path, {
       method: "POST",
       body: JSON.stringify({
@@ -199,6 +210,7 @@ function App() {
     localStorage.setItem(TOKEN_KEY, data.access_token);
     setToken(data.access_token);
     setStatus("已登录");
+    await loadAll(data.access_token);
   }
 
   async function bindWallet() {
@@ -218,19 +230,54 @@ function App() {
     await loadAll();
   }
 
-  async function loadAll() {
-    if (!token) return;
+  async function changePassword() {
+    if (!address || !walletProvider) {
+      setStatus("请先连接钱包");
+      await open({ view: "Connect" });
+      return;
+    }
+    if (newPassword.trim().length < 6) {
+      setStatus("新密码至少 6 位");
+      return;
+    }
+    setStatus("请在钱包中签名确认");
+    const challenge = await request<{ message: string }>("/v1/auth/change-password-message", {
+      method: "POST",
+      body: JSON.stringify({ chain: "bsc", address })
+    });
+    const provider = new ethers.BrowserProvider(walletProvider as ethers.Eip1193Provider);
+    const signer = await provider.getSigner();
+    const signature = await signer.signMessage(challenge.message);
+    await request("/v1/auth/change-password", {
+      method: "POST",
+      body: JSON.stringify({
+        chain: "bsc",
+        address,
+        message: challenge.message,
+        signature,
+        new_password: newPassword.trim()
+      })
+    });
+    localStorage.removeItem(TOKEN_KEY);
+    setToken("");
+    setPassword("");
+    setNewPassword("");
+    setStatus("密码已修改，请重新登录");
+  }
+
+  async function loadAll(nextToken = token) {
+    if (!nextToken) return;
     const [nextBalance, nextInstructions, nextDeposits, nextWithdrawals, nextOrders, nextReports, nextSettlements, nextLedger, nextReferral] =
       await Promise.all([
-        request<Balance>("/v1/balance"),
-        request<DepositInstructions>("/v1/deposits/instructions"),
-        request<Deposit[]>("/v1/deposits"),
-        request<Withdrawal[]>("/v1/withdrawals"),
-        request<Order[]>("/v1/event-contract-orders"),
-        request<Report[]>("/v1/execution-reports"),
-        request<Settlement[]>("/v1/settlements"),
-        request<Ledger[]>("/v1/ledger"),
-        request<ReferralSummary>("/v1/referrals/summary")
+        request<Balance>("/v1/balance", {}, nextToken),
+        request<DepositInstructions>("/v1/deposits/instructions", {}, nextToken),
+        request<Deposit[]>("/v1/deposits", {}, nextToken),
+        request<Withdrawal[]>("/v1/withdrawals", {}, nextToken),
+        request<Order[]>("/v1/event-contract-orders", {}, nextToken),
+        request<Report[]>("/v1/execution-reports", {}, nextToken),
+        request<Settlement[]>("/v1/settlements", {}, nextToken),
+        request<Ledger[]>("/v1/ledger", {}, nextToken),
+        request<ReferralSummary>("/v1/referrals/summary", {}, nextToken)
       ]);
     setBalance(nextBalance);
     setInstructions(nextInstructions);
@@ -290,6 +337,23 @@ function App() {
     if (address && !withdrawAddress) setWithdrawAddress(address);
   }, [address, withdrawAddress]);
 
+  if (!loggedIn) {
+    return (
+      <AuthPage
+        isConnected={isConnected}
+        shortAddress={shortAddress}
+        password={password}
+        referralCode={referralCode}
+        status={status}
+        onPassword={setPassword}
+        onReferralCode={setReferralCode}
+        onConnect={() => open({ view: "Connect" })}
+        onLogin={() => login("/v1/auth/login").catch((err) => setStatus(cleanError(err)))}
+        onRegister={() => login("/v1/auth/register").catch((err) => setStatus(cleanError(err)))}
+      />
+    );
+  }
+
   return (
     <div className="phone-shell">
       <header className="topbar">
@@ -309,13 +373,7 @@ function App() {
         <HomePage
           balance={balance}
           isConnected={isConnected}
-          password={password}
-          referralCode={referralCode}
-          onPassword={setPassword}
-          onReferralCode={setReferralCode}
           onConnect={() => open({ view: "Connect" })}
-          onLogin={() => login("/v1/auth/login").catch((err) => setStatus(cleanError(err)))}
-          onRegister={() => login("/v1/auth/register").catch((err) => setStatus(cleanError(err)))}
           onBind={() => bindWallet().catch((err) => setStatus(cleanError(err)))}
           ledger={ledger}
         />
@@ -345,6 +403,13 @@ function App() {
           onSubmit={() => requestWithdraw().catch((err) => setStatus(cleanError(err)))}
         />
       )}
+      {tab === "security" && (
+        <SecurityPage
+          newPassword={newPassword}
+          onNewPassword={setNewPassword}
+          onChangePassword={() => changePassword().catch((err) => setStatus(cleanError(err)))}
+        />
+      )}
 
       <nav className="tabbar">
         <TabButton active={tab === "home"} icon={<Home size={18} />} label="首页" onClick={() => setTab("home")} />
@@ -352,7 +417,76 @@ function App() {
         <TabButton active={tab === "trade"} icon={<CreditCard size={18} />} label="交易" onClick={() => setTab("trade")} />
         <TabButton active={tab === "referral"} icon={<Share2 size={18} />} label="推荐" onClick={() => setTab("referral")} />
         <TabButton active={tab === "withdraw"} icon={<ArrowUpFromLine size={18} />} label="提现" onClick={() => setTab("withdraw")} />
+        <TabButton active={tab === "security"} icon={<KeyRound size={18} />} label="安全" onClick={() => setTab("security")} />
       </nav>
+    </div>
+  );
+}
+
+function AuthPage({
+  isConnected,
+  shortAddress,
+  password,
+  referralCode,
+  status,
+  onPassword,
+  onReferralCode,
+  onConnect,
+  onLogin,
+  onRegister
+}: {
+  isConnected: boolean;
+  shortAddress: string;
+  password: string;
+  referralCode: string;
+  status: string;
+  onPassword: (value: string) => void;
+  onReferralCode: (value: string) => void;
+  onConnect: () => void;
+  onLogin: () => void;
+  onRegister: () => void;
+}) {
+  const passwordReady = password.trim().length >= 6;
+  return (
+    <div className="phone-shell auth-shell">
+      <section className="hero-card auth-card">
+        <div className="brand auth-brand">
+          <div className="brand-mark">ES</div>
+          <div>
+            <strong>事件合约</strong>
+            <span>{isConnected ? shortAddress : "请先连接钱包"}</span>
+          </div>
+        </div>
+        <button className={isConnected ? "secondary" : "primary"} onClick={onConnect}>
+          <Wallet size={18} />
+          {isConnected ? "切换钱包" : "连接钱包"}
+        </button>
+        <label>
+          登录密码
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => onPassword(event.target.value)}
+            placeholder="至少 6 位"
+            autoComplete="current-password"
+          />
+        </label>
+        <label>
+          邀请码
+          <input value={referralCode} onChange={(event) => onReferralCode(event.target.value)} placeholder="没有可不填，注册时绑定" />
+        </label>
+        <div className="row">
+          <button className="primary" disabled={!isConnected || !passwordReady} onClick={onLogin}>
+            <LogIn size={18} />
+            登录
+          </button>
+          <button className="secondary" disabled={!isConnected || !passwordReady} onClick={onRegister}>
+            <UserPlus size={18} />
+            注册
+          </button>
+        </div>
+        <p className="auth-status">{status}</p>
+      </section>
     </div>
   );
 }
@@ -360,25 +494,13 @@ function App() {
 function HomePage({
   balance,
   isConnected,
-  password,
-  referralCode,
-  onPassword,
-  onReferralCode,
   onConnect,
-  onLogin,
-  onRegister,
   onBind,
   ledger
 }: {
   balance: Balance | null;
   isConnected: boolean;
-  password: string;
-  referralCode: string;
-  onPassword: (value: string) => void;
-  onReferralCode: (value: string) => void;
   onConnect: () => void;
-  onLogin: () => void;
-  onRegister: () => void;
   onBind: () => void;
   ledger: Ledger[];
 }) {
@@ -400,16 +522,6 @@ function HomePage({
         <div className="wallet-row">
           <button className="primary" onClick={onConnect}><Wallet size={18} />连接钱包</button>
           <button className="secondary" onClick={onBind}><Link2 size={18} />签名绑定</button>
-        </div>
-      </section>
-
-      <section className="card">
-        <div className="section-title"><h2>账号登录</h2></div>
-        <label>密码<input type="password" value={password} onChange={(event) => onPassword(event.target.value)} placeholder="至少 6 位" /></label>
-        <label>邀请码<input value={referralCode} onChange={(event) => onReferralCode(event.target.value)} placeholder="选填，注册时绑定上级" /></label>
-        <div className="row">
-          <button className="primary" onClick={onLogin}>登录</button>
-          <button className="secondary" onClick={onRegister}>注册</button>
         </div>
       </section>
 
@@ -612,6 +724,21 @@ function WithdrawPage(props: {
   );
 }
 
+function SecurityPage(props: {
+  newPassword: string;
+  onNewPassword: (value: string) => void;
+  onChangePassword: () => void;
+}) {
+  return (
+    <section className="card">
+      <div className="section-title"><h2>账号安全</h2></div>
+      <label>新密码<input type="password" value={props.newPassword} onChange={(event) => props.onNewPassword(event.target.value)} placeholder="至少 6 位" /></label>
+      <button className="primary" onClick={props.onChangePassword}>钱包签名修改密码</button>
+      <p className="muted">修改后 App 和 DApp 的旧登录会话都会失效，需要重新登录。</p>
+    </section>
+  );
+}
+
 function Metric({ label, value }: { label: string; value: string }) {
   return <div className="metric"><span>{label}</span><strong>{value}</strong></div>;
 }
@@ -701,6 +828,21 @@ function percent(value?: string | null) {
 
 function cleanError(err: unknown) {
   return err instanceof Error ? err.message.slice(0, 120) : "请求失败";
+}
+
+function friendlyErrorFromBody(body: string, status: number) {
+  try {
+    const parsed = JSON.parse(body) as { code?: string; message?: string };
+    if (parsed.code === "AUTH_PASSWORD_WEAK") return "密码至少 6 位";
+    if (parsed.code === "AUTH_INVALID_CREDENTIALS") return "账号或密码错误，未注册请点注册";
+    if (parsed.code === "AUTH_ACCOUNT_EXISTS") return "该钱包已注册，请直接登录";
+    if (parsed.code === "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE") return "该账号已在其他设备登录";
+    if (parsed.code === "WALLET_NOT_BOUND") return "请先签名绑定钱包";
+    if (parsed.message) return parsed.message;
+  } catch {
+    if (body.trim()) return body.trim();
+  }
+  return `请求失败 ${status}`;
 }
 
 createRoot(document.getElementById("root")!).render(

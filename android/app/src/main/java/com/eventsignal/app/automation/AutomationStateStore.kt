@@ -2,6 +2,7 @@ package com.eventsignal.app.automation
 
 import android.content.Context
 import com.eventsignal.app.domain.AutomationSettings
+import com.eventsignal.app.domain.AppRuntimeSummary
 import com.eventsignal.app.domain.SignalSnapshot
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -30,6 +31,9 @@ class AutomationStateStore(context: Context) {
 
         @Volatile
         private var cachedConnectionState: String? = null
+
+        @Volatile
+        private var cachedRuntimeSummary: AppRuntimeSummary? = null
 
         @Volatile
         private var lastDebugDiskWriteAtMs: Long = 0
@@ -104,6 +108,19 @@ class AutomationStateStore(context: Context) {
         cachedConnectionState ?: (prefs.getString("connection_state", "unknown") ?: "unknown").also {
             cachedConnectionState = it
         }
+
+    fun saveRuntimeSummary(summary: AppRuntimeSummary) {
+        cachedRuntimeSummary = summary
+        prefs.edit()
+            .putString("runtime_summary", json.encodeToString(summary))
+            .apply()
+    }
+
+    fun loadRuntimeSummary(): AppRuntimeSummary =
+        cachedRuntimeSummary ?: prefs.getString("runtime_summary", null)
+            ?.let { raw -> runCatching { json.decodeFromString<AppRuntimeSummary>(raw) }.getOrNull() }
+            ?.also { cachedRuntimeSummary = it }
+            ?: AppRuntimeSummary()
 
     fun saveDebugState(state: AutomationDebugState) {
         val now = System.currentTimeMillis()

@@ -44,6 +44,8 @@ data class AuthResponse(
     val accessToken: String,
     @SerialName("refresh_token")
     val refreshToken: String,
+    @SerialName("app_session_key")
+    val appSessionKey: String,
     @SerialName("expires_in")
     val expiresIn: Long,
 )
@@ -60,8 +62,16 @@ data class ExchangeCredentialStatus(
     val balanceAvailableUsdt: String? = null,
     @SerialName("balance_wallet_usdt")
     val balanceWalletUsdt: String? = null,
+    @SerialName("account_match_status")
+    val accountMatchStatus: String? = null,
+    @SerialName("observed_balance_usdt")
+    val observedBalanceUsdt: String? = null,
+    @SerialName("account_balance_delta_usdt")
+    val accountBalanceDeltaUsdt: String? = null,
     @SerialName("balance_updated_at")
     val balanceUpdatedAt: String? = null,
+    @SerialName("balance_cache_fresh")
+    val balanceCacheFresh: Boolean = false,
     @SerialName("last_verified_at")
     val lastVerifiedAt: String? = null,
     @SerialName("last_error")
@@ -111,6 +121,12 @@ data class SignalSnapshot(
     val feeReserveUsdt: String? = null,
     @SerialName("authorization_status")
     val authorizationStatus: String? = null,
+    @SerialName("account_match_status")
+    val accountMatchStatus: String? = null,
+    @SerialName("observed_balance_usdt")
+    val observedBalanceUsdt: String? = null,
+    @SerialName("account_balance_delta_usdt")
+    val accountBalanceDeltaUsdt: String? = null,
     @SerialName("cycle_end")
     val cycleEnd: String? = null,
 ) {
@@ -215,6 +231,22 @@ data class AutomationPageStateRequest(
     val upButtonFound: Boolean,
     @SerialName("down_button_found")
     val downButtonFound: Boolean,
+    @SerialName("observed_balance_usdt")
+    val observedBalanceUsdt: String? = null,
     @SerialName("observed_at")
     val observedAt: String,
+)
+
+@Serializable
+data class AppRuntimeSummary(
+    @SerialName("orders_total")
+    val ordersTotal: Int = 0,
+    val wins: Int = 0,
+    val losses: Int = 0,
+    @SerialName("win_rate")
+    val winRate: String = "0",
+    @SerialName("pnl_usdt")
+    val pnlUsdt: String = "0",
+    @SerialName("pending_settlements")
+    val pendingSettlements: Int = 0,
 )

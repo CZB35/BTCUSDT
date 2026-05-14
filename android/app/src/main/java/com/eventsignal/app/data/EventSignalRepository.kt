@@ -4,6 +4,7 @@ import android.content.Context
 import com.eventsignal.app.automation.AutomationStateStore
 import com.eventsignal.app.domain.AutomationPageStateRequest
 import com.eventsignal.app.domain.AutomationSettings
+import com.eventsignal.app.domain.AppRuntimeSummary
 import com.eventsignal.app.domain.AuthResponse
 import com.eventsignal.app.domain.EventContractOrderRequest
 import com.eventsignal.app.domain.ExchangeCredentialResponse
@@ -43,6 +44,9 @@ class EventSignalRepository(context: Context) {
     fun ackSignalDelivery(ack: SignalDeliveryAckRequest): Result<Unit> =
         api.ackSignalDelivery(ack)
 
+    fun loadAppRuntimeSummary(): Result<AppRuntimeSummary> =
+        api.getAppRuntimeSummary().onSuccess(stateStore::saveRuntimeSummary)
+
     fun websocketRequest() =
         api.websocketRequest()
 
@@ -55,4 +59,11 @@ class EventSignalRepository(context: Context) {
     fun dappUrl(): String = "${api.baseUrl}/dapp/?return_uri=eventsignal://wallet"
 
     fun accessToken(): String? = api.accessToken
+
+    fun apiBaseUrl(): String = api.baseUrl
+
+    fun logout() {
+        api.accessToken = null
+        api.clearAppSessionKey()
+    }
 }
