@@ -76,6 +76,10 @@ const DEFAULT_DB_MAX_CONNECTIONS: u32 = 40;
 const DEFAULT_BSC_SYNC_INTERVAL_SECONDS: u64 = 6;
 const DEFAULT_BSC_DEPOSIT_SYNC_LIMIT: i64 = 100;
 const DEFAULT_BSC_RPC_TIMEOUT_SECONDS: u64 = 8;
+const DEFAULT_RESERVATION_RELEASE_INTERVAL_SECONDS: u64 = 2;
+const DEFAULT_RESERVATION_NO_ACK_RELEASE_SECONDS: i64 = 30;
+const DEFAULT_RESERVATION_ORDER_TIMEOUT_SECONDS: i64 = 90;
+const DEFAULT_RESERVATION_RELEASE_LIMIT: i64 = 100;
 const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUERY_LIMIT: i64 = 50;
 const MAX_QUERY_LIMIT: i64 = 500;
@@ -186,6 +190,7 @@ async fn main() -> anyhow::Result<()> {
         .await
         .map_err(|err| anyhow::anyhow!("{}: {}", err.code, err.message))?;
     start_bsc_deposit_sync_worker(&state);
+    start_reservation_release_worker(&state);
     start_market_data_feed(&state);
     start_prediction_loop(&state);
     let app = router(state);
@@ -239,6 +244,10 @@ fn router(state: SharedState) -> Router {
         .route("/v1/deposits", get(deposits))
         .route("/v1/withdrawals", get(withdrawals).post(create_withdrawal))
         .route("/v1/event-contract-orders", post(submit_order))
+        .route(
+            "/v1/signal-reservations/release",
+            post(release_signal_reservation),
+        )
         .route("/v1/event-contract-orders", get(event_contract_orders))
         .route("/v1/execution-reports", post(submit_execution_report))
         .route("/v1/execution-reports", get(execution_reports))
@@ -383,6 +392,25 @@ fn start_bsc_deposit_sync_worker(state: &SharedState) {
             interval.tick().await;
             if let Err(err) = sync_confirming_deposits(&pool).await {
                 eprintln!("BSC deposit sync failed: {}", err.message);
+            }
+        }
+    });
+}
+
+fn start_reservation_release_worker(state: &SharedState) {
+    let Some(pool) = state.db.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(StdDuration::from_secs(env_u64(
+            "RESERVATION_RELEASE_INTERVAL_SECONDS",
+            DEFAULT_RESERVATION_RELEASE_INTERVAL_SECONDS,
+            1,
+        )));
+        loop {
+            interval.tick().await;
+            if let Err(err) = db_release_stale_signal_reservations(&pool).await {
+                eprintln!("reservation release failed: {}", err.message);
             }
         }
     });
@@ -660,6 +688,7 @@ struct AppState {
     market_data: RwLock<MarketDataState>,
     prediction_runtime: RwLock<PredictionRuntimeStatus>,
     prediction_last_emitted_cycle: RwLock<Option<DateTime<Utc>>>,
+    active_ws_connections: RwLock<HashMap<Uuid, Uuid>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
 }
@@ -696,6 +725,7 @@ impl AppState {
             market_data: RwLock::new(MarketDataState::default()),
             prediction_runtime: RwLock::new(PredictionRuntimeStatus::default()),
             prediction_last_emitted_cycle: RwLock::new(None),
+            active_ws_connections: RwLock::new(HashMap::new()),
             signal_tx,
             started_at: Utc::now(),
         })
@@ -1792,6 +1822,12 @@ struct EventContractOrderRequest {
 struct SubmitOrderResponse {
     order_id: Uuid,
     status: String,
+}
+
+#[derive(Deserialize)]
+struct ReleaseReservationRequest {
+    reservation_id: Uuid,
+    reason: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -5058,6 +5094,27 @@ async fn submit_order(
     }))
 }
 
+async fn release_signal_reservation(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<ReleaseReservationRequest>,
+) -> Result<Json<serde_json::Value>, AppError> {
+    let user_id = require_android_user(&state, &headers).await?;
+    let Some(pool) = state.db.as_ref() else {
+        return Ok(Json(json!({ "ok": true, "released": false })));
+    };
+    let reason = reservation_release_entry_type(req.reason.as_deref().unwrap_or("client_failed"));
+    let released = db_release_signal_reservation_for_user(
+        pool,
+        req.reservation_id,
+        user_id,
+        reason,
+        "released",
+    )
+    .await?;
+    Ok(Json(json!({ "ok": true, "released": released })))
+}
+
 async fn submit_execution_report(
     State(state): State<SharedState>,
     headers: HeaderMap,
@@ -5196,6 +5253,11 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: Sess
     let user_id = session.user_id;
     let mut rx = state.signal_tx.subscribe();
     let ws_connection_id = Uuid::now_v7();
+    state
+        .active_ws_connections
+        .write()
+        .await
+        .insert(user_id, ws_connection_id);
     let _ = socket
         .send(Message::Text(
             json!({
@@ -5209,6 +5271,26 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: Sess
         ))
         .await;
     while let Ok(signal) = rx.recv().await {
+        let is_current_connection = state
+            .active_ws_connections
+            .read()
+            .await
+            .get(&user_id)
+            .copied()
+            == Some(ws_connection_id);
+        if !is_current_connection {
+            let _ = socket
+                .send(Message::Text(
+                    json!({
+                        "type": "connection.closed",
+                        "code": "WS_REPLACED",
+                        "message": "newer websocket connection is active"
+                    })
+                    .to_string(),
+                ))
+                .await;
+            break;
+        }
         if !session_device_is_current(&state, &session).await {
             let _ = socket
                 .send(Message::Text(
@@ -5276,9 +5358,26 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: Sess
                     Utc::now(),
                 )
                 .await;
+                if let Some(reservation_id) = payload
+                    .reservation_id
+                    .as_deref()
+                    .and_then(|value| Uuid::parse_str(value).ok())
+                {
+                    let _ = db_release_signal_reservation(
+                        pool,
+                        reservation_id,
+                        reservation_release_entry_type("send_failed"),
+                        "released",
+                    )
+                    .await;
+                }
             }
             break;
         }
+    }
+    let mut active = state.active_ws_connections.write().await;
+    if active.get(&user_id).copied() == Some(ws_connection_id) {
+        active.remove(&user_id);
     }
 }
 
@@ -6453,16 +6552,30 @@ async fn authorize_signal_for_user(
             status: "reserved".to_string(),
             order_id: None,
             execution_report_id: None,
-            expires_at: signal.cycle_end + Duration::seconds(30),
+            expires_at: now + Duration::seconds(DEFAULT_RESERVATION_ORDER_TIMEOUT_SECONDS),
             created_at: now,
             updated_at: now,
         };
 
         if let Some(pool) = state.db.as_ref() {
-            match db_reserve_signal_fee(pool, &reservation).await {
+            match db_reserve_or_load_signal_fee(pool, &reservation).await {
                 Ok(after) => {
                     balance_after = after.available;
                     reservation_id = Some(id);
+                }
+                Err(err) if err.code == "SIGNAL_RESERVATION_ALREADY_EXISTS" => {
+                    match db_signal_reservation_for_user_signal(pool, user_id, signal.id).await {
+                        Ok(Some(existing)) if existing.status == "reserved" => {
+                            status = "reservation_already_open".to_string();
+                            balance_after = balance.available;
+                        }
+                        Ok(Some(_)) => {
+                            status = "reservation_already_used".to_string();
+                        }
+                        _ => {
+                            status = "reservation_conflict".to_string();
+                        }
+                    }
                 }
                 Err(err) if err.code == "BALANCE_INSUFFICIENT" => {
                     status = "fee_reserve_insufficient".to_string();
@@ -6510,7 +6623,7 @@ async fn authorize_signal_for_user(
                 }
             }
         }
-        if status == "reserved" && reservation_id.is_some() {
+        if status == "reserved" && state.db.is_none() && reservation_id.is_some() {
             state.reservations.write().await.insert(id, reservation);
         }
     }
@@ -9363,6 +9476,281 @@ async fn db_reserve_signal_fee(
     Ok(after)
 }
 
+async fn db_reserve_or_load_signal_fee(
+    pool: &PgPool,
+    reservation: &SignalReservation,
+) -> Result<BalanceRecord, AppError> {
+    match db_reserve_signal_fee(pool, reservation).await {
+        Ok(balance) => Ok(balance),
+        Err(err) if is_unique_violation(&err) => Err(AppError::conflict(
+            "SIGNAL_RESERVATION_ALREADY_EXISTS",
+            "signal reservation already exists",
+        )),
+        Err(err) => Err(err),
+    }
+}
+
+async fn db_signal_reservation_for_user_signal(
+    pool: &PgPool,
+    user_id: Uuid,
+    signal_id: Uuid,
+) -> Result<Option<SignalReservation>, AppError> {
+    sqlx::query(
+        r#"
+        select id, user_id, signal_id, stake_usdt, expected_profit_usdt, fee_reserve_usdt,
+               status, order_id, execution_report_id, expires_at, created_at, updated_at
+        from signal_reservations
+        where user_id = $1 and signal_id = $2
+        "#,
+    )
+    .bind(user_id)
+    .bind(signal_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| row.map(signal_reservation_from_row))
+    .map_err(AppError::from_sqlx)
+}
+
+fn signal_reservation_from_row(row: sqlx::postgres::PgRow) -> SignalReservation {
+    SignalReservation {
+        id: row.get("id"),
+        user_id: row.get("user_id"),
+        signal_id: row.get("signal_id"),
+        stake_usdt: row.get("stake_usdt"),
+        expected_profit_usdt: row.get("expected_profit_usdt"),
+        fee_reserve_usdt: row.get("fee_reserve_usdt"),
+        status: row.get("status"),
+        order_id: row.get("order_id"),
+        execution_report_id: row.get("execution_report_id"),
+        expires_at: row.get("expires_at"),
+        created_at: row.get("created_at"),
+        updated_at: row.get("updated_at"),
+    }
+}
+
+async fn db_release_stale_signal_reservations(pool: &PgPool) -> Result<usize, AppError> {
+    let now = Utc::now();
+    let no_ack_before = now
+        - Duration::seconds(env_i64(
+            "RESERVATION_NO_ACK_RELEASE_SECONDS",
+            DEFAULT_RESERVATION_NO_ACK_RELEASE_SECONDS,
+            3,
+        ));
+    let rows = sqlx::query(
+        r#"
+        select r.id
+        from signal_reservations r
+        where r.status = 'reserved'
+          and r.order_id is null
+          and not exists (
+            select 1 from event_contract_orders o where o.reservation_id = r.id
+          )
+          and (
+            r.expires_at <= $1
+            or exists (
+              select 1
+              from signal_deliveries d
+              where d.reservation_id = r.id
+                and d.trade_authorized = true
+                and d.delivery_status = 'failed'
+            )
+            or (
+              not exists (
+                select 1
+                from signal_deliveries d
+                where d.reservation_id = r.id
+                  and d.received_at is not null
+              )
+              and exists (
+                select 1
+                from signal_deliveries d
+                where d.reservation_id = r.id
+                  and d.trade_authorized = true
+                  and d.sent_at <= $2
+              )
+            )
+          )
+        order by r.created_at asc
+        limit $3
+        "#,
+    )
+    .bind(now)
+    .bind(no_ack_before)
+    .bind(env_i64(
+        "RESERVATION_RELEASE_LIMIT",
+        DEFAULT_RESERVATION_RELEASE_LIMIT,
+        1,
+    ))
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    let mut released = 0usize;
+    for row in rows {
+        let reservation_id: Uuid = row.get("id");
+        if db_release_signal_reservation(
+            pool,
+            reservation_id,
+            "signal_fee_reserve_release_stale",
+            "expired",
+        )
+        .await?
+        {
+            released += 1;
+        }
+    }
+    Ok(released)
+}
+
+async fn db_release_signal_reservation(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    entry_type: &str,
+    release_status: &str,
+) -> Result<bool, AppError> {
+    db_release_signal_reservation_locked(pool, reservation_id, None, entry_type, release_status)
+        .await
+}
+
+async fn db_release_signal_reservation_for_user(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    user_id: Uuid,
+    entry_type: &str,
+    release_status: &str,
+) -> Result<bool, AppError> {
+    db_release_signal_reservation_locked(
+        pool,
+        reservation_id,
+        Some(user_id),
+        entry_type,
+        release_status,
+    )
+    .await
+}
+
+async fn db_release_signal_reservation_locked(
+    pool: &PgPool,
+    reservation_id: Uuid,
+    user_id: Option<Uuid>,
+    entry_type: &str,
+    release_status: &str,
+) -> Result<bool, AppError> {
+    if release_status != "released" && release_status != "expired" {
+        return Err(AppError::bad_request(
+            "RESERVATION_RELEASE_STATUS_INVALID",
+            "release status must be released or expired",
+        ));
+    }
+    let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+    let reservation_row = sqlx::query(
+        r#"
+        select id, user_id, signal_id, stake_usdt, expected_profit_usdt, fee_reserve_usdt,
+               status, order_id, execution_report_id, expires_at, created_at, updated_at
+        from signal_reservations
+        where id = $1
+        for update
+        "#,
+    )
+    .bind(reservation_id)
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let Some(row) = reservation_row else {
+        tx.rollback().await.map_err(AppError::from_sqlx)?;
+        return Ok(false);
+    };
+    let reservation = signal_reservation_from_row(row);
+    if let Some(expected_user_id) = user_id {
+        if reservation.user_id != expected_user_id {
+            tx.rollback().await.map_err(AppError::from_sqlx)?;
+            return Err(AppError::forbidden(
+                "RESERVATION_USER_MISMATCH",
+                "reservation does not belong to current user",
+            ));
+        }
+    }
+    if reservation.status != "reserved" || reservation.order_id.is_some() {
+        tx.rollback().await.map_err(AppError::from_sqlx)?;
+        return Ok(false);
+    }
+    let order_exists =
+        sqlx::query("select id from event_contract_orders where reservation_id = $1")
+            .bind(reservation.id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(AppError::from_sqlx)?
+            .is_some();
+    if order_exists {
+        tx.rollback().await.map_err(AppError::from_sqlx)?;
+        return Ok(false);
+    }
+    let balance_row = sqlx::query(
+        r#"
+        select available, frozen
+        from balances
+        where user_id = $1
+        for update
+        "#,
+    )
+    .bind(reservation.user_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let available: Decimal = balance_row.get("available");
+    let frozen: Decimal = balance_row.get("frozen");
+    let release = reservation.fee_reserve_usdt.min(frozen);
+    let after_available = available + release;
+    let after_frozen = frozen - release;
+    let now = Utc::now();
+    sqlx::query(
+        r#"
+        update balances
+        set available = $2, frozen = $3, updated_at = $4
+        where user_id = $1
+        "#,
+    )
+    .bind(reservation.user_id)
+    .bind(after_available)
+    .bind(after_frozen)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    sqlx::query(
+        r#"
+        update signal_reservations
+        set status = $2, updated_at = $3
+        where id = $1 and status = 'reserved'
+        "#,
+    )
+    .bind(reservation.id)
+    .bind(release_status)
+    .bind(now)
+    .execute(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    insert_ledger_tx(
+        &mut tx,
+        LedgerEntry {
+            id: Uuid::now_v7(),
+            user_id: reservation.user_id,
+            asset: "USDT".to_string(),
+            entry_type: entry_type.to_string(),
+            amount: release,
+            balance_available_after: after_available,
+            balance_frozen_after: after_frozen,
+            ref_type: "signal_reservation".to_string(),
+            ref_id: reservation.id,
+            idempotency_key: format!("signal_fee_reserve_release:{}", reservation.id),
+            created_at: now,
+        },
+    )
+    .await?;
+    tx.commit().await.map_err(AppError::from_sqlx)?;
+    Ok(true)
+}
+
 async fn db_insert_order_with_reservation_validation(
     pool: &PgPool,
     order: &EventContractOrderRecord,
@@ -11247,6 +11635,26 @@ fn money(value: Decimal) -> String {
 fn decimal_from_f64(value: f64, scale: u32) -> Decimal {
     let scale = scale as usize;
     Decimal::from_str(&format!("{value:.scale$}")).unwrap_or(Decimal::ZERO)
+}
+
+fn reservation_release_entry_type(reason: &str) -> &'static str {
+    match reason {
+        "send_failed" => "signal_fee_reserve_release_send_failed",
+        "stale" => "signal_fee_reserve_release_stale",
+        "missing_suggested_stake" => "signal_fee_reserve_release_missing_stake",
+        "unsupported_direction" => "signal_fee_reserve_release_bad_direction",
+        "missing_root_window" => "signal_fee_reserve_release_no_window",
+        "amount_field_not_found" => "signal_fee_reserve_release_no_amount_field",
+        "amount_input_failed" => "signal_fee_reserve_release_input_failed",
+        "action_button_not_found" => "signal_fee_reserve_release_no_action_button",
+        "action_click_failed" => "signal_fee_reserve_release_action_failed",
+        "confirm_button_not_found" => "signal_fee_reserve_release_no_confirm",
+        _ => "signal_fee_reserve_release_client_failed",
+    }
+}
+
+fn is_unique_violation(err: &AppError) -> bool {
+    err.code == "DATABASE_CONFLICT"
 }
 
 #[derive(Debug)]

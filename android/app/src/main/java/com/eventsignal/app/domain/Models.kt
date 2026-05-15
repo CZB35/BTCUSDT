@@ -209,6 +209,13 @@ data class EventContractOrderRequest(
 )
 
 @Serializable
+data class ReleaseSignalReservationRequest(
+    @SerialName("reservation_id")
+    val reservationId: String,
+    val reason: String? = null,
+)
+
+@Serializable
 data class SignalDeliveryAckRequest(
     @SerialName("delivery_id")
     val deliveryId: String,

@@ -194,6 +194,11 @@ class AutomationForegroundService : Service() {
 
     private fun handleSocketMessage(text: String) {
         if (text.contains("\"connection.closed\"")) {
+            if (text.contains("WS_REPLACED")) {
+                stateStore.saveLastStatus("ws_replaced")
+                webSocket?.cancel()
+                return
+            }
             if (text.contains("AUTH_SESSION_REVOKED") || text.contains("DEVICE_SESSION_REPLACED")) {
                 EventSignalRepository(applicationContext).logout()
                 stateStore.saveConnectionState("auth_required")

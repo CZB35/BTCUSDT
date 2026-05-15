@@ -62,6 +62,9 @@ class EventSignalRepository(context: Context) {
     fun submitEventContractOrder(order: EventContractOrderRequest): Result<Unit> =
         api.submitEventContractOrder(order)
 
+    fun releaseSignalReservation(reservationId: String, reason: String): Result<Unit> =
+        api.releaseSignalReservation(reservationId, reason)
+
     fun ackSignalDelivery(ack: SignalDeliveryAckRequest): Result<Unit> =
         api.ackSignalDelivery(ack)
 

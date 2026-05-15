@@ -41,16 +41,19 @@ class ActionRunner(
 
         val amount = signal.suggestedStake?.trim()?.takeIf { it.isNotBlank() } ?: run {
             stateStore.saveLastStatus("missing_suggested_stake")
+            releaseReservation(signal, "missing_suggested_stake")
             return
         }
         val direction = signal.direction.uppercase()
         if (direction != "UP" && direction != "DOWN") {
             stateStore.saveLastStatus("unsupported_direction:$direction")
+            releaseReservation(signal, "unsupported_direction")
             return
         }
 
         val root = service.rootInActiveWindow ?: run {
             stateStore.saveLastStatus("missing_root_window")
+            releaseReservation(signal, "missing_root_window")
             return
         }
         val nodes = flatten(root)
@@ -76,11 +79,13 @@ class ActionRunner(
         )
         if (amountField == null) {
             stateStore.saveLastStatus("amount_field_not_found")
+            releaseReservation(signal, "amount_field_not_found")
             return
         }
         if (!setText(amountField, amount)) {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "金额输入失败")
             stateStore.saveLastStatus("amount_input_failed")
+            releaseReservation(signal, "amount_input_failed")
             return
         }
 
@@ -88,6 +93,7 @@ class ActionRunner(
         if (button == null) {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到执行按钮")
             stateStore.saveLastStatus("action_button_not_found")
+            releaseReservation(signal, "action_button_not_found")
             return
         }
         if (click(button)) {
@@ -107,12 +113,23 @@ class ActionRunner(
                 stateStore.saveLastStatus("confirmed:$amount:${screen.confidence}")
             } else {
                 stateStore.saveLastStatus("confirm_button_not_found:$amount")
+                releaseReservation(signal, "confirm_button_not_found")
                 saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到确认按钮")
             }
         } else {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "按钮点击失败")
             stateStore.saveLastStatus("action_click_failed")
+            releaseReservation(signal, "action_click_failed")
         }
+    }
+
+    private fun releaseReservation(signal: SignalSnapshot, reason: String) {
+        val reservationId = signal.reservationId?.trim()?.takeIf { it.isNotBlank() } ?: return
+        stateStore.markExecuted(signal.id ?: reservationId)
+        repository.releaseSignalReservation(reservationId, reason)
+            .onFailure {
+                stateStore.saveLastStatus("reservation_release_failed:${it.javaClass.simpleName}")
+            }
     }
 
     private fun pauseForUnauthorizedSignal(signal: SignalSnapshot) {

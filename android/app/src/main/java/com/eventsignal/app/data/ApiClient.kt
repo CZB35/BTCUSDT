@@ -13,6 +13,7 @@ import com.eventsignal.app.domain.ExchangeCredentialResponse
 import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.ExecutionReportRequest
 import com.eventsignal.app.domain.RefreshRequest
+import com.eventsignal.app.domain.ReleaseSignalReservationRequest
 import com.eventsignal.app.domain.SignalDeliveryAckRequest
 import com.eventsignal.app.domain.SignalSnapshot
 import kotlinx.serialization.encodeToString
@@ -199,6 +200,19 @@ class ApiClient(context: Context) {
         val request = signedRequest("/v1/event-contract-orders").post(body).build()
         http.newCall(request).execute().use { response ->
             if (!response.isSuccessful) error("event contract order failed: ${response.code}")
+        }
+    }
+
+    fun releaseSignalReservation(reservationId: String, reason: String): Result<Unit> = runCatching {
+        val body = json.encodeToString(
+            ReleaseSignalReservationRequest(
+                reservationId = reservationId,
+                reason = reason,
+            ),
+        ).toRequestBody(mediaType)
+        val request = signedRequest("/v1/signal-reservations/release").post(body).build()
+        http.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("release reservation failed: ${response.code}")
         }
     }
 
