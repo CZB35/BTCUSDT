@@ -12,6 +12,7 @@ import com.eventsignal.app.domain.ExchangeCredentialRequest
 import com.eventsignal.app.domain.ExchangeCredentialResponse
 import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.ExecutionReportRequest
+import com.eventsignal.app.domain.RefreshRequest
 import com.eventsignal.app.domain.SignalDeliveryAckRequest
 import com.eventsignal.app.domain.SignalSnapshot
 import kotlinx.serialization.encodeToString
@@ -64,7 +65,21 @@ class ApiClient(context: Context) {
             editor.apply()
         }
 
-    fun clearAppSessionKey() {
+    private var refreshToken: String?
+        get() = prefs.getString("refresh_token", null)
+        set(value) {
+            val editor = prefs.edit()
+            if (value.isNullOrBlank()) {
+                editor.remove("refresh_token")
+            } else {
+                editor.putString("refresh_token", value)
+            }
+            editor.apply()
+        }
+
+    fun clearAuth() {
+        accessToken = null
+        refreshToken = null
         appSessionKey = null
     }
 
@@ -73,6 +88,26 @@ class ApiClient(context: Context) {
 
     fun login(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         auth("/v1/auth/login", walletAddress, password, deviceFingerprint)
+
+    fun refreshSession(): Result<AuthResponse> = runCatching {
+        val token = refreshToken?.trim().orEmpty()
+        if (token.isBlank()) error("refresh token is required")
+        val body = json.encodeToString(RefreshRequest(token)).toRequestBody(mediaType)
+        val request = Request.Builder()
+            .url("${baseUrl.trimEnd('/')}/v1/auth/refresh")
+            .post(body)
+            .build()
+        http.newCall(request).execute().use { response ->
+            val responseBody = response.body?.string().orEmpty()
+            if (!response.isSuccessful) {
+                if (isAuthInvalid(responseBody)) {
+                    clearAuth()
+                }
+                error(friendlyError(responseBody) ?: "刷新登录失败：HTTP ${response.code}")
+            }
+            json.decodeFromString<AuthResponse>(responseBody).also(::saveAuth)
+        }
+    }
 
     fun getLatestSignal(): Result<SignalSnapshot> = runCatching {
         val request = signedRequest("/v1/signals/latest").get().build()
@@ -221,12 +256,15 @@ class ApiClient(context: Context) {
             http.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) error(httpError("登录失败", response))
                 json.decodeFromString<AuthResponse>(response.body?.string().orEmpty())
-                    .also {
-                        accessToken = it.accessToken
-                        appSessionKey = it.appSessionKey
-                    }
+                    .also(::saveAuth)
             }
         }
+
+    private fun saveAuth(response: AuthResponse) {
+        accessToken = response.accessToken
+        refreshToken = response.refreshToken
+        appSessionKey = response.appSessionKey
+    }
 
     private fun httpError(prefix: String, response: okhttp3.Response): String {
         val raw = response.body?.string().orEmpty()
@@ -238,12 +276,19 @@ class ApiClient(context: Context) {
         raw.contains("AUTH_PASSWORD_WEAK", ignoreCase = true) -> "密码至少 6 位"
         raw.contains("AUTH_INVALID_CREDENTIALS", ignoreCase = true) -> "钱包地址或密码错误"
         raw.contains("AUTH_SESSION_REVOKED", ignoreCase = true) -> "账号会话已失效，请重新登录"
+        raw.contains("AUTH_TOKEN_EXPIRED", ignoreCase = true) -> "登录已过期，请重新登录"
+        raw.contains("AUTH_INVALID_REFRESH_TOKEN", ignoreCase = true) -> "登录已过期，请重新登录"
         raw.contains("AUTH_ACCOUNT_EXISTS", ignoreCase = true) -> "该钱包已注册，请直接登录"
         raw.contains("ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE", ignoreCase = true) -> "该账号已在其他设备登录"
         raw.contains("CLIENT_TYPE_FORBIDDEN", ignoreCase = true) -> "当前账号类型不能登录 App"
         raw.contains("RATE_LIMITED", ignoreCase = true) -> "请求过快，请稍后再试"
         else -> null
     }
+
+    private fun isAuthInvalid(raw: String): Boolean =
+        raw.contains("AUTH_INVALID_REFRESH_TOKEN", ignoreCase = true) ||
+            raw.contains("AUTH_SESSION_REVOKED", ignoreCase = true) ||
+            raw.contains("DEVICE_SESSION_REPLACED", ignoreCase = true)
 }
 
 private fun appSignature(key: String, timestamp: String, nonce: String): String {

@@ -44,6 +44,7 @@ class AutomationForegroundService : Service() {
             runtimeNotification(this, "Automation active", "Monitoring authorized action state"),
         )
         AutomationRuntime.running = true
+        startSessionRefreshLoop()
         startSignalSocket()
         startRuntimeSummaryLoop()
         startPendingOrderReportLoop()
@@ -51,6 +52,7 @@ class AutomationForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         AutomationRuntime.running = true
+        startSessionRefreshLoop()
         startSignalSocket()
         return START_STICKY
     }
@@ -77,6 +79,8 @@ class AutomationForegroundService : Service() {
         scope.launch {
             val repository = EventSignalRepository(applicationContext)
             while (isActive) {
+                repository.refreshSession()
+                    .onFailure { reportSessionRefreshFailure(it, "session_refresh_before_ws_failed") }
                 repository.loadAutomationSettings()
                 val requestResult = repository.websocketRequest()
                 val request = requestResult.getOrNull()
@@ -124,6 +128,27 @@ class AutomationForegroundService : Service() {
                 }
             }
         }
+    }
+
+    private var sessionRefreshLoopStarted = false
+
+    private fun startSessionRefreshLoop() {
+        if (sessionRefreshLoopStarted) return
+        sessionRefreshLoopStarted = true
+        scope.launch {
+            val repository = EventSignalRepository(applicationContext)
+            while (isActive && AutomationRuntime.running) {
+                delay(6 * 60 * 60 * 1_000L)
+                if (!isActive || !AutomationRuntime.running) break
+                repository.refreshSession()
+                    .onFailure { reportSessionRefreshFailure(it, "session_refresh_failed") }
+            }
+        }
+    }
+
+    private fun reportSessionRefreshFailure(error: Throwable, prefix: String) {
+        if (error.message == "refresh token is required") return
+        stateStore.saveLastStatus("$prefix:${error.javaClass.simpleName}")
     }
 
     private var summaryLoopStarted = false

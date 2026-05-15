@@ -28,7 +28,11 @@ class ScreenRecognitionService {
             packageName = packageName,
             screenName = inferScreenName(structure, texts),
             confidence = confidence,
-            safeToAct = structure.isEventContractPage && confidence >= profile.minRecognitionConfidence,
+            safeToAct = structure.isEventContractPage &&
+                amountFieldFound &&
+                upButtonFound &&
+                downButtonFound &&
+                confidence >= profile.minRecognitionConfidence,
             pageKeywordHits = pageKeywordHits,
             amountFieldFound = amountFieldFound,
             upButtonFound = upButtonFound,
@@ -87,11 +91,14 @@ class ScreenRecognitionService {
             allText.contains("EVENTCONTRACT", ignoreCase = true)
         val hasSymbol = allText.contains("BTCUSDT", ignoreCase = true)
         val hasTimeUnit = allText.contains("时间单位") ||
-            listOf("1分", "5分", "10分钟", "15分", "30分", "1小时", "10M").any { token ->
+            listOf("1分", "5分", "10分钟", "10分钟", "15分", "30分", "1小时", "10M", "10MIN").any { token ->
                 allText.contains(token, ignoreCase = true)
             }
         val hasAmountArea = amountFieldFound ||
             allText.contains("数量") ||
+            allText.contains("数量USDT") ||
+            allText.contains("可用") ||
+            allText.contains("USDT") ||
             allText.contains("AMOUNT", ignoreCase = true) ||
             allText.contains("STAKE", ignoreCase = true)
         val hasDirectionArea = (upButtonFound && downButtonFound) ||
@@ -129,12 +136,36 @@ class ScreenRecognitionService {
 
     private fun findAmountField(nodes: List<NodeSnapshot>, profile: AutomationProfile): NodeSnapshot? {
         val editable = nodes.filter { it.isEditable && it.isEnabled }
-        if (editable.isEmpty()) return null
-
-        return editable.firstOrNull { node ->
+        editable.firstOrNull { node ->
             profile.amountFieldHints.any { hint -> node.textForMatching.contains(hint, ignoreCase = true) }
-        } ?: editable.firstOrNull()
+        }?.let { return it }
+        editable.firstOrNull()?.let { return it }
+
+        val amountLabelIndex = nodes.indexOfFirst { node -> isExplicitAmountLabel(node.textForMatching) }
+        if (amountLabelIndex >= 0) {
+            nodes.drop(amountLabelIndex + 1).take(12).firstOrNull { node ->
+                node.isEnabled &&
+                    (node.isEditable ||
+                        node.isClickable ||
+                        node.parentClickable ||
+                        node.isFocusable ||
+                        node.className.contains("EditText", ignoreCase = true)) &&
+                    !node.textForMatching.contains("+") &&
+                    !node.textForMatching.contains("上涨") &&
+                    !node.textForMatching.contains("下跌")
+            }?.let { return it }
+        }
+        return nodes.firstOrNull { node ->
+            node.isEnabled &&
+                (node.isEditable || node.isFocusable || node.className.contains("EditText", ignoreCase = true)) &&
+                node.textForMatching.contains("USDT", ignoreCase = true)
+        }
     }
+
+    private fun isExplicitAmountLabel(text: String): Boolean =
+        listOf("数量", "金额", "下注", "投入", "Amount", "Stake").any { keyword ->
+            text.contains(keyword, ignoreCase = true)
+        }
 
     private fun findDirectionButton(nodes: List<NodeSnapshot>, keywords: List<String>): NodeSnapshot? =
         nodes.firstOrNull { node ->
@@ -147,6 +178,7 @@ class ScreenRecognitionService {
         val normalizedTexts = texts.map { it.replace(",", "").replace("\\s+".toRegex(), " ").trim() }
         val joined = normalizedTexts.joinToString(" ")
         val directPatterns = listOf(
+            Regex("""可用\s*U\s*本\s*位\s*合\s*约\s*([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
             Regex("""U\s*本\s*位\s*合\s*约\s*([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE),
             Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT\s*U\s*本\s*位\s*合\s*约""", RegexOption.IGNORE_CASE),
         )
@@ -156,7 +188,7 @@ class ScreenRecognitionService {
 
         normalizedTexts.forEachIndexed { index, text ->
             if (text.contains("U本位合约") || text.contains("U 本位合约")) {
-                val local = normalizedTexts.drop(index).take(4).joinToString(" ")
+                val local = normalizedTexts.drop((index - 1).coerceAtLeast(0)).take(6).joinToString(" ")
                 Regex("""([0-9]+(?:\.[0-9]+)?)\s*USDT""", RegexOption.IGNORE_CASE)
                     .find(local)
                     ?.groupValues
@@ -175,9 +207,11 @@ class ScreenRecognitionService {
                 hintText?.toString(),
                 viewIdResourceName,
             ).joinToString(" "),
+            className = className?.toString().orEmpty(),
             isEditable = isEditable,
             isEnabled = isEnabled,
             isClickable = isClickable,
+            isFocusable = isFocusable,
             parentClickable = parent?.isClickable == true,
         )
 
@@ -194,14 +228,16 @@ private data class EventContractStructure(
     val hasPaymentArea: Boolean,
 ) {
     val isEventContractPage: Boolean =
-        hasEventTitle && hasSymbol && hasTimeUnit && hasAmountArea && hasDirectionArea
+        hasSymbol && hasTimeUnit && hasAmountArea && hasDirectionArea && (hasEventTitle || hasPaymentArea)
 }
 
 private data class NodeSnapshot(
     val textForMatching: String,
+    val className: String,
     val isEditable: Boolean,
     val isEnabled: Boolean,
     val isClickable: Boolean,
+    val isFocusable: Boolean,
     val parentClickable: Boolean,
 )
 

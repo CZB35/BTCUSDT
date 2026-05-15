@@ -76,6 +76,7 @@ const DEFAULT_DB_MAX_CONNECTIONS: u32 = 40;
 const DEFAULT_BSC_SYNC_INTERVAL_SECONDS: u64 = 6;
 const DEFAULT_BSC_DEPOSIT_SYNC_LIMIT: i64 = 100;
 const DEFAULT_BSC_RPC_TIMEOUT_SECONDS: u64 = 8;
+const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUERY_LIMIT: i64 = 50;
 const MAX_QUERY_LIMIT: i64 = 500;
 const DEFAULT_PREDICTION_INTERVAL_SECONDS: u64 = 1;
@@ -731,6 +732,9 @@ struct AdminUserRecord {
     wallet_address: String,
     status: String,
     active_device_fingerprint: Option<String>,
+    balance_available: String,
+    balance_frozen: String,
+    balance_updated_at: Option<DateTime<Utc>>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
 }
@@ -742,6 +746,9 @@ impl From<UserRecord> for AdminUserRecord {
             wallet_address: user.wallet_address,
             status: user.status,
             active_device_fingerprint: user.active_device_fingerprint,
+            balance_available: money(Decimal::ZERO),
+            balance_frozen: money(Decimal::ZERO),
+            balance_updated_at: None,
             created_at: user.created_at,
             updated_at: user.updated_at,
         }
@@ -1364,6 +1371,7 @@ struct WithdrawalRecord {
 #[derive(Clone, Serialize)]
 struct ExchangeCredentialStatus {
     provider: String,
+    api_key: Option<String>,
     connected: bool,
     can_read_account: bool,
     verification_status: String,
@@ -1739,7 +1747,7 @@ struct SignalDeliveryAckRequest {
 #[derive(Deserialize)]
 struct ExchangeCredentialRequest {
     api_key: String,
-    api_secret: String,
+    api_secret: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -2499,15 +2507,26 @@ async fn refresh_token(
             "session is no longer active",
         ));
     }
-    Ok(Json(
-        create_session(
-            &state,
-            session.user_id,
-            &session.device_fingerprint,
-            session.client_type,
-        )
-        .await?,
-    ))
+    let response = create_session(
+        &state,
+        session.user_id,
+        &session.device_fingerprint,
+        session.client_type,
+    )
+    .await?;
+    state
+        .sessions
+        .write()
+        .await
+        .retain(|_, session| session.refresh_token != req.refresh_token);
+    if let Some(pool) = state.db.as_ref() {
+        sqlx::query("delete from auth_sessions where refresh_token = $1")
+            .bind(&req.refresh_token)
+            .execute(pool)
+            .await
+            .map_err(AppError::from_sqlx)?;
+    }
+    Ok(Json(response))
 }
 
 async fn stats(State(state): State<SharedState>) -> Json<StatsResponse> {
@@ -2825,7 +2844,37 @@ async fn save_binance_credentials(
 ) -> Result<Json<ExchangeCredentialResponse>, AppError> {
     let user_id = require_android_user(&state, &headers).await?;
     let api_key = normalize_api_key(&req.api_key)?;
-    let api_secret = normalize_api_secret(&req.api_secret)?;
+    let api_secret = match req
+        .api_secret
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => normalize_api_secret(value)?,
+        None => {
+            let pool = state.db.as_ref().ok_or_else(|| {
+                AppError::bad_request(
+                    "DATABASE_REQUIRED",
+                    "exchange credential storage requires PostgreSQL",
+                )
+            })?;
+            let credentials = db_exchange_credentials(pool, user_id)
+                .await?
+                .ok_or_else(|| {
+                    AppError::bad_request(
+                        "BINANCE_API_SECRET_REQUIRED",
+                        "api_secret is required before credentials are saved",
+                    )
+                })?;
+            if credentials.api_key != api_key {
+                return Err(AppError::bad_request(
+                    "BINANCE_API_KEY_MISMATCH",
+                    "api_key does not match saved credentials",
+                ));
+            }
+            decrypt_secret(&credentials.api_secret_ciphertext)?
+        }
+    };
     let snapshot = binance_account_access(&api_key, &api_secret).await?;
     let now = Utc::now();
     let ciphertext = encrypt_secret(&api_secret)?;
@@ -3916,6 +3965,7 @@ async fn verify_bsc_refund(
 fn default_exchange_status() -> ExchangeCredentialStatus {
     ExchangeCredentialStatus {
         provider: BINANCE_PROVIDER.to_string(),
+        api_key: None,
         connected: false,
         can_read_account: false,
         verification_status: "missing".to_string(),
@@ -5631,7 +5681,7 @@ async fn create_session(
     let access_token = new_token("access");
     let refresh_token = new_token("refresh");
     let app_session_key = new_token("app-key");
-    let expires_in = 3600;
+    let expires_in = USER_SESSION_TTL_SECONDS;
     let expires_at = Utc::now() + Duration::seconds(expires_in);
     if let Some(pool) = state.db.as_ref() {
         let session_version = db_user_session_version(pool, user_id).await?;
@@ -7777,7 +7827,7 @@ async fn db_exchange_credential_status(
 ) -> Result<Option<ExchangeCredentialStatus>, AppError> {
     sqlx::query(
         r#"
-        select c.provider, c.can_read_account, c.verification_status,
+        select c.provider, c.api_key, c.can_read_account, c.verification_status,
                c.balance_available_usdt, c.balance_wallet_usdt,
                p.observed_balance_usdt, p.account_match_status, p.account_balance_delta_usdt,
                c.balance_updated_at,
@@ -7794,6 +7844,7 @@ async fn db_exchange_credential_status(
     .map(|row| {
         row.map(|row| ExchangeCredentialStatus {
             provider: row.get("provider"),
+            api_key: Some(row.get("api_key")),
             connected: true,
             can_read_account: row.get("can_read_account"),
             verification_status: row.get("verification_status"),
@@ -10469,17 +10520,22 @@ async fn db_admin_users(
     let status = status_filter(query);
     sqlx::query(
         r#"
-        select id, wallet_address, password_hash, status, active_device_fingerprint, session_version, created_at, updated_at
-        from users
-        where ($1::text is null or status = $1)
+        select u.id, u.wallet_address, u.status, u.active_device_fingerprint,
+               coalesce(b.available, 0) as balance_available,
+               coalesce(b.frozen, 0) as balance_frozen,
+               b.updated_at as balance_updated_at,
+               u.created_at, u.updated_at
+        from users u
+        left join balances b on b.user_id = u.id and b.asset = 'USDT'
+        where ($1::text is null or u.status = $1)
           and (
             $2::text is null
-            or wallet_address ilike $2 escape '\'
-            or id::text ilike $2 escape '\'
-            or active_device_fingerprint ilike $2 escape '\'
-            or status ilike $2 escape '\'
+            or u.wallet_address ilike $2 escape '\'
+            or u.id::text ilike $2 escape '\'
+            or u.active_device_fingerprint ilike $2 escape '\'
+            or u.status ilike $2 escape '\'
           )
-        order by created_at desc
+        order by u.created_at desc
         limit $3 offset $4
         "#,
     )
@@ -10491,8 +10547,17 @@ async fn db_admin_users(
     .await
     .map(|rows| {
         rows.into_iter()
-            .map(user_from_row)
-            .map(AdminUserRecord::from)
+            .map(|row| AdminUserRecord {
+                id: row.get("id"),
+                wallet_address: row.get("wallet_address"),
+                status: row.get("status"),
+                active_device_fingerprint: row.get("active_device_fingerprint"),
+                balance_available: money(row.get("balance_available")),
+                balance_frozen: money(row.get("balance_frozen")),
+                balance_updated_at: row.get("balance_updated_at"),
+                created_at: row.get("created_at"),
+                updated_at: row.get("updated_at"),
+            })
             .collect()
     })
     .map_err(AppError::from_sqlx)

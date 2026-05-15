@@ -218,12 +218,30 @@ class ActionRunner(
         profile: AutomationProfile,
     ): AccessibilityNodeInfo? {
         val editable = nodes.filter { it.isEditable && it.isEnabled }
-        if (editable.isEmpty()) return null
-
-        return editable.firstOrNull { node ->
+        editable.firstOrNull { node ->
             val label = node.nodeText()
             profile.amountFieldHints.any { hint -> label.contains(hint, ignoreCase = true) }
-        } ?: editable.firstOrNull()
+        }?.let { return it }
+        editable.firstOrNull()?.let { return it }
+
+        val amountLabelIndex = nodes.indexOfFirst { node ->
+            val label = node.nodeText()
+            profile.amountFieldHints.any { hint -> label.contains(hint, ignoreCase = true) }
+        }
+        if (amountLabelIndex >= 0) {
+            nodes.drop(amountLabelIndex + 1).take(14).firstOrNull { node ->
+                node.isEnabled &&
+                    (node.isEditable || node.isClickable || node.isFocusable || node.className?.contains("EditText", ignoreCase = true) == true) &&
+                    !node.nodeText().contains("+") &&
+                    !node.nodeText().contains("上涨") &&
+                    !node.nodeText().contains("下跌")
+            }?.let { return it }
+        }
+        return nodes.firstOrNull { node ->
+            node.isEnabled &&
+                (node.isEditable || node.isFocusable || node.className?.contains("EditText", ignoreCase = true) == true) &&
+                node.nodeText().contains("USDT", ignoreCase = true)
+        }
     }
 
     private fun findDirectionButton(
@@ -243,6 +261,8 @@ class ActionRunner(
         val args = Bundle().apply {
             putCharSequence(AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE, value)
         }
+        if (node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)) return true
+        click(node)
         return node.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
     }
 

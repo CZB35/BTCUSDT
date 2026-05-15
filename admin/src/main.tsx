@@ -118,6 +118,9 @@ type UserRecord = {
   wallet_address: string;
   status: string;
   active_device_fingerprint?: string | null;
+  balance_available: string;
+  balance_frozen: string;
+  balance_updated_at?: string | null;
   created_at: string;
   updated_at: string;
 };
@@ -1344,12 +1347,14 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
           </div>
         </div>
         <DataTable
-          columns={["注册时间", "钱包地址", "状态", "当前设备", "更新时间"]}
+          columns={["注册时间", "钱包地址", "可用余额", "冻结余额", "状态", "当前设备", "更新时间"]}
           rows={users.map((user) => ({
             id: user.id,
             cells: [
               shortTime(user.created_at),
               shortId(user.wallet_address, 10),
+              `${formatNumber(user.balance_available)} USDT`,
+              `${formatNumber(user.balance_frozen)} USDT`,
               user.status,
               user.active_device_fingerprint ? shortId(user.active_device_fingerprint, 14) : "-",
               shortTime(user.updated_at)
@@ -1357,6 +1362,9 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
             details: {
               用户ID: user.id,
               钱包地址: user.wallet_address,
+              可用余额: `${formatNumber(user.balance_available)} USDT`,
+              冻结余额: `${formatNumber(user.balance_frozen)} USDT`,
+              余额更新时间: shortTime(user.balance_updated_at),
               状态: user.status,
               当前设备: user.active_device_fingerprint || "-",
               注册时间: shortTime(user.created_at),

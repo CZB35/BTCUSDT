@@ -42,7 +42,13 @@ class EventSignalRepository(context: Context) {
 
     fun saveExchangeCredentials(apiKey: String, apiSecret: String): Result<ExchangeCredentialResponse> =
         api.saveExchangeCredentials(apiKey, apiSecret)
-            .onSuccess { saveLocalExchangeCredentials(apiKey, apiSecret) }
+            .onSuccess {
+                if (apiSecret.isNotBlank()) {
+                    saveLocalExchangeCredentials(apiKey, apiSecret)
+                } else {
+                    saveLocalExchangeApiKey(apiKey)
+                }
+            }
 
     fun saveAutomationSettings(settings: AutomationSettings): Result<AutomationSettings> =
         api.saveAutomationSettings(settings).onSuccess(stateStore::saveSettings)
@@ -71,6 +77,9 @@ class EventSignalRepository(context: Context) {
     fun login(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         api.login(walletAddress, password, deviceFingerprint)
 
+    fun refreshSession(): Result<AuthResponse> =
+        api.refreshSession()
+
     fun dappUrl(): String = "${api.baseUrl}/dapp/?return_uri=eventsignal://wallet"
 
     fun accessToken(): String? = api.accessToken
@@ -85,6 +94,12 @@ class EventSignalRepository(context: Context) {
         prefs.edit()
             .putString("binance_api_key", encryptLocalSecret(apiKey.trim()))
             .putString("binance_api_secret", encryptLocalSecret(apiSecret.trim()))
+            .apply()
+    }
+
+    private fun saveLocalExchangeApiKey(apiKey: String) {
+        prefs.edit()
+            .putString("binance_api_key", encryptLocalSecret(apiKey.trim()))
             .apply()
     }
 
@@ -126,7 +141,6 @@ class EventSignalRepository(context: Context) {
     }
 
     fun logout() {
-        api.accessToken = null
-        api.clearAppSessionKey()
+        api.clearAuth()
     }
 }

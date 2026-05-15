@@ -135,18 +135,10 @@ class FloatingSignalService : Service() {
                 stopSelf()
             }
         }
-        val calibrate = Button(this).apply {
-            text = "\u8bc6\u522b"
-            styleOverlayButton()
-            setOnClickListener {
-                AutomationRuntime.requestCalibration()
-            }
-        }
         container.addView(title)
         container.addView(signal)
         container.addView(status)
         actions.addView(toggle)
-        actions.addView(calibrate)
         actions.addView(stop)
         container.addView(actions)
         attachDrag(container)

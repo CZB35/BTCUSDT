@@ -188,9 +188,27 @@ function App() {
     const res = await fetch(`${API_BASE}${path}`, { ...options, headers: { ...headers(nextToken), ...(options.headers || {}) } });
     if (!res.ok) {
       const text = await res.text();
+      if (isAuthExpired(text)) {
+        clearAuth("登录已过期，请重新登录");
+      }
       throw new Error(friendlyErrorFromBody(text, res.status));
     }
     return res.json();
+  }
+
+  function clearAuth(message: string) {
+    localStorage.removeItem(TOKEN_KEY);
+    setToken("");
+    setBalance(null);
+    setInstructions(null);
+    setDeposits([]);
+    setWithdrawals([]);
+    setOrders([]);
+    setReports([]);
+    setSettlements([]);
+    setLedger([]);
+    setReferral(null);
+    setStatus(message);
   }
 
   async function login(path: "/v1/auth/login" | "/v1/auth/register") {
@@ -864,6 +882,9 @@ function friendlyErrorFromBody(body: string, status: number) {
     const parsed = JSON.parse(body) as { code?: string; message?: string };
     if (parsed.code === "AUTH_PASSWORD_WEAK") return "密码至少 6 位";
     if (parsed.code === "AUTH_INVALID_CREDENTIALS") return "账号或密码错误，未注册请点注册";
+    if (parsed.code === "AUTH_TOKEN_EXPIRED" || parsed.code === "AUTH_INVALID_TOKEN" || parsed.code === "AUTH_SESSION_REVOKED") {
+      return "登录已过期，请重新登录";
+    }
     if (parsed.code === "AUTH_ACCOUNT_EXISTS") return "该钱包已注册，请直接登录";
     if (parsed.code === "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE") return "该账号已在其他设备登录";
     if (parsed.code === "WALLET_NOT_BOUND") return "请先签名绑定钱包";
@@ -872,6 +893,15 @@ function friendlyErrorFromBody(body: string, status: number) {
     if (body.trim()) return body.trim();
   }
   return `请求失败 ${status}`;
+}
+
+function isAuthExpired(body: string) {
+  try {
+    const parsed = JSON.parse(body) as { code?: string; message?: string };
+    return ["AUTH_TOKEN_EXPIRED", "AUTH_INVALID_TOKEN", "AUTH_SESSION_REVOKED"].includes(parsed.code || "");
+  } catch {
+    return /AUTH_TOKEN_EXPIRED|AUTH_INVALID_TOKEN|AUTH_SESSION_REVOKED|token expired|invalid token|session is no longer active/i.test(body);
+  }
 }
 
 function loadPendingDeposit(): PendingDeposit | null {

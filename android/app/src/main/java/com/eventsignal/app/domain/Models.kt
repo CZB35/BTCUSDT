@@ -51,8 +51,16 @@ data class AuthResponse(
 )
 
 @Serializable
+data class RefreshRequest(
+    @SerialName("refresh_token")
+    val refreshToken: String,
+)
+
+@Serializable
 data class ExchangeCredentialStatus(
     val provider: String = "binance_futures",
+    @SerialName("api_key")
+    val apiKey: String? = null,
     val connected: Boolean = false,
     @SerialName("can_read_account")
     val canReadAccount: Boolean = false,

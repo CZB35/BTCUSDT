@@ -66,7 +66,6 @@ import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.ExchangeCredentialStatus
 import com.eventsignal.app.domain.SignalSnapshot
 import com.eventsignal.app.service.AutomationForegroundService
-import com.eventsignal.app.service.AutomationRuntime
 import com.eventsignal.app.service.FloatingSignalService
 import com.eventsignal.app.service.SignalForegroundService
 import com.eventsignal.app.ui.BinanceYellow
@@ -131,6 +130,7 @@ private fun MainScreen(repository: EventSignalRepository) {
     var exchangeStatus by remember { mutableStateOf(ExchangeCredentialStatus()) }
     var binanceApiKey by remember { mutableStateOf(repository.savedExchangeApiKey()) }
     var binanceApiSecret by remember { mutableStateOf(repository.savedExchangeApiSecret()) }
+    var showSettings by remember { mutableStateOf(false) }
     val walletDeepLink = (context as? Activity)?.intent?.data?.getQueryParameter("address").orEmpty()
     val isLoggedIn = accessToken.isNotBlank()
     val tradingAccountReady = exchangeReady(exchangeStatus)
@@ -150,6 +150,9 @@ private fun MainScreen(repository: EventSignalRepository) {
         signal = nextSignal
         automationSettings = nextSettings
         exchangeStatus = nextExchangeStatus
+        if (binanceApiKey.isBlank()) {
+            binanceApiKey = nextExchangeStatus.apiKey.orEmpty()
+        }
         debugState = stateStore.loadDebugState()
         connectionState = stateStore.loadConnectionState()
         lastSocketStatus = stateStore.loadLastStatus()
@@ -161,6 +164,19 @@ private fun MainScreen(repository: EventSignalRepository) {
         scope.launch(Dispatchers.IO) {
             repository.saveAutomationSettings(next)
         }
+    }
+
+    fun logout() {
+        repository.logout()
+        context.stopService(Intent(context, SignalForegroundService::class.java))
+        context.stopService(Intent(context, AutomationForegroundService::class.java))
+        context.stopService(Intent(context, FloatingSignalService::class.java))
+        accessToken = ""
+        automationRunning = false
+        exchangeStatus = ExchangeCredentialStatus()
+        signal = SignalSnapshot.empty()
+        showSettings = false
+        status = "已退出登录"
     }
 
     LaunchedEffect(Unit) {
@@ -197,8 +213,8 @@ private fun MainScreen(repository: EventSignalRepository) {
                     actionIconContentColor = BodyOnDark,
                 ),
                 actions = {
-                    IconButton(onClick = { context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)) }) {
-                        Icon(Icons.Default.Settings, contentDescription = "自动化权限")
+                    IconButton(onClick = { showSettings = !showSettings }) {
+                        Icon(Icons.Default.Settings, contentDescription = "设置")
                     }
                     IconButton(onClick = {
                         status = "刷新中"
@@ -221,61 +237,68 @@ private fun MainScreen(repository: EventSignalRepository) {
                     .padding(16.dp),
                 verticalArrangement = Arrangement.spacedBy(12.dp),
             ) {
-                AuthCard(
-                    accessToken = accessToken,
-                    walletAddress = walletAddress,
-                    password = password,
-                    status = status,
-                    onWalletAddressChange = { walletAddress = it },
-                    onPasswordChange = { password = it },
-                    onOpenDapp = {
-                        context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(repository.dappUrl())))
-                        status = "已打开充值 DApp"
-                    },
-                    onLogin = {
-                        val device = deviceFingerprint(context)
-                        scope.launch {
-                            status = "登录中"
-                            val result = withContext(Dispatchers.IO) {
-                                repository.login(walletAddress, password, device)
+                if (showSettings) {
+                    SettingsCard(
+                        loggedIn = isLoggedIn,
+                        status = status,
+                        onAccessibilityPermission = {
+                            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                        },
+                        onOverlayPermission = {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                            context.startActivity(intent)
+                        },
+                        onLogout = ::logout,
+                    )
+                }
+                if (!isLoggedIn) {
+                    AuthCard(
+                        walletAddress = walletAddress,
+                        password = password,
+                        status = status,
+                        onWalletAddressChange = { walletAddress = it },
+                        onPasswordChange = { password = it },
+                        onOpenDapp = {
+                            context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(repository.dappUrl())))
+                            status = "已打开充值 DApp"
+                        },
+                        onLogin = {
+                            val device = deviceFingerprint(context)
+                            scope.launch {
+                                status = "登录中"
+                                val result = withContext(Dispatchers.IO) {
+                                    repository.login(walletAddress, password, device)
+                                }
+                                result.onSuccess {
+                                    accessToken = it.accessToken
+                                    status = "登录成功"
+                                    refresh()
+                                }.onFailure {
+                                    status = "登录失败：${it.message ?: it.javaClass.simpleName}"
+                                }
                             }
-                            result.onSuccess {
-                                accessToken = it.accessToken
-                                status = "登录成功"
-                                refresh()
-                            }.onFailure {
-                                status = "登录失败：${it.message ?: it.javaClass.simpleName}"
+                        },
+                        onRegister = {
+                            val device = deviceFingerprint(context)
+                            scope.launch {
+                                status = "注册中"
+                                val result = withContext(Dispatchers.IO) {
+                                    repository.register(walletAddress, password, device)
+                                }
+                                result.onSuccess {
+                                    accessToken = it.accessToken
+                                    status = "注册并登录成功"
+                                    refresh()
+                                }.onFailure {
+                                    status = "注册失败：${it.message ?: it.javaClass.simpleName}"
+                                }
                             }
-                        }
-                    },
-                    onRegister = {
-                        val device = deviceFingerprint(context)
-                        scope.launch {
-                            status = "注册中"
-                            val result = withContext(Dispatchers.IO) {
-                                repository.register(walletAddress, password, device)
-                            }
-                            result.onSuccess {
-                                accessToken = it.accessToken
-                                status = "注册并登录成功"
-                                refresh()
-                            }.onFailure {
-                                status = "注册失败：${it.message ?: it.javaClass.simpleName}"
-                            }
-                        }
-                    },
-                    onLogout = {
-                        repository.logout()
-                        context.stopService(Intent(context, SignalForegroundService::class.java))
-                        context.stopService(Intent(context, AutomationForegroundService::class.java))
-                        context.stopService(Intent(context, FloatingSignalService::class.java))
-                        accessToken = ""
-                        automationRunning = false
-                        exchangeStatus = ExchangeCredentialStatus()
-                        signal = SignalSnapshot.empty()
-                        status = "已退出登录"
-                    },
-                )
+                        },
+                    )
+                }
                 if (isLoggedIn) {
                     ExchangeCard(
                         status = exchangeStatus,
@@ -291,6 +314,7 @@ private fun MainScreen(repository: EventSignalRepository) {
                                 }
                                 result.onSuccess {
                                     exchangeStatus = exchangeStatus.copy(
+                                        apiKey = binanceApiKey.trim(),
                                         connected = it.connected,
                                         canReadAccount = it.canReadAccount,
                                         verificationStatus = it.verificationStatus,
@@ -352,26 +376,12 @@ private fun MainScreen(repository: EventSignalRepository) {
                             automationRunning = true
                             status = "自动化服务已启动"
                         },
-                        onCalibrate = {
-                            AutomationRuntime.requestCalibration()
-                            status = "已请求识别当前页面"
-                        },
                         onStop = {
                             context.stopService(Intent(context, SignalForegroundService::class.java))
                             context.stopService(Intent(context, AutomationForegroundService::class.java))
                             context.stopService(Intent(context, FloatingSignalService::class.java))
                             automationRunning = false
                             status = "自动化已停止"
-                        },
-                        onAccessibilityPermission = {
-                            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
-                        },
-                        onOverlayPermission = {
-                            val intent = Intent(
-                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
-                                Uri.parse("package:${context.packageName}"),
-                            )
-                            context.startActivity(intent)
                         },
                     )
                 }
@@ -382,7 +392,6 @@ private fun MainScreen(repository: EventSignalRepository) {
 
 @Composable
 private fun AuthCard(
-    accessToken: String,
     walletAddress: String,
     password: String,
     status: String,
@@ -391,23 +400,20 @@ private fun AuthCard(
     onOpenDapp: () -> Unit,
     onLogin: () -> Unit,
     onRegister: () -> Unit,
-    onLogout: () -> Unit,
 ) {
-    val loggedIn = accessToken.isNotBlank()
     val walletReady = walletAddress.trim().startsWith("0x", ignoreCase = true) && walletAddress.trim().length >= 42
     val passwordReady = password.length >= 6
     val canSubmit = walletReady && passwordReady
     AppCard {
         SectionHeader(
-            title = if (loggedIn) "账号已登录" else "账号登录",
-            subtitle = if (loggedIn) "自动化服务启动后会接收授权信号" else "连接钱包可自动填地址，未注册的钱包先注册",
+            title = "账号登录",
+            subtitle = "连接钱包可自动填地址，未注册的钱包先注册",
         )
         OutlinedTextField(
             value = walletAddress,
             onValueChange = onWalletAddressChange,
             label = { Text("钱包地址") },
             singleLine = true,
-            enabled = !loggedIn,
             modifier = Modifier.fillMaxWidth(),
         )
         OutlinedTextField(
@@ -415,28 +421,39 @@ private fun AuthCard(
             onValueChange = onPasswordChange,
             label = { Text("密码") },
             singleLine = true,
-            enabled = !loggedIn,
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            PrimaryButton(text = "登录", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onLogin)
+            SecondaryButton(text = "注册", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onRegister)
+        }
+        SecondaryButton(text = "连接钱包 / 充值", modifier = Modifier.fillMaxWidth(), onClick = onOpenDapp)
+        StatusChip(
+            label = if (canSubmit) "账号信息：可提交" else "账号信息：请输入钱包地址和 6 位以上密码",
+            active = canSubmit,
+            modifier = Modifier.fillMaxWidth(),
+        )
+        Text(status, style = MaterialTheme.typography.bodySmall, color = MutedText)
+    }
+}
+
+@Composable
+private fun SettingsCard(
+    loggedIn: Boolean,
+    status: String,
+    onAccessibilityPermission: () -> Unit,
+    onOverlayPermission: () -> Unit,
+    onLogout: () -> Unit,
+) {
+    AppCard {
+        SectionHeader(title = "设置", subtitle = "权限和账号操作")
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            SecondaryButton(text = "无障碍权限", modifier = Modifier.weight(1f), onClick = onAccessibilityPermission)
+            SecondaryButton(text = "悬浮窗权限", modifier = Modifier.weight(1f), onClick = onOverlayPermission)
+        }
         if (loggedIn) {
-            StatusChip(
-                label = "登录状态：已连接",
-                active = true,
-                modifier = Modifier.fillMaxWidth(),
-            )
             SecondaryButton(text = "退出登录", modifier = Modifier.fillMaxWidth(), onClick = onLogout)
-        } else {
-            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-                PrimaryButton(text = "登录", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onLogin)
-                SecondaryButton(text = "注册", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onRegister)
-            }
-            SecondaryButton(text = "连接钱包 / 充值", modifier = Modifier.fillMaxWidth(), onClick = onOpenDapp)
-            StatusChip(
-                label = if (canSubmit) "账号信息：可提交" else "账号信息：请输入钱包地址和 6 位以上密码",
-                active = canSubmit,
-                modifier = Modifier.fillMaxWidth(),
-            )
         }
         Text(status, style = MaterialTheme.typography.bodySmall, color = MutedText)
     }
@@ -451,6 +468,7 @@ private fun ExchangeCard(
     onApiSecretChange: (String) -> Unit,
     onBind: () -> Unit,
 ) {
+    val secretReady = apiSecret.isNotBlank() || status.connected
     AppCard {
         SectionHeader(
             title = "币安只读 API",
@@ -490,19 +508,19 @@ private fun ExchangeCard(
         OutlinedTextField(
             value = apiSecret,
             onValueChange = onApiSecretChange,
-            label = { Text("API Secret") },
+            label = { Text(if (status.connected) "API Secret（已保存可留空）" else "API Secret") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
         PrimaryButton(
-            text = "绑定并验证",
+            text = if (status.connected && apiSecret.isBlank()) "重新验证" else "绑定并验证",
             modifier = Modifier.fillMaxWidth(),
-            enabled = apiKey.isNotBlank() && apiSecret.isNotBlank(),
+            enabled = apiKey.isNotBlank() && secretReady,
             onClick = onBind,
         )
         Text(
-            "账号校验通过后才会自动执行信号；校验失败时不会自动下单。",
+            "账号校验通过后才会自动执行信号；已保存的密钥会加密保存在后端和本机。",
             style = MaterialTheme.typography.bodySmall,
             color = MutedText,
         )
@@ -543,10 +561,7 @@ private fun AutomationCard(
     tradingAccountReady: Boolean,
     onToggle: (Boolean) -> Unit,
     onStart: () -> Unit,
-    onCalibrate: () -> Unit,
     onStop: () -> Unit,
-    onAccessibilityPermission: () -> Unit,
-    onOverlayPermission: () -> Unit,
 ) {
     AppCard {
         Row(verticalAlignment = Alignment.CenterVertically, modifier = Modifier.fillMaxWidth()) {
@@ -591,13 +606,6 @@ private fun AutomationCard(
                 onClick = onStart,
             )
             SecondaryButton(text = "停止", modifier = Modifier.weight(1f), enabled = running, onClick = onStop)
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            SecondaryButton(text = "识别页面", modifier = Modifier.fillMaxWidth(), enabled = running && tradingAccountReady, onClick = onCalibrate)
-        }
-        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
-            SecondaryButton(text = "无障碍权限", modifier = Modifier.weight(1f), onClick = onAccessibilityPermission)
-            SecondaryButton(text = "悬浮窗权限", modifier = Modifier.weight(1f), onClick = onOverlayPermission)
         }
     }
 }
