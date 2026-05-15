@@ -259,6 +259,11 @@ input:focus {
   padding-bottom: 0;
 }
 
+.wallet-button.connected {
+  background: #0ecb81;
+  color: #0b0e11;
+}
+
 .stats-grid {
   display: grid;
   grid-template-columns: repeat(4, minmax(0, 1fr));

@@ -17,9 +17,12 @@ import {
   SquarePen,
   Trash2,
   Users,
+  Wallet,
   Zap
 } from "lucide-react";
-import { BrowserProvider, Contract, parseUnits } from "ethers";
+import { BrowserProvider, Contract, parseUnits, type Eip1193Provider } from "ethers";
+import { createAppKit, useAppKit, useAppKitAccount, useAppKitProvider } from "@reown/appkit/react";
+import { EthersAdapter } from "@reown/appkit-adapter-ethers";
 import "./styles.css";
 
 type AdminView =
@@ -264,12 +267,38 @@ type TableRow = {
 const TOKEN_KEY = "event_signal_admin_token";
 const ADMIN_USER_KEY = "event_signal_admin_user";
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
+const REOWN_PROJECT_ID = import.meta.env.VITE_REOWN_PROJECT_ID || "00000000000000000000000000000000";
 const BSC_USDT = "0x55d398326f99059fF775485246999027B3197955";
 const BSC_VAULT = (import.meta.env.VITE_BSC_VAULT_CONTRACT || "").trim();
+const BSC_SETTLEMENT_WALLET = (import.meta.env.VITE_BSC_SETTLEMENT_WALLET || "").trim();
 const erc20Abi = ["function approve(address spender,uint256 value) external returns (bool)"];
 const vaultAbi = ["function payRefund(address recipient,uint256 amount,bytes32 refundId) external"];
+const bsc = {
+  id: 56,
+  caipNetworkId: "eip155:56",
+  chainNamespace: "eip155",
+  name: "BNB Smart Chain",
+  nativeCurrency: { name: "BNB", symbol: "BNB", decimals: 18 },
+  rpcUrls: { default: { http: ["https://bsc-dataseed.binance.org/"] } },
+  blockExplorers: { default: { name: "BscScan", url: "https://bscscan.com" } }
+} as const;
+
+createAppKit({
+  adapters: [new EthersAdapter()],
+  networks: [bsc],
+  projectId: REOWN_PROJECT_ID,
+  metadata: {
+    name: "Event Signal Admin",
+    description: "Event Signal withdrawal operations",
+    url: typeof window === "undefined" ? "https://localhost" : window.location.origin,
+    icons: []
+  }
+});
 
 function App() {
+  const { open } = useAppKit();
+  const { address, isConnected } = useAppKitAccount();
+  const { walletProvider } = useAppKitProvider("eip155");
   const [token, setToken] = useState(localStorage.getItem(TOKEN_KEY) || "");
   const [adminUser, setAdminUser] = useState(localStorage.getItem(ADMIN_USER_KEY) || "2752186242");
   const [adminPassword, setAdminPassword] = useState("");
@@ -566,15 +595,20 @@ function App() {
   }
 
   async function payWithdrawalOnChain(withdrawal: WithdrawalRecord) {
-    if (!window.ethereum) {
-      setStatus("未检测到钱包");
+    if (!isConnected || !walletProvider || !address) {
+      setStatus("请先连接管理钱包");
+      await open({ view: "Connect" });
       return;
     }
     if (!BSC_VAULT) {
       setStatus("缺少 BSC_VAULT_CONTRACT");
       return;
     }
-    const provider = new BrowserProvider(window.ethereum);
+    if (BSC_SETTLEMENT_WALLET && address.toLowerCase() !== BSC_SETTLEMENT_WALLET.toLowerCase()) {
+      setStatus(`请切换到打款钱包 ${shortId(BSC_SETTLEMENT_WALLET, 8)}`);
+      return;
+    }
+    const provider = new BrowserProvider(walletProvider as Eip1193Provider);
     await provider.send("wallet_switchEthereumChain", [{ chainId: "0x38" }]);
     const signer = await provider.getSigner();
     const usdt = new Contract(BSC_USDT, erc20Abi, signer);
@@ -697,6 +731,10 @@ function App() {
           </div>
           <div className="topbar-actions">
             <span className="status">{status}</span>
+            <button className={isConnected ? "icon-button wallet-button connected" : "icon-button wallet-button"} onClick={() => open({ view: "Connect" })}>
+              <Wallet size={18} />
+              {isConnected ? shortId(address, 6) : "连接钱包"}
+            </button>
             <button className="icon-button" onClick={() => loadAll().catch(() => undefined)}>
               <RefreshCw size={18} />
               刷新
@@ -711,6 +749,13 @@ function App() {
           <label>
             登录身份
             <input value={`管理员：${adminUser}`} readOnly />
+          </label>
+          <label>
+            管理钱包
+            <input
+              value={isConnected ? `${shortId(address, 10)}${BSC_SETTLEMENT_WALLET ? ` / 打款钱包 ${shortId(BSC_SETTLEMENT_WALLET, 10)}` : ""}` : "未连接"}
+              readOnly
+            />
           </label>
         </section>
 
