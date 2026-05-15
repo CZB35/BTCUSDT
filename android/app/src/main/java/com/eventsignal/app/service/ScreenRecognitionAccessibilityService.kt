@@ -19,6 +19,8 @@ import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import java.time.Instant
 import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
+import java.util.concurrent.atomic.AtomicReference
 
 class ScreenRecognitionAccessibilityService : AccessibilityService() {
     private lateinit var recognition: ScreenRecognitionService
@@ -27,6 +29,8 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
     private lateinit var repository: EventSignalRepository
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main)
     private val pageGateReportInFlight = AtomicBoolean(false)
+    private val pageGateFailureCount = AtomicInteger(0)
+    private val latestPageGatePayload = AtomicReference<AutomationPageStateRequest?>(null)
     private var handledCalibrationVersion = 0L
     private var handledExecutionVersion = 0L
 
@@ -91,13 +95,33 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
             observedBalanceUsdt = screen.observedBalanceUsdt,
             observedAt = Instant.now().toString(),
         )
+        latestPageGatePayload.set(payload)
         if (!pageGateReportInFlight.compareAndSet(false, true)) return
         scope.launch(Dispatchers.IO) {
             try {
-                repository.submitAutomationPageState(payload)
-                    .onFailure { stateStore.saveLastStatus("page_gate_report_failed:${it.javaClass.simpleName}") }
+                reportLatestPageGate()
             } finally {
                 pageGateReportInFlight.set(false)
+            }
+        }
+    }
+
+    private suspend fun reportLatestPageGate() {
+        repeat(3) { attempt ->
+            val payload = latestPageGatePayload.get() ?: return
+            val result = repository.submitAutomationPageState(payload)
+            if (result.isSuccess) {
+                pageGateFailureCount.set(0)
+                return
+            }
+            if (attempt < 2) {
+                delay(300)
+                return@repeat
+            }
+            val failures = pageGateFailureCount.incrementAndGet()
+            if (failures >= 3) {
+                val error = result.exceptionOrNull()
+                stateStore.saveLastStatus("page_gate_report_failed:${error?.javaClass?.simpleName ?: "Unknown"}")
             }
         }
     }

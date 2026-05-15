@@ -352,6 +352,18 @@ private fun MainScreen(repository: EventSignalRepository) {
                             persistAutomationSettings(next)
                             status = if (enabled) "自动化已开启" else "自动化已关闭"
                         },
+                        onAccessibilityPermission = {
+                            context.startActivity(Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS))
+                            status = "请开启事件信号无障碍服务"
+                        },
+                        onOverlayPermission = {
+                            val intent = Intent(
+                                Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                                Uri.parse("package:${context.packageName}"),
+                            )
+                            context.startActivity(intent)
+                            status = "请开启悬浮窗权限"
+                        },
                         onStart = {
                             if (accessToken.isBlank()) {
                                 status = "请先登录账号"
@@ -560,6 +572,8 @@ private fun AutomationCard(
     status: String,
     tradingAccountReady: Boolean,
     onToggle: (Boolean) -> Unit,
+    onAccessibilityPermission: () -> Unit,
+    onOverlayPermission: () -> Unit,
     onStart: () -> Unit,
     onStop: () -> Unit,
 ) {
@@ -598,6 +612,10 @@ private fun AutomationCard(
         Text("最近信号连接：${runtimeStatusLabel(lastSocketStatus)}", style = MaterialTheme.typography.bodySmall, color = MutedText)
         Text("状态：$status", style = MaterialTheme.typography.bodySmall, color = MutedText)
         Spacer(modifier = Modifier.height(2.dp))
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+            SecondaryButton(text = "无障碍权限", modifier = Modifier.weight(1f), onClick = onAccessibilityPermission)
+            SecondaryButton(text = "悬浮窗权限", modifier = Modifier.weight(1f), onClick = onOverlayPermission)
+        }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
             PrimaryButton(
                 text = if (running) "运行中" else "启动服务",
