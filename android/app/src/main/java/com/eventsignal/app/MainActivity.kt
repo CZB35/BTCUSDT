@@ -129,8 +129,8 @@ private fun MainScreen(repository: EventSignalRepository) {
     var walletAddress by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var exchangeStatus by remember { mutableStateOf(ExchangeCredentialStatus()) }
-    var binanceApiKey by remember { mutableStateOf("") }
-    var binanceApiSecret by remember { mutableStateOf("") }
+    var binanceApiKey by remember { mutableStateOf(repository.savedExchangeApiKey()) }
+    var binanceApiSecret by remember { mutableStateOf(repository.savedExchangeApiSecret()) }
     val walletDeepLink = (context as? Activity)?.intent?.data?.getQueryParameter("address").orEmpty()
     val isLoggedIn = accessToken.isNotBlank()
     val tradingAccountReady = exchangeReady(exchangeStatus)
@@ -226,7 +226,6 @@ private fun MainScreen(repository: EventSignalRepository) {
                     walletAddress = walletAddress,
                     password = password,
                     status = status,
-                    apiBaseUrl = repository.apiBaseUrl(),
                     onWalletAddressChange = { walletAddress = it },
                     onPasswordChange = { password = it },
                     onOpenDapp = {
@@ -291,16 +290,15 @@ private fun MainScreen(repository: EventSignalRepository) {
                                     repository.saveExchangeCredentials(binanceApiKey, binanceApiSecret)
                                 }
                                 result.onSuccess {
-                                exchangeStatus = exchangeStatus.copy(
-                                    connected = it.connected,
-                                    canReadAccount = it.canReadAccount,
-                                    verificationStatus = it.verificationStatus,
-                                    balanceAvailableUsdt = it.balanceAvailableUsdt,
-                                    balanceWalletUsdt = it.balanceWalletUsdt,
-                                    lastVerifiedAt = it.lastVerifiedAt,
-                                    lastError = null,
-                                )
-                                    binanceApiSecret = ""
+                                    exchangeStatus = exchangeStatus.copy(
+                                        connected = it.connected,
+                                        canReadAccount = it.canReadAccount,
+                                        verificationStatus = it.verificationStatus,
+                                        balanceAvailableUsdt = it.balanceAvailableUsdt,
+                                        balanceWalletUsdt = it.balanceWalletUsdt,
+                                        lastVerifiedAt = it.lastVerifiedAt,
+                                        lastError = null,
+                                    )
                                     status = if (exchangeReady(exchangeStatus)) "交易账号已验证" else "交易账号验证失败"
                                 }.onFailure {
                                     status = "绑定失败：${it.message ?: it.javaClass.simpleName}"
@@ -388,7 +386,6 @@ private fun AuthCard(
     walletAddress: String,
     password: String,
     status: String,
-    apiBaseUrl: String,
     onWalletAddressChange: (String) -> Unit,
     onPasswordChange: (String) -> Unit,
     onOpenDapp: () -> Unit,
@@ -403,7 +400,7 @@ private fun AuthCard(
     AppCard {
         SectionHeader(
             title = if (loggedIn) "账号已登录" else "账号登录",
-            subtitle = if (loggedIn) "自动化服务启动后会接收后端 WebSocket 信号" else "连接钱包可自动填地址，未注册的钱包先注册",
+            subtitle = if (loggedIn) "自动化服务启动后会接收授权信号" else "连接钱包可自动填地址，未注册的钱包先注册",
         )
         OutlinedTextField(
             value = walletAddress,
@@ -434,14 +431,13 @@ private fun AuthCard(
                 PrimaryButton(text = "登录", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onLogin)
                 SecondaryButton(text = "注册", modifier = Modifier.weight(1f), enabled = canSubmit, onClick = onRegister)
             }
-            SecondaryButton(text = "连接钱包 / 注册充值", modifier = Modifier.fillMaxWidth(), onClick = onOpenDapp)
+            SecondaryButton(text = "连接钱包 / 充值", modifier = Modifier.fillMaxWidth(), onClick = onOpenDapp)
             StatusChip(
                 label = if (canSubmit) "账号信息：可提交" else "账号信息：请输入钱包地址和 6 位以上密码",
                 active = canSubmit,
                 modifier = Modifier.fillMaxWidth(),
             )
         }
-        Text("后端：$apiBaseUrl", style = MaterialTheme.typography.bodySmall, color = MutedText)
         Text(status, style = MaterialTheme.typography.bodySmall, color = MutedText)
     }
 }
@@ -519,7 +515,7 @@ private fun ExchangeCard(
 @Composable
 private fun SignalCard(signal: SignalSnapshot) {
     AppCard {
-        SectionHeader(title = "最新信号", subtitle = "后端只通过 WebSocket 下发一次授权信号")
+        SectionHeader(title = "最新信号", subtitle = "自动化只执行实时授权信号")
         Row(horizontalArrangement = Arrangement.spacedBy(10.dp), modifier = Modifier.fillMaxWidth()) {
             MetricTile("交易对", signal.symbol, Modifier.weight(1f))
             MetricTile("信号状态", signalStateLabel(signal), Modifier.weight(1f), if (signal.tradeAuthorized) TradingUp else MutedText)

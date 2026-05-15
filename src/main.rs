@@ -400,7 +400,7 @@ async fn sync_confirming_deposits(pool: &PgPool) -> Result<usize, AppError> {
             &deposit.tx_hash,
             deposit.user_id,
             &deposit.from_address,
-            &deposit.deposit_id,
+            Some(deposit.deposit_id.as_str()),
             Some(deposit.amount),
         )
         .await
@@ -1833,7 +1833,7 @@ struct AdminLoginResponse {
 struct DepositTxRequest {
     tx_hash: String,
     amount: Option<String>,
-    deposit_id: String,
+    deposit_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -2933,13 +2933,19 @@ async fn submit_deposit_tx(
         .map(|value| parse_decimal(value, "amount"))
         .transpose()?;
     let tx_hash = normalize_tx_hash(&req.tx_hash)?;
-    let deposit_id = normalize_topic(&req.deposit_id)?;
+    let expected_deposit_id = req
+        .deposit_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_topic)
+        .transpose()?;
     let bound_wallet = bound_wallet_for_user(&state, user_id).await?;
     let verified = verify_bsc_contract_deposit(
         &tx_hash,
         user_id,
         &bound_wallet,
-        &deposit_id,
+        expected_deposit_id.as_deref(),
         expected_amount,
     )
     .await?;
@@ -3558,7 +3564,7 @@ async fn verify_bsc_contract_deposit(
     tx_hash: &str,
     user_id: Uuid,
     bound_wallet: &str,
-    expected_deposit_id: &str,
+    expected_deposit_id: Option<&str>,
     expected_amount: Option<Decimal>,
 ) -> Result<VerifiedDeposit, AppError> {
     let rpc_url = bsc_rpc_url()?;
@@ -3566,6 +3572,11 @@ async fn verify_bsc_contract_deposit(
     let vault_contract = bsc_vault_contract()?;
     let settlement_wallet = bsc_settlement_wallet()?;
     let bound_wallet = normalize_wallet_address(bound_wallet)?;
+    let expected_deposit_id = expected_deposit_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(normalize_topic)
+        .transpose()?;
     let expected_account_id = account_id_topic(user_id);
 
     let receipt: Option<RpcTransactionReceipt> =
@@ -3575,7 +3586,7 @@ async fn verify_bsc_contract_deposit(
             tx_hash: tx_hash.to_string(),
             token_contract,
             contract_address: vault_contract.clone(),
-            deposit_id: expected_deposit_id.to_string(),
+            deposit_id: expected_deposit_id.clone().unwrap_or_default(),
             from_address: bound_wallet,
             to_address: settlement_wallet,
             amount: expected_amount.unwrap_or(Decimal::ZERO),
@@ -3621,11 +3632,13 @@ async fn verify_bsc_contract_deposit(
             "deposit event account_id does not match user",
         ));
     }
-    if deposit.deposit_id != expected_deposit_id {
-        return Err(AppError::bad_request(
-            "DEPOSIT_ID_MISMATCH",
-            "deposit event deposit_id does not match request",
-        ));
+    if let Some(expected_deposit_id) = expected_deposit_id.as_ref() {
+        if deposit.deposit_id.as_str() != expected_deposit_id.as_str() {
+            return Err(AppError::bad_request(
+                "DEPOSIT_ID_MISMATCH",
+                "deposit event deposit_id does not match request",
+            ));
+        }
     }
     if deposit.payer != bound_wallet {
         return Err(AppError::bad_request(

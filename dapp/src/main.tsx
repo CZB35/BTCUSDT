@@ -116,6 +116,7 @@ type RecordRow = {
 };
 
 const TOKEN_KEY = "event_signal_access_token";
+const PENDING_DEPOSIT_KEY = "event_signal_pending_deposit";
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
 const projectId = import.meta.env.VITE_REOWN_PROJECT_ID || "00000000000000000000000000000000";
 const bsc = {
@@ -143,6 +144,12 @@ createAppKit({
 const erc20Abi = ["function approve(address spender,uint256 value) external returns (bool)"];
 const vaultAbi = ["function deposit(bytes32 accountId,bytes32 depositId,uint256 amount) external"];
 
+type PendingDeposit = {
+  txHash: string;
+  amount: string;
+  depositId: string;
+};
+
 function App() {
   const { open } = useAppKit();
   const { address, isConnected } = useAppKitAccount();
@@ -162,7 +169,7 @@ function App() {
   const [ledger, setLedger] = useState<Ledger[]>([]);
   const [referral, setReferral] = useState<ReferralSummary | null>(null);
   const [amount, setAmount] = useState("");
-  const [txHash, setTxHash] = useState("");
+  const [txHash, setTxHash] = useState(() => loadPendingDeposit()?.txHash || "");
   const [withdrawAmount, setWithdrawAmount] = useState("");
   const [withdrawAddress, setWithdrawAddress] = useState("");
   const [newPassword, setNewPassword] = useState("");
@@ -306,15 +313,26 @@ function App() {
     const vault = new ethers.Contract(info.vault_contract, vaultAbi, signer);
     const tx = await vault.deposit(info.account_id, info.deposit_id, units);
     setTxHash(tx.hash);
+    savePendingDeposit({ txHash: tx.hash, amount, depositId: info.deposit_id });
     await tx.wait();
     await submitTx(tx.hash, amount, info.deposit_id);
   }
 
-  async function submitTx(nextTxHash = txHash, nextAmount = amount, depositId = instructions?.deposit_id || "") {
+  async function submitTx(nextTxHash = txHash, nextAmount = amount, depositId = "") {
+    const pending = loadPendingDeposit();
+    const finalTxHash = nextTxHash.trim() || pending?.txHash || "";
+    const finalAmount = nextAmount.trim() || pending?.amount || "";
+    const finalDepositId = depositId.trim() || (pending?.txHash === finalTxHash ? pending.depositId : "");
     const deposit = await request<Deposit>("/v1/deposits/submit-tx", {
       method: "POST",
-      body: JSON.stringify({ tx_hash: nextTxHash.trim(), amount: nextAmount.trim(), deposit_id: depositId })
+      body: JSON.stringify({
+        tx_hash: finalTxHash,
+        amount: finalAmount || null,
+        deposit_id: finalDepositId || null
+      })
     });
+    clearPendingDeposit(finalTxHash);
+    setTxHash(finalTxHash);
     setStatus(`充值提交成功：${deposit.status}`);
     await loadAll();
   }
@@ -383,12 +401,9 @@ function App() {
           instructions={instructions}
           deposits={deposits}
           amount={amount}
-          txHash={txHash}
           onAmount={setAmount}
-          onTxHash={setTxHash}
           onRefresh={() => loadAll().catch((err) => setStatus(cleanError(err)))}
           onSend={() => sendDeposit().catch((err) => setStatus(cleanError(err)))}
-          onSubmit={() => submitTx().catch((err) => setStatus(cleanError(err)))}
         />
       )}
       {tab === "trade" && <TradePage orders={orders} reports={reports} settlements={settlements} />}
@@ -520,7 +535,10 @@ function HomePage({
           <Metric label="钱包" value={isConnected ? "已连接" : "未连接"} />
         </div>
         <div className="wallet-row">
-          <button className="primary" onClick={onConnect}><Wallet size={18} />连接钱包</button>
+          <button className={isConnected ? "secondary" : "primary"} onClick={onConnect}>
+            <Wallet size={18} />
+            {isConnected ? "切换钱包" : "连接钱包"}
+          </button>
           <button className="secondary" onClick={onBind}><Link2 size={18} />签名绑定</button>
         </div>
       </section>
@@ -547,12 +565,9 @@ function DepositPage(props: {
   instructions: DepositInstructions | null;
   deposits: Deposit[];
   amount: string;
-  txHash: string;
   onAmount: (value: string) => void;
-  onTxHash: (value: string) => void;
   onRefresh: () => void;
   onSend: () => void;
-  onSubmit: () => void;
 }) {
   const feeRate = Number(props.instructions?.deposit_fee_rate || 0);
   const credited = Number(props.amount || 0) * (1 - feeRate);
@@ -560,7 +575,7 @@ function DepositPage(props: {
     <>
       <section className="card">
         <div className="section-title">
-          <h2>合约充值</h2>
+          <h2>USDT 充值</h2>
           <button className="ghost" onClick={props.onRefresh}><RefreshCw size={16} />刷新</button>
         </div>
         <div className="metrics">
@@ -569,12 +584,7 @@ function DepositPage(props: {
           <Metric label="预计到账" value={`${Number.isFinite(credited) ? credited.toFixed(2) : "0"}U`} />
         </div>
         <label>充值金额<input value={props.amount} onChange={(event) => props.onAmount(event.target.value)} placeholder="首次至少 100U" /></label>
-        <label>交易哈希<input value={props.txHash} onChange={(event) => props.onTxHash(event.target.value)} placeholder="钱包充值后会自动填入，异常时提交哈希" /></label>
-        <div className="row">
-          <button className="primary" onClick={props.onSend}>钱包充值</button>
-          <button className="secondary" onClick={props.onSubmit}>提交哈希</button>
-        </div>
-        <p className="mono muted">合约 {shortId(props.instructions?.vault_contract || "")}</p>
+        <button className="primary" onClick={props.onSend}>钱包充值</button>
       </section>
       <RecordList title="充值记录" rows={props.deposits.map((row) => ({
         id: row.id,
@@ -862,6 +872,33 @@ function friendlyErrorFromBody(body: string, status: number) {
     if (body.trim()) return body.trim();
   }
   return `请求失败 ${status}`;
+}
+
+function loadPendingDeposit(): PendingDeposit | null {
+  try {
+    const raw = localStorage.getItem(PENDING_DEPOSIT_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw) as Partial<PendingDeposit>;
+    if (!parsed.txHash) return null;
+    return {
+      txHash: parsed.txHash,
+      amount: parsed.amount || "",
+      depositId: parsed.depositId || ""
+    };
+  } catch {
+    return null;
+  }
+}
+
+function savePendingDeposit(deposit: PendingDeposit) {
+  localStorage.setItem(PENDING_DEPOSIT_KEY, JSON.stringify(deposit));
+}
+
+function clearPendingDeposit(txHash: string) {
+  const pending = loadPendingDeposit();
+  if (!pending || pending.txHash === txHash) {
+    localStorage.removeItem(PENDING_DEPOSIT_KEY);
+  }
 }
 
 createRoot(document.getElementById("root")!).render(
