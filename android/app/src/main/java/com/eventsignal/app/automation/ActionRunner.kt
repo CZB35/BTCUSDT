@@ -1,6 +1,7 @@
 package com.eventsignal.app.automation
 
 import android.accessibilityservice.AccessibilityService
+import android.graphics.Rect
 import android.os.Bundle
 import android.os.SystemClock
 import android.view.accessibility.AccessibilityNodeInfo
@@ -89,17 +90,36 @@ class ActionRunner(
             return
         }
 
-        val button = if (direction == "UP") upButton else downButton
+        SystemClock.sleep(300)
+        val refreshedRoot = service.rootInActiveWindow ?: run {
+            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "金额已输入，页面丢失")
+            stateStore.saveLastStatus("missing_root_window_after_input")
+            releaseReservation(signal, "missing_root_window_after_input")
+            return
+        }
+        val refreshedNodes = flatten(refreshedRoot)
+        val refreshedUpButton = findDirectionButton(refreshedNodes, profile, "UP")
+        val refreshedDownButton = findDirectionButton(refreshedNodes, profile, "DOWN")
+        saveActionState(
+            screen,
+            amountFieldFound = true,
+            upButtonFound = refreshedUpButton != null,
+            downButtonFound = refreshedDownButton != null,
+            action = "金额已输入，重新识别执行按钮",
+        )
+
+        val button = if (direction == "UP") refreshedUpButton else refreshedDownButton
         if (button == null) {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到执行按钮")
+            saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "未找到执行按钮")
             stateStore.saveLastStatus("action_button_not_found")
             releaseReservation(signal, "action_button_not_found")
             return
         }
+        val buttonLabel = button.nodeText().take(40)
         if (click(button)) {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已点击执行按钮，等待确认")
+            saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "已点击执行按钮:$buttonLabel")
             if (clickConfirm(profile)) {
-                saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "已确认下单")
+                saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "已确认下单")
                 val pending = buildOrderReport(
                     signal = signal,
                     signalId = signalId,
@@ -114,10 +134,10 @@ class ActionRunner(
             } else {
                 stateStore.saveLastStatus("confirm_button_not_found:$amount")
                 releaseReservation(signal, "confirm_button_not_found")
-                saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "未找到确认按钮")
+                saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "未找到确认按钮:$buttonLabel")
             }
         } else {
-            saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "按钮点击失败")
+            saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "按钮点击失败:$buttonLabel")
             stateStore.saveLastStatus("action_click_failed")
             releaseReservation(signal, "action_click_failed")
         }
@@ -267,11 +287,44 @@ class ActionRunner(
         direction: String,
     ): AccessibilityNodeInfo? {
         val keywords = if (direction == "UP") profile.upButtonKeywords else profile.downButtonKeywords
-        return nodes.firstOrNull { node ->
-            node.isEnabled &&
-                (node.isClickable || node.parent?.isClickable == true) &&
-                keywords.any { keyword -> node.nodeText().contains(keyword, ignoreCase = true) }
+        return nodes
+            .filter { node -> isDirectionButtonCandidate(node, keywords) }
+            .maxByOrNull { node -> directionButtonScore(node) }
+    }
+
+    private fun isDirectionButtonCandidate(
+        node: AccessibilityNodeInfo,
+        keywords: List<String>,
+    ): Boolean {
+        val label = node.nodeText()
+        if (looksLikePayoutLabel(label)) return false
+        return node.isEnabled &&
+            (node.isClickable || node.parent?.isClickable == true) &&
+            keywords.any { keyword -> label.contains(keyword, ignoreCase = true) }
+    }
+
+    private fun looksLikePayoutLabel(label: String): Boolean =
+        (label.contains("%") || label.contains("支付率") || label.contains("Payout", ignoreCase = true)) &&
+            !label.contains("↗") &&
+            !label.contains("↘")
+
+    private fun directionButtonScore(node: AccessibilityNodeInfo): Int {
+        val label = node.nodeText()
+        val bounds = node.boundsInScreen()
+        var score = 0
+        if (node.isClickable) score += 4
+        if (label.contains("%")) score -= 35
+        if (label.contains("支付率") || label.contains("支付金额") || label.contains("Payout", ignoreCase = true)) {
+            score -= 25
         }
+        if (label.contains("↗") || label.contains("↘")) score += 10
+        if (label.contains("看涨") || label.contains("看跌")) score += 4
+        if (label.length <= 12) score += 4
+        if (bounds.width() >= 160) score += 8
+        if (bounds.height() >= 48) score += 8
+        if (bounds.width() >= 240 && bounds.height() >= 60) score += 8
+        score += (bounds.centerY() / 80).coerceIn(0, 40)
+        return score
     }
 
     private fun setText(node: AccessibilityNodeInfo, value: String): Boolean {
@@ -296,7 +349,7 @@ class ActionRunner(
     }
 
     private fun clickConfirm(profile: AutomationProfile): Boolean {
-        repeat(12) {
+        repeat(20) {
             SystemClock.sleep(250)
             val root = service.rootInActiveWindow ?: return@repeat
             val confirm = findButton(flatten(root), profile.confirmButtonKeywords)
@@ -336,4 +389,7 @@ class ActionRunner(
             hintText?.toString(),
             viewIdResourceName,
         ).joinToString(" ")
+
+    private fun AccessibilityNodeInfo.boundsInScreen(): Rect =
+        Rect().also { getBoundsInScreen(it) }
 }

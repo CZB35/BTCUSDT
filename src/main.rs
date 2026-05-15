@@ -986,6 +986,16 @@ impl SignalCore {
         }
     }
 
+    fn manual(direction: String, suggested_stake: Decimal, confidence: Decimal) -> Self {
+        let mut signal = Self::new(direction, suggested_stake, confidence);
+        signal.model_version = "manual-signal-v1".to_string();
+        signal
+    }
+
+    fn uses_explicit_stake(&self) -> bool {
+        self.model_version == "manual-signal-v1"
+    }
+
     fn from_prediction(decision: &PredictionDecision) -> Self {
         Self {
             id: Uuid::now_v7(),
@@ -5429,11 +5439,12 @@ async fn admin_emit_signal(
         None => MIN_EVENT_STAKE,
     };
     validate_event_stake(stake)?;
+    let stake = stake.floor();
     let confidence = match req.confidence {
         Some(value) => parse_decimal(&value, "confidence")?,
         None => dec!(1),
     };
-    let signal = SignalCore::new(direction, stake, confidence);
+    let signal = SignalCore::manual(direction, stake, confidence);
     if let Some(pool) = state.db.as_ref() {
         if !db_insert_signal(pool, &signal).await? {
             return Err(AppError::conflict(
@@ -6428,7 +6439,15 @@ async fn display_signal_for_user(
         .ok()
         .flatten();
     let stake_base = exchange_available.unwrap_or(balance.available);
-    let stake = calculated_stake(stake_base, &settings, None);
+    let explicit_stake = signal
+        .uses_explicit_stake()
+        .then_some(signal.suggested_stake);
+    let stake = calculated_stake(stake_base, &settings, explicit_stake);
+    let stake_rule = if explicit_stake.is_some() {
+        "手动信号按后台填写金额下发；latest/history 不创建预扣"
+    } else {
+        "展示值按缓存的 U 本位合约可用余额和后台比例计算；latest/history 不创建预扣"
+    };
     SignalApiResponse {
         id: signal.id.to_string(),
         signal_id: signal.id.to_string(),
@@ -6442,8 +6461,7 @@ async fn display_signal_for_user(
         entry_price: money(signal.entry_price),
         suggested_stake: money(stake),
         stake_percent: decimal(settings.stake_percent),
-        suggested_stake_rule:
-            "展示值按缓存的 U 本位合约可用余额和后台比例计算；latest/history 不创建预扣".to_string(),
+        suggested_stake_rule: stake_rule.to_string(),
         trade_authorized: false,
         reservation_id: None,
         fee_reserve_usdt: money(Decimal::ZERO),
@@ -6481,7 +6499,15 @@ async fn authorize_signal_for_user(
         .as_ref()
         .map(|snapshot| snapshot.available);
     let stake_base = exchange_available.unwrap_or(Decimal::ZERO);
-    let stake = calculated_stake(stake_base, &trading, None);
+    let explicit_stake = signal
+        .uses_explicit_stake()
+        .then_some(signal.suggested_stake);
+    let stake = calculated_stake(stake_base, &trading, explicit_stake);
+    let stake_rule = if explicit_stake.is_some() {
+        "手动信号按后台填写金额下发；预扣 = 预计盈利 * 30%"
+    } else {
+        "U 本位合约可用余额 * 后台比例，金额向下取整，最低 5 USDT，最高 250 USDT；预扣 = 预计盈利 * 30%"
+    };
     let expected_profit = stake * DEFAULT_PAYOUT_RATIO;
     let fee_reserve = expected_profit * PROFIT_SHARE_RATE;
 
@@ -6498,7 +6524,7 @@ async fn authorize_signal_for_user(
     {
         status = "exchange_balance_stale".to_string();
     }
-    if status == "reserved" && stake_base < MIN_EVENT_STAKE {
+    if status == "reserved" && stake_base < stake {
         status = "exchange_balance_insufficient".to_string();
     }
     if !automation.automation_enabled
@@ -6641,9 +6667,7 @@ async fn authorize_signal_for_user(
         entry_price: money(signal.entry_price),
         suggested_stake: money(stake),
         stake_percent: decimal(trading.stake_percent),
-        suggested_stake_rule:
-            "U本位合约可用余额 * 后台比例，最低 5 USDT，最高 250 USDT；预扣 = 预计盈利 * 30%"
-                .to_string(),
+        suggested_stake_rule: stake_rule.to_string(),
         trade_authorized: status == "reserved",
         reservation_id: reservation_id.map(|id| id.to_string()),
         fee_reserve_usdt: money(fee_reserve),
@@ -6969,7 +6993,7 @@ fn calculated_stake(
     if stake > MAX_EVENT_STAKE {
         stake = MAX_EVENT_STAKE;
     }
-    stake.round_dp(2)
+    stake.floor()
 }
 
 fn page_is_fresh(page: &AutomationPageState) -> bool {

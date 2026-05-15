@@ -78,6 +78,8 @@ object BuiltInProfiles {
             "确认",
             "確定",
             "确定",
+            "确认下单",
+            "确定下单",
             "Confirm",
             "CONFIRM",
         ),
