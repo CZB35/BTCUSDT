@@ -4780,6 +4780,54 @@ fn build_prediction_decision(
     let live_ret_3 =
         rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 90)
             .unwrap_or(ret_3);
+    // Event contracts punish late entries hard. At band extremes we either wait,
+    // or only reverse after live price confirms a rejection/reclaim.
+    let upper_extreme = clamp((boll_pos - 0.82) / 0.18, 0.0, 1.0);
+    let lower_extreme = clamp((0.18 - boll_pos) / 0.18, 0.0, 1.0);
+    let up_move_intensity = clamp(
+        (live_ret_1.max(ret_1).max(cycle.return_from_open) - 0.00035) / 0.00150,
+        0.0,
+        1.0,
+    );
+    let down_move_intensity = clamp(
+        ((-live_ret_1).max(-ret_1).max(-cycle.return_from_open) - 0.00035) / 0.00150,
+        0.0,
+        1.0,
+    );
+    let live_reclaiming = snapshot.latest_price >= latest.close || latest.close >= latest.open;
+    let live_rejecting = snapshot.latest_price <= latest.close || latest.close <= latest.open;
+    let bottom_reversal_confirmed = lower_extreme > 0.25
+        && (cycle.return_from_open < -0.00070 || ret_3 < -0.00070 || ret_5 < -0.00100)
+        && live_ret_1 > 0.00010
+        && live_ret_1 > live_ret_3 * 0.35
+        && live_reclaiming;
+    let top_reversal_confirmed = upper_extreme > 0.25
+        && (cycle.return_from_open > 0.00070 || ret_3 > 0.00070 || ret_5 > 0.00100)
+        && live_ret_1 < -0.00010
+        && live_ret_1 < live_ret_3 * 0.35
+        && live_rejecting;
+    let bottom_reversal_signal_score = if bottom_reversal_confirmed {
+        6.4 + lower_extreme * 1.2
+            + clamp(live_ret_1 * 5500.0, 0.0, 1.8)
+            + clamp(
+                (-cycle.return_from_open).max(-ret_3).max(-ret_5) * 850.0,
+                0.0,
+                1.4,
+            )
+    } else {
+        0.0
+    };
+    let top_reversal_signal_score = if top_reversal_confirmed {
+        -6.4 - upper_extreme * 1.2
+            - clamp((-live_ret_1) * 5500.0, 0.0, 1.8)
+            - clamp(
+                cycle.return_from_open.max(ret_3).max(ret_5) * 850.0,
+                0.0,
+                1.4,
+            )
+    } else {
+        0.0
+    };
     let momentum_score = live_ret_1 * 1450.0
         + live_ret_3 * 900.0
         + ret_1 * 950.0
@@ -4798,13 +4846,15 @@ fn build_prediction_decision(
             0.0
         };
     let volume_score = clamp(volume_z, -2.5, 2.5) * sign(ret_1 + ret_3) * 0.28;
-    let mean_reversion_score = if boll_pos > 0.92 {
-        -0.42
-    } else if boll_pos < 0.08 {
-        0.42
-    } else {
-        0.0
-    };
+    let mean_reversion_score = lower_extreme * (1.05 + down_move_intensity * 1.20)
+        - upper_extreme * (1.05 + up_move_intensity * 1.20)
+        + if bottom_reversal_confirmed {
+            1.10
+        } else if top_reversal_confirmed {
+            -1.10
+        } else {
+            0.0
+        };
     let candle_score = body_ratio * sign(latest.close - latest.open) * 0.22;
     let live_score = ratio_delta(snapshot.latest_price, ema5) * 260.0;
     let mark_index_basis = snapshot
@@ -4825,7 +4875,7 @@ fn build_prediction_decision(
         -0.8,
         0.8,
     );
-    let score = momentum_score
+    let continuation_score = momentum_score
         + trend_score
         + volume_score
         + mean_reversion_score
@@ -4833,6 +4883,23 @@ fn build_prediction_decision(
         + live_score
         + cycle_score
         + basis_score;
+    let (score, reversal_mode) = if bottom_reversal_signal_score >= config.up_threshold
+        && continuation_score > config.down_threshold * 0.75
+    {
+        (
+            bottom_reversal_signal_score.max(continuation_score),
+            "bottom_reversal",
+        )
+    } else if top_reversal_signal_score <= config.down_threshold
+        && continuation_score < config.up_threshold * 0.75
+    {
+        (
+            top_reversal_signal_score.min(continuation_score),
+            "top_reversal",
+        )
+    } else {
+        (continuation_score, "none")
+    };
     let confidence = clamp(1.0 / (1.0 + (-score.abs() / 2.8).exp()), 0.0, 0.99);
     let predicted_return = clamp(score / 10_000.0, -0.003, 0.003);
     let mut direction = if score >= config.up_threshold {
@@ -4857,6 +4924,26 @@ fn build_prediction_decision(
         reason = format!(
             "hold basis abnormal mark_index {mark_index_basis:.6} trade_index {trade_index_basis:.6}"
         );
+    } else if direction == "UP"
+        && reversal_mode == "none"
+        && upper_extreme > 0.75
+        && up_move_intensity > 0.45
+    {
+        direction = "HOLD".to_string();
+        reason = format!(
+            "hold overextended up move boll_pos {boll_pos:.4} live_ret_1 {live_ret_1:.6} cycle_ret {:.6}",
+            cycle.return_from_open
+        );
+    } else if direction == "DOWN"
+        && reversal_mode == "none"
+        && lower_extreme > 0.75
+        && down_move_intensity > 0.45
+    {
+        direction = "HOLD".to_string();
+        reason = format!(
+            "hold overextended down move boll_pos {boll_pos:.4} live_ret_1 {live_ret_1:.6} cycle_ret {:.6}",
+            cycle.return_from_open
+        );
     }
     let cycle_start = millis_to_utc(snapshot.latest_price_time_ms)?;
     Ok(PredictionDecision {
@@ -4873,43 +4960,67 @@ fn build_prediction_decision(
         market_candles: candles.len(),
         reason,
         feature_snapshot: json!({
-            "market_source": snapshot.latest_source,
-            "latest_mark_price": snapshot.latest_mark_price,
-            "latest_trade_price": snapshot.latest_trade_price,
-            "latest_futures_kline_price": snapshot.latest_futures_kline_price,
-            "last_message_at": snapshot.last_message_at,
-            "latest_price_time_ms": snapshot.latest_price_time_ms,
-            "latest_candle_close_time_ms": latest.close_time_ms,
-            "mark_index_basis": mark_index_basis,
-            "trade_index_basis": trade_index_basis,
-            "futures_kline_index_basis": futures_kline_index_basis,
-            "basis_score": basis_score,
-            "momentum_score": momentum_score,
-            "trend_score": trend_score,
-            "volume_score": volume_score,
-            "mean_reversion_score": mean_reversion_score,
-            "candle_score": candle_score,
-            "live_score": live_score,
-            "cycle_score": cycle_score,
-            "cycle_start_ms": cycle.start_ms,
-            "cycle_progress": cycle.progress,
-            "cycle_open_price": cycle.open_price,
-            "cycle_return_from_open": cycle.return_from_open,
-            "live_ret_1": live_ret_1,
-            "live_ret_3": live_ret_3,
-            "closed_ret_1": closed_ret_1,
-            "closed_ret_3": closed_ret_3,
-            "ret_1": ret_1,
-            "ret_3": ret_3,
-            "ret_5": ret_5,
-            "ret_10": ret_10,
-            "ret_30": ret_30,
-            "boll_pos": boll_pos,
-            "boll_width": boll_width,
-            "volume_z": volume_z,
-            "volatility": volatility,
-            "body_ratio": body_ratio,
-            "age_seconds": age_seconds
+            "market": {
+                "source": snapshot.latest_source,
+                "latest_mark_price": snapshot.latest_mark_price,
+                "latest_trade_price": snapshot.latest_trade_price,
+                "latest_futures_kline_price": snapshot.latest_futures_kline_price,
+                "last_message_at": snapshot.last_message_at,
+                "latest_price_time_ms": snapshot.latest_price_time_ms,
+                "latest_candle_close_time_ms": latest.close_time_ms,
+                "age_seconds": age_seconds
+            },
+            "basis": {
+                "mark_index_basis": mark_index_basis,
+                "trade_index_basis": trade_index_basis,
+                "futures_kline_index_basis": futures_kline_index_basis,
+                "basis_score": basis_score
+            },
+            "scores": {
+                "continuation_score": continuation_score,
+                "momentum_score": momentum_score,
+                "trend_score": trend_score,
+                "volume_score": volume_score,
+                "mean_reversion_score": mean_reversion_score,
+                "candle_score": candle_score,
+                "live_score": live_score,
+                "cycle_score": cycle_score
+            },
+            "reversal": {
+                "mode": reversal_mode,
+                "upper_extreme": upper_extreme,
+                "lower_extreme": lower_extreme,
+                "up_move_intensity": up_move_intensity,
+                "down_move_intensity": down_move_intensity,
+                "bottom_confirmed": bottom_reversal_confirmed,
+                "top_confirmed": top_reversal_confirmed,
+                "bottom_signal_score": bottom_reversal_signal_score,
+                "top_signal_score": top_reversal_signal_score
+            },
+            "cycle": {
+                "start_ms": cycle.start_ms,
+                "progress": cycle.progress,
+                "open_price": cycle.open_price,
+                "return_from_open": cycle.return_from_open
+            },
+            "returns": {
+                "live_ret_1": live_ret_1,
+                "live_ret_3": live_ret_3,
+                "closed_ret_1": closed_ret_1,
+                "closed_ret_3": closed_ret_3,
+                "ret_1": ret_1,
+                "ret_3": ret_3,
+                "ret_5": ret_5,
+                "ret_10": ret_10,
+                "ret_30": ret_30
+            },
+            "shape": {
+                "boll_pos": boll_pos,
+                "boll_width": boll_width,
+                "volume_z": volume_z,
+                "volatility": volatility,
+                "body_ratio": body_ratio
+            }
         }),
     })
 }

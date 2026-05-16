@@ -57,15 +57,24 @@ For each prediction timestamp, compute:
 
 ## First Model
 
-Use a transparent weighted score model first:
+Use a transparent weighted score model first. The first pass is a continuation score:
 
 ```text
-score = momentum_score
-      + trend_score
-      + volume_score
-      + volatility_score
-      + mean_reversion_score
+continuation_score = momentum_score
+                   + trend_score
+                   + volume_score
+                   + mean_reversion_score
+                   + candle_score
+                   + live_score
+                   + cycle_score
+                   + basis_score
 ```
+
+At Bollinger-band extremes the engine applies an event-contract guard:
+
+- If price is already extended in the same direction, emit `HOLD` instead of chasing a late move.
+- If price reaches an extreme and then confirms a reclaim/rejection with live returns, use a separate top/bottom reversal score.
+- Reversal score must still pass the same configured thresholds before a real signal is emitted.
 
 Direction mapping:
 
