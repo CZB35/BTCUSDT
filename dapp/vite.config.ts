@@ -10,7 +10,7 @@ export default defineConfig(({ mode }) => {
       host: "127.0.0.1",
       port: 5174,
       proxy: {
-        "/v1": env.VITE_API_BASE_URL || "http://127.0.0.1:8787"
+        "/v1": env.VITE_API_BASE_URL || "http:///66.245.218.165:8787"
       }
     }
   };
