@@ -94,6 +94,12 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v2";
+const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
+const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
+const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.65;
+const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
+const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -511,7 +517,20 @@ fn start_prediction_loop(state: &SharedState) {
                 continue;
             }
             match evaluate_prediction(&state, &config).await {
-                Ok(decision) => {
+                Ok(mut decision) => {
+                    if let Some(pool) = state.db.as_ref() {
+                        if let Err(err) =
+                            apply_prediction_calibration(pool, &config, &mut decision).await
+                        {
+                            let calibration = PredictionCalibration::disabled(&config);
+                            merge_prediction_calibration(&mut decision, &calibration, None);
+                            let mut runtime = state.prediction_runtime.write().await;
+                            runtime.last_error = Some(err.message.clone());
+                        }
+                    } else {
+                        let calibration = PredictionCalibration::disabled(&config);
+                        merge_prediction_calibration(&mut decision, &calibration, None);
+                    }
                     update_prediction_runtime(&state, &decision).await;
                     if let Some(pool) = state.db.as_ref() {
                         let _ = db_insert_prediction_observation(pool, &decision).await;
@@ -987,7 +1006,7 @@ impl SignalCore {
             predicted_return: dec!(0.0008),
             entry_price: dec!(0),
             suggested_stake,
-            model_version: "score-v1".to_string(),
+            model_version: PREDICTION_MODEL_VERSION.to_string(),
             created_at: now,
         }
     }
@@ -1014,7 +1033,7 @@ impl SignalCore {
             predicted_return: decimal_from_f64(decision.predicted_return, 10),
             entry_price: decimal_from_f64(decision.entry_price, 8),
             suggested_stake: MIN_EVENT_STAKE,
-            model_version: "score-v1".to_string(),
+            model_version: PREDICTION_MODEL_VERSION.to_string(),
             created_at: Utc::now(),
         }
     }
@@ -1071,6 +1090,11 @@ struct PredictionConfig {
     market_ws_url: String,
     market_ws_reconnect_seconds: u64,
     signal_cooldown_seconds: i64,
+    calibration_lookback_minutes: i64,
+    calibration_min_samples: i32,
+    calibration_min_win_rate: f64,
+    calibration_min_ev_usdt: f64,
+    calibration_sample_seconds: i64,
 }
 
 #[derive(Clone, Serialize, Deserialize)]
@@ -1083,6 +1107,10 @@ struct PredictionSettings {
     technical_weight: Decimal,
     probability_weight: Decimal,
     volatility_floor: Decimal,
+    calibration_lookback_minutes: i32,
+    calibration_min_samples: i32,
+    calibration_min_win_rate: Decimal,
+    calibration_min_ev_usdt: Decimal,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -1097,6 +1125,16 @@ impl Default for PredictionSettings {
             technical_weight: decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6),
             probability_weight: decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6),
             volatility_floor: decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8),
+            calibration_lookback_minutes: DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32,
+            calibration_min_samples: DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES,
+            calibration_min_win_rate: decimal_from_f64(
+                DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE,
+                6,
+            ),
+            calibration_min_ev_usdt: decimal_from_f64(
+                DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT,
+                4,
+            ),
             updated_at: None,
         }
     }
@@ -1133,6 +1171,47 @@ struct PredictionDecision {
     market_candles: usize,
     reason: String,
     feature_snapshot: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+struct PredictionCandidate {
+    direction: String,
+    mode: String,
+    rule: String,
+    raw_confidence: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PredictionCalibration {
+    allowed: bool,
+    sample_count: i64,
+    wins: i64,
+    win_rate: f64,
+    ev_usdt: f64,
+    min_samples: i32,
+    min_win_rate: f64,
+    min_ev_usdt: f64,
+    lookback_minutes: i64,
+    sample_seconds: i64,
+    reason: String,
+}
+
+impl PredictionCalibration {
+    fn disabled(config: &PredictionConfig) -> Self {
+        Self {
+            allowed: false,
+            sample_count: 0,
+            wins: 0,
+            win_rate: 0.0,
+            ev_usdt: -5.0,
+            min_samples: config.calibration_min_samples,
+            min_win_rate: config.calibration_min_win_rate,
+            min_ev_usdt: config.calibration_min_ev_usdt,
+            lookback_minutes: config.calibration_lookback_minutes,
+            sample_seconds: config.calibration_sample_seconds,
+            reason: "calibration unavailable".to_string(),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -1569,6 +1648,31 @@ impl PredictionConfig {
                 DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS,
                 0,
             ),
+            calibration_lookback_minutes: env_i64(
+                "PREDICTION_CALIBRATION_LOOKBACK_MINUTES",
+                DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES,
+                10,
+            ),
+            calibration_min_samples: env_i32(
+                "PREDICTION_CALIBRATION_MIN_SAMPLES",
+                DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES,
+                1,
+            ),
+            calibration_min_win_rate: env_f64(
+                "PREDICTION_CALIBRATION_MIN_WIN_RATE",
+                DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE,
+                0.0,
+            ),
+            calibration_min_ev_usdt: env_f64(
+                "PREDICTION_CALIBRATION_MIN_EV_USDT",
+                DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT,
+                -5.0,
+            ),
+            calibration_sample_seconds: env_i64(
+                "PREDICTION_CALIBRATION_SAMPLE_SECONDS",
+                DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS,
+                10,
+            ),
         }
     }
 
@@ -1606,6 +1710,19 @@ impl PredictionConfig {
             .to_string()
             .parse::<f64>()
             .unwrap_or(self.volatility_floor);
+        next.calibration_lookback_minutes =
+            i64::from(settings.calibration_lookback_minutes).max(10);
+        next.calibration_min_samples = settings.calibration_min_samples.max(1);
+        next.calibration_min_win_rate = settings
+            .calibration_min_win_rate
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.calibration_min_win_rate);
+        next.calibration_min_ev_usdt = settings
+            .calibration_min_ev_usdt
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.calibration_min_ev_usdt);
         next.signal_cooldown_seconds = self.signal_cooldown_seconds.max(0);
         next
     }
@@ -4992,24 +5109,57 @@ fn build_prediction_decision(
         -12.0,
         12.0,
     );
-    let confidence = clamp(edge_probability, 0.0, 0.99);
+    let base_confidence = clamp(edge_probability, 0.0, 0.99);
     let predicted_return = clamp(expected_expiry_return, -0.003, 0.003);
-    let mut direction = if model_score >= config.up_threshold {
-        "UP".to_string()
-    } else if model_score <= config.down_threshold {
-        "DOWN".to_string()
-    } else {
-        "HOLD".to_string()
-    };
-    let mut reason = format!(
-        "score {model_score:.4} confidence {confidence:.4} expiry_prob up {up_probability:.4} down {down_probability:.4}"
+    let market_regime = classify_prediction_regime(
+        cycle.return_from_open,
+        ret_3,
+        ret_5,
+        live_ret_1,
+        live_ret_3,
+        boll_width,
+        volatility,
+        mark_index_basis,
+        trade_index_basis,
     );
+    let candidate = prediction_candidate(
+        model_score,
+        &market_regime,
+        upper_extreme,
+        lower_extreme,
+        up_move_intensity,
+        down_move_intensity,
+        live_ret_1,
+        live_ret_3,
+        ret_1,
+        ret_3,
+        ret_5,
+        cycle.return_from_open,
+        base_confidence,
+    );
+    let mut direction = candidate
+        .as_ref()
+        .map(|candidate| candidate.direction.clone())
+        .unwrap_or_else(|| "HOLD".to_string());
+    let confidence = candidate
+        .as_ref()
+        .map(|candidate| candidate.raw_confidence)
+        .unwrap_or(base_confidence);
+    let mut reason = match candidate.as_ref() {
+        Some(candidate) => format!(
+            "candidate {} mode {} rule {} score {:.4} raw_confidence {:.4}",
+            candidate.direction, candidate.mode, candidate.rule, model_score, candidate.raw_confidence
+        ),
+        None => format!(
+            "hold no candidate mode {market_regime} score {model_score:.4} raw_confidence {base_confidence:.4}"
+        ),
+    };
     if age_seconds > config.stale_seconds {
         direction = "HOLD".to_string();
         reason = format!("hold stale data age {age_seconds}s");
-    } else if confidence < config.min_confidence {
+    } else if base_confidence < config.min_confidence {
         direction = "HOLD".to_string();
-        reason = format!("hold low confidence {confidence:.4}");
+        reason = format!("hold low raw confidence {base_confidence:.4}");
     } else if volatility < 0.00012 {
         direction = "HOLD".to_string();
         reason = format!("hold low volatility {volatility:.6}");
@@ -5017,28 +5167,6 @@ fn build_prediction_decision(
         direction = "HOLD".to_string();
         reason = format!(
             "hold basis abnormal mark_index {mark_index_basis:.6} trade_index {trade_index_basis:.6}"
-        );
-    } else if direction == "UP"
-        && reversal_mode == "none"
-        && upper_extreme > 0.75
-        && up_move_intensity > 0.45
-        && (live_ret_1 < -0.00005 || live_ret_3 < -0.00015 || ret_1 < -0.00010)
-    {
-        direction = "HOLD".to_string();
-        reason = format!(
-            "hold overextended up move boll_pos {boll_pos:.4} live_ret_1 {live_ret_1:.6} cycle_ret {:.6}",
-            cycle.return_from_open
-        );
-    } else if direction == "DOWN"
-        && reversal_mode == "none"
-        && lower_extreme > 0.75
-        && down_move_intensity > 0.45
-        && (live_ret_1 > 0.00005 || live_ret_3 > 0.00015 || ret_1 > 0.00010)
-    {
-        direction = "HOLD".to_string();
-        reason = format!(
-            "hold overextended down move boll_pos {boll_pos:.4} live_ret_1 {live_ret_1:.6} cycle_ret {:.6}",
-            cycle.return_from_open
         );
     }
     let cycle_start = millis_to_utc(snapshot.latest_price_time_ms)?;
@@ -5074,6 +5202,7 @@ fn build_prediction_decision(
             },
             "scores": {
                 "model_score": model_score,
+                "raw_confidence": base_confidence,
                 "technical_score": score,
                 "probability_score": probability_score,
                 "technical_weight": technical_weight,
@@ -5086,6 +5215,14 @@ fn build_prediction_decision(
                 "candle_score": candle_score,
                 "live_score": live_score,
                 "cycle_score": cycle_score
+            },
+            "decision": {
+                "model_version": PREDICTION_MODEL_VERSION,
+                "regime": market_regime,
+                "candidate_direction": candidate.as_ref().map(|candidate| candidate.direction.as_str()),
+                "candidate_mode": candidate.as_ref().map(|candidate| candidate.mode.as_str()),
+                "candidate_rule": candidate.as_ref().map(|candidate| candidate.rule.as_str()),
+                "calibration_required": true
             },
             "reversal": {
                 "mode": reversal_mode,
@@ -5147,6 +5284,246 @@ fn build_prediction_decision(
             }
         }),
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn classify_prediction_regime(
+    cycle_ret: f64,
+    ret_3: f64,
+    ret_5: f64,
+    live_ret_1: f64,
+    live_ret_3: f64,
+    boll_width: f64,
+    volatility: f64,
+    mark_index_basis: f64,
+    trade_index_basis: f64,
+) -> String {
+    if mark_index_basis.abs() > 0.0008 || trade_index_basis.abs() > 0.0012 {
+        return "chaos".to_string();
+    }
+    if volatility < 0.00012 || boll_width < 0.00045 {
+        return "quiet".to_string();
+    }
+    let impulse_up = cycle_ret > 0.00120 && ret_3 > 0.00035 && live_ret_3 > 0.00010;
+    let impulse_down = cycle_ret < -0.00120 && ret_3 < -0.00035 && live_ret_3 < -0.00010;
+    if impulse_up || impulse_down {
+        return "impulse".to_string();
+    }
+    let trend_up = ret_5 > 0.00070 && ret_3 > 0.00025 && live_ret_1 > -0.00008;
+    let trend_down = ret_5 < -0.00070 && ret_3 < -0.00025 && live_ret_1 < 0.00008;
+    if trend_up {
+        "trend_up".to_string()
+    } else if trend_down {
+        "trend_down".to_string()
+    } else {
+        "mean_reversion".to_string()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prediction_candidate(
+    model_score: f64,
+    market_regime: &str,
+    upper_extreme: f64,
+    lower_extreme: f64,
+    up_move_intensity: f64,
+    down_move_intensity: f64,
+    live_ret_1: f64,
+    live_ret_3: f64,
+    ret_1: f64,
+    ret_3: f64,
+    ret_5: f64,
+    cycle_ret: f64,
+    raw_confidence: f64,
+) -> Option<PredictionCandidate> {
+    if matches!(market_regime, "chaos" | "quiet") {
+        return None;
+    }
+    let top_overheated = model_score >= 1.5
+        && (upper_extreme > 0.55 || cycle_ret > 0.00070 || ret_3 > 0.00045)
+        && up_move_intensity > 0.15;
+    let bottom_oversold = model_score <= -1.2
+        && (lower_extreme > 0.35 || cycle_ret < -0.00025 || ret_3 < -0.00035)
+        && down_move_intensity > 0.05;
+    match market_regime {
+        "mean_reversion" => {
+            if bottom_oversold && !(live_ret_1 < -0.00035 && live_ret_3 < -0.00055) {
+                Some(PredictionCandidate {
+                    direction: "UP".to_string(),
+                    mode: "mean_reversion".to_string(),
+                    rule: "oversold_rebound".to_string(),
+                    raw_confidence,
+                })
+            } else if top_overheated && !(live_ret_1 > 0.00035 && live_ret_3 > 0.00055) {
+                Some(PredictionCandidate {
+                    direction: "DOWN".to_string(),
+                    mode: "mean_reversion".to_string(),
+                    rule: "overheated_pullback".to_string(),
+                    raw_confidence,
+                })
+            } else {
+                None
+            }
+        }
+        "impulse" => {
+            let upward_impulse_fading = top_overheated
+                && live_ret_1 <= 0.00005
+                && (ret_1 < 0.00020 || live_ret_3 < 0.00025);
+            let downward_impulse_fading = bottom_oversold
+                && live_ret_1 >= -0.00005
+                && (ret_1 > -0.00020 || live_ret_3 > -0.00025);
+            if upward_impulse_fading {
+                Some(PredictionCandidate {
+                    direction: "DOWN".to_string(),
+                    mode: "impulse_fade".to_string(),
+                    rule: "up_impulse_fading".to_string(),
+                    raw_confidence,
+                })
+            } else if downward_impulse_fading {
+                Some(PredictionCandidate {
+                    direction: "UP".to_string(),
+                    mode: "impulse_fade".to_string(),
+                    rule: "down_impulse_fading".to_string(),
+                    raw_confidence,
+                })
+            } else {
+                None
+            }
+        }
+        "trend_up" => {
+            let pullback_reclaim = model_score > 0.6
+                && ret_5 > 0.00055
+                && ret_1 > -0.00020
+                && live_ret_1 > 0.00003
+                && upper_extreme < 0.75;
+            if pullback_reclaim {
+                Some(PredictionCandidate {
+                    direction: "UP".to_string(),
+                    mode: "trend_pullback".to_string(),
+                    rule: "up_pullback_reclaim".to_string(),
+                    raw_confidence,
+                })
+            } else {
+                None
+            }
+        }
+        "trend_down" => {
+            let bounce_reject = model_score < -0.6
+                && ret_5 < -0.00055
+                && ret_1 < 0.00020
+                && live_ret_1 < -0.00003
+                && lower_extreme < 0.75;
+            if bounce_reject {
+                Some(PredictionCandidate {
+                    direction: "DOWN".to_string(),
+                    mode: "trend_pullback".to_string(),
+                    rule: "down_bounce_reject".to_string(),
+                    raw_confidence,
+                })
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+async fn apply_prediction_calibration(
+    pool: &PgPool,
+    config: &PredictionConfig,
+    decision: &mut PredictionDecision,
+) -> Result<(), AppError> {
+    if !matches!(decision.direction.as_str(), "UP" | "DOWN") {
+        let calibration = PredictionCalibration::disabled(config);
+        merge_prediction_calibration(decision, &calibration, None);
+        return Ok(());
+    }
+    let candidate = prediction_candidate_from_snapshot(&decision.feature_snapshot);
+    let Some(candidate) = candidate else {
+        let calibration = PredictionCalibration::disabled(config);
+        merge_prediction_calibration(decision, &calibration, None);
+        return Ok(());
+    };
+    let calibration = db_prediction_calibration(pool, config, &candidate).await?;
+    merge_prediction_calibration(decision, &calibration, Some(&candidate));
+    Ok(())
+}
+
+fn prediction_candidate_from_snapshot(snapshot: &serde_json::Value) -> Option<PredictionCandidate> {
+    let decision = snapshot.get("decision")?;
+    let direction = decision.get("candidate_direction")?.as_str()?.to_string();
+    let mode = decision.get("candidate_mode")?.as_str()?.to_string();
+    let rule = decision.get("candidate_rule")?.as_str()?.to_string();
+    let raw_confidence = snapshot
+        .get("scores")
+        .and_then(|scores| scores.get("raw_confidence"))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0);
+    Some(PredictionCandidate {
+        direction,
+        mode,
+        rule,
+        raw_confidence,
+    })
+}
+
+fn merge_prediction_calibration(
+    decision: &mut PredictionDecision,
+    calibration: &PredictionCalibration,
+    candidate: Option<&PredictionCandidate>,
+) {
+    let candidate_direction = candidate.map(|candidate| candidate.direction.as_str());
+    if let Some(candidate) = candidate {
+        if calibration.allowed {
+            decision.direction = candidate.direction.clone();
+            decision.confidence = calibration.win_rate;
+            decision.reason = format!(
+                "send {} mode {} rule {} calibrated win {:.4} ev {:.4} samples {}/{}",
+                candidate.direction,
+                candidate.mode,
+                candidate.rule,
+                calibration.win_rate,
+                calibration.ev_usdt,
+                calibration.sample_count,
+                calibration.min_samples
+            );
+        } else {
+            decision.direction = "HOLD".to_string();
+            decision.confidence = calibration.win_rate;
+            decision.reason = calibration.reason.clone();
+        }
+    } else {
+        let existing_reason = decision.reason.clone();
+        decision.direction = "HOLD".to_string();
+        decision.confidence = 0.0;
+        decision.reason = if existing_reason.starts_with("hold ") {
+            existing_reason
+        } else {
+            format!("hold no candidate; {}", calibration.reason)
+        };
+    }
+    let mut snapshot = decision.feature_snapshot.clone();
+    if let Some(object) = snapshot.as_object_mut() {
+        object.insert(
+            "calibration".to_string(),
+            json!({
+                "model_version": PREDICTION_MODEL_VERSION,
+                "allowed": calibration.allowed,
+                "candidate_direction": candidate_direction,
+                "sample_count": calibration.sample_count,
+                "wins": calibration.wins,
+                "win_rate": calibration.win_rate,
+                "ev_usdt": calibration.ev_usdt,
+                "min_samples": calibration.min_samples,
+                "min_win_rate": calibration.min_win_rate,
+                "min_ev_usdt": calibration.min_ev_usdt,
+                "lookback_minutes": calibration.lookback_minutes,
+                "sample_seconds": calibration.sample_seconds,
+                "reason": calibration.reason
+            }),
+        );
+    }
+    decision.feature_snapshot = snapshot;
 }
 
 fn json_i64(value: &serde_json::Value) -> Result<i64, AppError> {
@@ -6687,6 +7064,34 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
             "volatility_floor must be between 0.00001 and 0.002",
         ));
     }
+    if settings.calibration_lookback_minutes < 10 || settings.calibration_lookback_minutes > 1440 {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "calibration_lookback_minutes must be between 10 and 1440",
+        ));
+    }
+    if settings.calibration_min_samples < 1 || settings.calibration_min_samples > 300 {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "calibration_min_samples must be between 1 and 300",
+        ));
+    }
+    if settings.calibration_min_win_rate < dec!(0.50)
+        || settings.calibration_min_win_rate > dec!(0.95)
+    {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "calibration_min_win_rate must be between 0.50 and 0.95",
+        ));
+    }
+    if settings.calibration_min_ev_usdt < dec!(-1.00)
+        || settings.calibration_min_ev_usdt > dec!(5.00)
+    {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "calibration_min_ev_usdt must be between -1 and 5",
+        ));
+    }
     Ok(())
 }
 
@@ -8120,7 +8525,9 @@ async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings
     sqlx::query(
         r#"
         select enabled, interval_seconds, up_threshold, down_threshold, min_confidence,
-               technical_weight, probability_weight, volatility_floor, updated_at
+               technical_weight, probability_weight, volatility_floor,
+               calibration_lookback_minutes, calibration_min_samples,
+               calibration_min_win_rate, calibration_min_ev_usdt, updated_at
         from prediction_settings
         where id = true
         "#,
@@ -8143,6 +8550,18 @@ async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings
             volatility_floor: row
                 .try_get("volatility_floor")
                 .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8)),
+            calibration_lookback_minutes: row
+                .try_get("calibration_lookback_minutes")
+                .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32),
+            calibration_min_samples: row
+                .try_get("calibration_min_samples")
+                .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES),
+            calibration_min_win_rate: row.try_get("calibration_min_win_rate").unwrap_or_else(
+                |_| decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE, 6),
+            ),
+            calibration_min_ev_usdt: row.try_get("calibration_min_ev_usdt").unwrap_or_else(|_| {
+                decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT, 4)
+            }),
             updated_at: row.get("updated_at"),
         })
         .unwrap_or_default()
@@ -8158,8 +8577,10 @@ async fn db_save_prediction_settings(
         r#"
         insert into prediction_settings
           (id, enabled, interval_seconds, up_threshold, down_threshold, min_confidence,
-           technical_weight, probability_weight, volatility_floor, updated_at)
-        values (true, $1, $2, $3, $4, $5, $6, $7, $8, now())
+           technical_weight, probability_weight, volatility_floor,
+           calibration_lookback_minutes, calibration_min_samples,
+           calibration_min_win_rate, calibration_min_ev_usdt, updated_at)
+        values (true, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, now())
         on conflict (id) do update set
           enabled = excluded.enabled,
           interval_seconds = excluded.interval_seconds,
@@ -8169,6 +8590,10 @@ async fn db_save_prediction_settings(
           technical_weight = excluded.technical_weight,
           probability_weight = excluded.probability_weight,
           volatility_floor = excluded.volatility_floor,
+          calibration_lookback_minutes = excluded.calibration_lookback_minutes,
+          calibration_min_samples = excluded.calibration_min_samples,
+          calibration_min_win_rate = excluded.calibration_min_win_rate,
+          calibration_min_ev_usdt = excluded.calibration_min_ev_usdt,
           updated_at = now()
         "#,
     )
@@ -8180,6 +8605,10 @@ async fn db_save_prediction_settings(
     .bind(settings.technical_weight)
     .bind(settings.probability_weight)
     .bind(settings.volatility_floor)
+    .bind(settings.calibration_lookback_minutes)
+    .bind(settings.calibration_min_samples)
+    .bind(settings.calibration_min_win_rate)
+    .bind(settings.calibration_min_ev_usdt)
     .execute(pool)
     .await
     .map(|_| ())
@@ -8808,7 +9237,7 @@ async fn db_insert_prediction_observation(
     .bind("strategy_loop")
     .bind(DEFAULT_SYMBOL)
     .bind(DEFAULT_PERIOD_SECONDS)
-    .bind("score-v1")
+    .bind(PREDICTION_MODEL_VERSION)
     .bind(&decision.direction)
     .bind(decimal_from_f64(decision.confidence, 6))
     .bind(decimal_from_f64(decision.predicted_return, 10))
@@ -8821,6 +9250,115 @@ async fn db_insert_prediction_observation(
     .await
     .map(|_| ())
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_prediction_calibration(
+    pool: &PgPool,
+    config: &PredictionConfig,
+    candidate: &PredictionCandidate,
+) -> Result<PredictionCalibration, AppError> {
+    let gross_win = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE);
+    let fee = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE * PROFIT_SHARE_RATE);
+    let net_win = gross_win - fee;
+    let loss = decimal_to_f64(MIN_EVENT_STAKE);
+    let row = sqlx::query(
+        r#"
+        with matched as (
+          select distinct on (
+                   floor(extract(epoch from o.created_at) / $6::double precision)
+                 )
+                 o.created_at,
+                 o.entry_price::float8 as entry_price,
+                 f.entry_price::float8 as future_price
+          from prediction_observations o
+          join lateral (
+            select entry_price
+            from prediction_observations p
+            where p.created_at >= o.created_at + interval '10 minutes'
+            order by p.created_at asc
+            limit 1
+          ) f on true
+          where o.model_version = $1
+            and o.created_at >= now() - ($2::text || ' minutes')::interval
+            and o.created_at <= now() - interval '10 minutes'
+            and o.feature_snapshot->'decision'->>'candidate_mode' = $3
+            and o.feature_snapshot->'decision'->>'candidate_rule' = $4
+            and o.feature_snapshot->'decision'->>'candidate_direction' = $5
+          order by floor(extract(epoch from o.created_at) / $6::double precision), o.created_at desc
+        ),
+        scored as (
+          select *,
+                 case
+                   when $5 = 'UP' and future_price > entry_price then 1
+                   when $5 = 'DOWN' and future_price < entry_price then 1
+                   else 0
+                 end as win
+          from matched
+        )
+        select count(*)::bigint as samples,
+               coalesce(sum(win), 0)::bigint as wins
+        from scored
+        "#,
+    )
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(config.calibration_lookback_minutes)
+    .bind(&candidate.mode)
+    .bind(&candidate.rule)
+    .bind(&candidate.direction)
+    .bind(config.calibration_sample_seconds.max(1))
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    let sample_count: i64 = row.get("samples");
+    let wins: i64 = row.get("wins");
+    let win_rate = if sample_count > 0 {
+        wins as f64 / sample_count as f64
+    } else {
+        0.0
+    };
+    let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
+    let allowed = sample_count >= i64::from(config.calibration_min_samples)
+        && win_rate >= config.calibration_min_win_rate
+        && ev_usdt >= config.calibration_min_ev_usdt;
+    let reason = if sample_count < i64::from(config.calibration_min_samples) {
+        format!(
+            "hold calibration warmup mode {} rule {} direction {} samples {}/{}",
+            candidate.mode,
+            candidate.rule,
+            candidate.direction,
+            sample_count,
+            config.calibration_min_samples
+        )
+    } else if win_rate < config.calibration_min_win_rate {
+        format!(
+            "hold calibration win_rate {:.4} < {:.4} mode {} rule {} samples {}",
+            win_rate, config.calibration_min_win_rate, candidate.mode, candidate.rule, sample_count
+        )
+    } else if ev_usdt < config.calibration_min_ev_usdt {
+        format!(
+            "hold calibration ev {:.4} < {:.4} mode {} rule {} samples {}",
+            ev_usdt, config.calibration_min_ev_usdt, candidate.mode, candidate.rule, sample_count
+        )
+    } else {
+        format!(
+            "calibration passed win_rate {:.4} ev {:.4} mode {} rule {} samples {}",
+            win_rate, ev_usdt, candidate.mode, candidate.rule, sample_count
+        )
+    };
+    Ok(PredictionCalibration {
+        allowed,
+        sample_count,
+        wins,
+        win_rate,
+        ev_usdt,
+        min_samples: config.calibration_min_samples,
+        min_win_rate: config.calibration_min_win_rate,
+        min_ev_usdt: config.calibration_min_ev_usdt,
+        lookback_minutes: config.calibration_lookback_minutes,
+        sample_seconds: config.calibration_sample_seconds,
+        reason,
+    })
 }
 
 async fn db_prediction_observations(
@@ -12231,6 +12769,10 @@ fn money(value: Decimal) -> String {
 fn decimal_from_f64(value: f64, scale: u32) -> Decimal {
     let scale = scale as usize;
     Decimal::from_str(&format!("{value:.scale$}")).unwrap_or(Decimal::ZERO)
+}
+
+fn decimal_to_f64(value: Decimal) -> f64 {
+    value.to_string().parse::<f64>().unwrap_or(0.0)
 }
 
 fn reservation_release_entry_type(reason: &str) -> &'static str {

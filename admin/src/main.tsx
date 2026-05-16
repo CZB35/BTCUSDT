@@ -83,6 +83,10 @@ type PredictionSettings = {
   technical_weight: string;
   probability_weight: string;
   volatility_floor: string;
+  calibration_lookback_minutes: number;
+  calibration_min_samples: number;
+  calibration_min_win_rate: string;
+  calibration_min_ev_usdt: string;
   updated_at?: string | null;
 };
 
@@ -340,7 +344,11 @@ function App() {
     min_confidence: "0.62",
     technical_weight: "0.35",
     probability_weight: "0.65",
-    volatility_floor: "0.00016"
+    volatility_floor: "0.00016",
+    calibration_lookback_minutes: 180,
+    calibration_min_samples: 30,
+    calibration_min_win_rate: "0.65",
+    calibration_min_ev_usdt: "0.01"
   });
   const [predictionObservations, setPredictionObservations] = useState<PredictionObservation[]>([]);
   const [workerName, setWorkerName] = useState("");
@@ -1185,6 +1193,38 @@ function PredictionPage({
         <label>
           波动率下限
           <input value={draft.volatility_floor} onChange={(event) => updateDraft({ volatility_floor: event.target.value })} />
+        </label>
+        <label>
+          校准窗口（分钟）
+          <input
+            value={draft.calibration_lookback_minutes}
+            onChange={(event) =>
+              updateDraft({ calibration_lookback_minutes: Number(event.target.value) || 180 })
+            }
+          />
+        </label>
+        <label>
+          校准最小样本
+          <input
+            value={draft.calibration_min_samples}
+            onChange={(event) =>
+              updateDraft({ calibration_min_samples: Number(event.target.value) || 30 })
+            }
+          />
+        </label>
+        <label>
+          校准最低胜率
+          <input
+            value={draft.calibration_min_win_rate}
+            onChange={(event) => updateDraft({ calibration_min_win_rate: event.target.value })}
+          />
+        </label>
+        <label>
+          校准最低EV
+          <input
+            value={draft.calibration_min_ev_usdt}
+            onChange={(event) => updateDraft({ calibration_min_ev_usdt: event.target.value })}
+          />
         </label>
         <button className="primary" onClick={saveDraft}>
           <Power size={18} />
