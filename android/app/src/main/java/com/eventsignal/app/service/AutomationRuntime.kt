@@ -18,6 +18,12 @@ object AutomationRuntime {
         running = false
     }
 
+    fun restoreIfDesired(desired: Boolean) {
+        if (desired) {
+            running = true
+        }
+    }
+
     fun requestCalibration(): Long =
         calibrationRequests.incrementAndGet()
 

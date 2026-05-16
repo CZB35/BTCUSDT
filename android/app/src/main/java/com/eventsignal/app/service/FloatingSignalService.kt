@@ -129,6 +129,7 @@ class FloatingSignalService : Service() {
             text = "\u505c"
             styleOverlayButton()
             setOnClickListener {
+                stateStore.saveRuntimeDesired(false)
                 AutomationRuntime.stop()
                 stopService(Intent(this@FloatingSignalService, SignalForegroundService::class.java))
                 stopService(Intent(this@FloatingSignalService, AutomationForegroundService::class.java))

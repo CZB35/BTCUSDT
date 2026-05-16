@@ -41,6 +41,7 @@ class AutomationForegroundService : Service() {
         super.onCreate()
         stateStore = AutomationStateStore(applicationContext)
         stateStore.saveConnectionState("stopped")
+        stateStore.saveRuntimeDesired(true)
         startForeground(
             1002,
             runtimeNotification(this, "Automation active", "Monitoring authorized action state"),
@@ -56,6 +57,7 @@ class AutomationForegroundService : Service() {
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         acquireWakeLock()
+        stateStore.saveRuntimeDesired(true)
         AutomationRuntime.running = true
         startSessionRefreshLoop()
         startSignalSocket()
@@ -64,7 +66,9 @@ class AutomationForegroundService : Service() {
     }
 
     override fun onDestroy() {
-        AutomationRuntime.running = false
+        if (!stateStore.loadRuntimeDesired()) {
+            AutomationRuntime.running = false
+        }
         releaseWakeLock()
         webSocket?.cancel()
         webSocket = null
@@ -111,7 +115,7 @@ class AutomationForegroundService : Service() {
         scope.launch {
             while (isActive) {
                 delay(1_000)
-                if (!AutomationRuntime.running) {
+                if (!AutomationRuntime.running && !stateStore.loadRuntimeDesired()) {
                     releaseWakeLock()
                     webSocket?.cancel()
                     stopSelf()
@@ -274,6 +278,7 @@ class AutomationForegroundService : Service() {
         if (!signal.tradeAuthorized) {
             when (signal.authorizationStatus) {
                 "fee_reserve_insufficient" -> {
+                    stateStore.saveRuntimeDesired(false)
                     AutomationRuntime.stop()
                     stateStore.saveLastStatus("ws_signal_not_authorized_fee_reserve_insufficient")
                 }
@@ -283,6 +288,7 @@ class AutomationForegroundService : Service() {
                 "exchange_balance_stale",
                 "unknown",
                 -> {
+                    stateStore.saveRuntimeDesired(false)
                     AutomationRuntime.stop()
                     stateStore.saveLastStatus("ws_signal_not_authorized_account_gate")
                 }

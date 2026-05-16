@@ -41,6 +41,7 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
         stateStore = AutomationStateStore(applicationContext)
         repository = EventSignalRepository(applicationContext)
         actionRunner = ActionRunner(this, stateStore)
+        AutomationRuntime.restoreIfDesired(stateStore.loadRuntimeDesired())
         stateStore.saveDebugState(
             AutomationDebugState(
                 accessibilityConnected = true,
@@ -75,6 +76,7 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
     }
 
     private fun refreshPageGate() {
+        AutomationRuntime.restoreIfDesired(stateStore.loadRuntimeDesired())
         if (!AutomationRuntime.running) return
         val settings = stateStore.loadSettings()
         if (!settings.automationEnabled || settings.executionMode != "automatic") return

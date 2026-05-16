@@ -35,6 +35,9 @@ class AutomationStateStore(context: Context) {
         private var cachedConnectionState: String? = null
 
         @Volatile
+        private var cachedRuntimeDesired: Boolean? = null
+
+        @Volatile
         private var cachedRuntimeSummary: AppRuntimeSummary? = null
 
         @Volatile
@@ -136,6 +139,19 @@ class AutomationStateStore(context: Context) {
     fun loadConnectionState(): String =
         cachedConnectionState ?: (prefs.getString("connection_state", "unknown") ?: "unknown").also {
             cachedConnectionState = it
+        }
+
+    fun saveRuntimeDesired(running: Boolean) {
+        cachedRuntimeDesired = running
+        prefs.edit()
+            .putBoolean("runtime_desired", running)
+            .putLong("runtime_desired_at_ms", System.currentTimeMillis())
+            .apply()
+    }
+
+    fun loadRuntimeDesired(): Boolean =
+        cachedRuntimeDesired ?: prefs.getBoolean("runtime_desired", false).also {
+            cachedRuntimeDesired = it
         }
 
     fun saveRuntimeSummary(summary: AppRuntimeSummary) {

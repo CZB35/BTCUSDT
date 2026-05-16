@@ -122,7 +122,7 @@ private fun MainScreen(repository: EventSignalRepository) {
     var debugState by remember { mutableStateOf(AutomationDebugState()) }
     var connectionState by remember { mutableStateOf(stateStore.loadConnectionState()) }
     var lastSocketStatus by remember { mutableStateOf(stateStore.loadLastStatus()) }
-    var automationRunning by remember { mutableStateOf(false) }
+    var automationRunning by remember { mutableStateOf(stateStore.loadRuntimeDesired()) }
     var status by remember { mutableStateOf("就绪") }
     var accessToken by remember { mutableStateOf(repository.accessToken().orEmpty()) }
     var walletAddress by remember { mutableStateOf("") }
@@ -171,6 +171,7 @@ private fun MainScreen(repository: EventSignalRepository) {
         context.stopService(Intent(context, SignalForegroundService::class.java))
         context.stopService(Intent(context, AutomationForegroundService::class.java))
         context.stopService(Intent(context, FloatingSignalService::class.java))
+        stateStore.saveRuntimeDesired(false)
         accessToken = ""
         automationRunning = false
         exchangeStatus = ExchangeCredentialStatus()
@@ -193,6 +194,7 @@ private fun MainScreen(repository: EventSignalRepository) {
             debugState = stateStore.loadDebugState()
             connectionState = stateStore.loadConnectionState()
             lastSocketStatus = stateStore.loadLastStatus()
+            automationRunning = stateStore.loadRuntimeDesired()
             delay(500)
         }
     }
@@ -385,10 +387,12 @@ private fun MainScreen(repository: EventSignalRepository) {
                             context.startForegroundService(Intent(context, SignalForegroundService::class.java))
                             context.startForegroundService(Intent(context, AutomationForegroundService::class.java))
                             context.startForegroundService(Intent(context, FloatingSignalService::class.java))
+                            stateStore.saveRuntimeDesired(true)
                             automationRunning = true
                             status = "自动化服务已启动"
                         },
                         onStop = {
+                            stateStore.saveRuntimeDesired(false)
                             context.stopService(Intent(context, SignalForegroundService::class.java))
                             context.stopService(Intent(context, AutomationForegroundService::class.java))
                             context.stopService(Intent(context, FloatingSignalService::class.java))

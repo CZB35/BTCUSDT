@@ -155,6 +155,7 @@ class ActionRunner(
     private fun pauseForUnauthorizedSignal(signal: SignalSnapshot) {
         when (signal.authorizationStatus) {
             "fee_reserve_insufficient" -> {
+                stateStore.saveRuntimeDesired(false)
                 AutomationRuntime.stop()
                 stateStore.saveLastStatus("signal_not_authorized_fee_reserve_insufficient")
             }
@@ -164,6 +165,7 @@ class ActionRunner(
             "exchange_balance_stale",
             "unknown",
             -> {
+                stateStore.saveRuntimeDesired(false)
                 AutomationRuntime.stop()
                 stateStore.saveLastStatus("signal_not_authorized_account_gate")
             }
