@@ -5169,6 +5169,8 @@ fn build_prediction_decision(
             "hold basis abnormal mark_index {mark_index_basis:.6} trade_index {trade_index_basis:.6}"
         );
     }
+    let pre_filter_passed = matches!(direction.as_str(), "UP" | "DOWN");
+    let pre_calibration_direction = direction.clone();
     let cycle_start = millis_to_utc(snapshot.latest_price_time_ms)?;
     Ok(PredictionDecision {
         direction,
@@ -5200,6 +5202,71 @@ fn build_prediction_decision(
                 "futures_kline_index_basis": futures_kline_index_basis,
                 "basis_score": basis_score
             },
+            "config": {
+                "model_version": PREDICTION_MODEL_VERSION,
+                "interval_seconds": config.interval_seconds,
+                "candle_limit": config.candle_limit,
+                "stale_seconds": config.stale_seconds,
+                "up_threshold": config.up_threshold,
+                "down_threshold": config.down_threshold,
+                "min_confidence": config.min_confidence,
+                "technical_weight": config.technical_weight,
+                "probability_weight": config.probability_weight,
+                "volatility_floor": config.volatility_floor,
+                "signal_cooldown_seconds": config.signal_cooldown_seconds,
+                "calibration_lookback_minutes": config.calibration_lookback_minutes,
+                "calibration_min_samples": config.calibration_min_samples,
+                "calibration_min_win_rate": config.calibration_min_win_rate,
+                "calibration_min_ev_usdt": config.calibration_min_ev_usdt,
+                "calibration_sample_seconds": config.calibration_sample_seconds
+            },
+            "rule_params": {
+                "hard_filters": {
+                    "low_volatility": 0.00012,
+                    "max_mark_index_basis_abs": 0.0008,
+                    "max_trade_index_basis_abs": 0.0012
+                },
+                "regime": {
+                    "quiet_volatility": 0.00012,
+                    "quiet_boll_width": 0.00045,
+                    "impulse_cycle_ret": 0.00120,
+                    "impulse_ret_3": 0.00035,
+                    "impulse_live_ret_3": 0.00010,
+                    "trend_ret_5": 0.00070,
+                    "trend_ret_3": 0.00025,
+                    "trend_live_ret_1": 0.00008
+                },
+                "candidate": {
+                    "top_score": 1.5,
+                    "bottom_score": -1.2,
+                    "top_upper_extreme": 0.55,
+                    "top_cycle_ret": 0.00070,
+                    "top_ret_3": 0.00045,
+                    "top_up_move_intensity": 0.15,
+                    "bottom_lower_extreme": 0.35,
+                    "bottom_cycle_ret": -0.00025,
+                    "bottom_ret_3": -0.00035,
+                    "bottom_down_move_intensity": 0.05,
+                    "mean_reversion_live_ret_1_limit": 0.00035,
+                    "mean_reversion_live_ret_3_limit": 0.00055,
+                    "impulse_fade_live_ret_1": 0.00005,
+                    "impulse_fade_ret_1": 0.00020,
+                    "impulse_fade_live_ret_3": 0.00025,
+                    "trend_pullback_score": 0.6,
+                    "trend_pullback_ret_5": 0.00055,
+                    "trend_pullback_ret_1": 0.00020,
+                    "trend_pullback_live_ret_1": 0.00003,
+                    "trend_pullback_extreme_max": 0.75
+                },
+                "payout": {
+                    "stake_usdt": MIN_EVENT_STAKE,
+                    "payout_ratio": DEFAULT_PAYOUT_RATIO,
+                    "profit_share_rate": PROFIT_SHARE_RATE,
+                    "loss_rebate_rate": PROFIT_SHARE_RATE,
+                    "win_net_usdt": MIN_EVENT_STAKE * DEFAULT_PAYOUT_RATIO * (Decimal::ONE - PROFIT_SHARE_RATE),
+                    "loss_net_usdt": MIN_EVENT_STAKE * (Decimal::ONE - PROFIT_SHARE_RATE)
+                }
+            },
             "scores": {
                 "model_score": model_score,
                 "raw_confidence": base_confidence,
@@ -5222,6 +5289,8 @@ fn build_prediction_decision(
                 "candidate_direction": candidate.as_ref().map(|candidate| candidate.direction.as_str()),
                 "candidate_mode": candidate.as_ref().map(|candidate| candidate.mode.as_str()),
                 "candidate_rule": candidate.as_ref().map(|candidate| candidate.rule.as_str()),
+                "pre_filter_passed": pre_filter_passed,
+                "pre_calibration_direction": pre_calibration_direction,
                 "calibration_required": true
             },
             "reversal": {
@@ -9260,7 +9329,7 @@ async fn db_prediction_calibration(
     let gross_win = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE);
     let fee = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE * PROFIT_SHARE_RATE);
     let net_win = gross_win - fee;
-    let loss = decimal_to_f64(MIN_EVENT_STAKE);
+    let loss = decimal_to_f64(MIN_EVENT_STAKE * (Decimal::ONE - PROFIT_SHARE_RATE));
     let row = sqlx::query(
         r#"
         with matched as (
@@ -9284,6 +9353,7 @@ async fn db_prediction_calibration(
             and o.feature_snapshot->'decision'->>'candidate_mode' = $3
             and o.feature_snapshot->'decision'->>'candidate_rule' = $4
             and o.feature_snapshot->'decision'->>'candidate_direction' = $5
+            and coalesce((o.feature_snapshot->'decision'->>'pre_filter_passed')::boolean, false)
           order by floor(extract(epoch from o.created_at) / $6::double precision), o.created_at desc
         ),
         scored as (
