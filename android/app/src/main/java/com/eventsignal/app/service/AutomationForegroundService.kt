@@ -3,6 +3,7 @@ package com.eventsignal.app.service
 import android.app.Service
 import android.content.Intent
 import android.os.IBinder
+import android.os.PowerManager
 import com.eventsignal.app.automation.AutomationStateStore
 import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.data.SignalJsonParser
@@ -33,6 +34,7 @@ class AutomationForegroundService : Service() {
         .build()
     private lateinit var stateStore: AutomationStateStore
     private var webSocket: WebSocket? = null
+    private var wakeLock: PowerManager.WakeLock? = null
     private val handledSignalIds = ConcurrentHashMap.newKeySet<String>()
 
     override fun onCreate() {
@@ -43,22 +45,27 @@ class AutomationForegroundService : Service() {
             1002,
             runtimeNotification(this, "Automation active", "Monitoring authorized action state"),
         )
+        acquireWakeLock()
         AutomationRuntime.running = true
         startSessionRefreshLoop()
         startSignalSocket()
         startRuntimeSummaryLoop()
         startPendingOrderReportLoop()
+        startStopWatcher()
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        acquireWakeLock()
         AutomationRuntime.running = true
         startSessionRefreshLoop()
         startSignalSocket()
+        startStopWatcher()
         return START_STICKY
     }
 
     override fun onDestroy() {
         AutomationRuntime.running = false
+        releaseWakeLock()
         webSocket?.cancel()
         webSocket = null
         if (::stateStore.isInitialized) {
@@ -71,7 +78,48 @@ class AutomationForegroundService : Service() {
 
     override fun onBind(intent: Intent?): IBinder? = null
 
+    private fun acquireWakeLock() {
+        val current = wakeLock
+        if (current?.isHeld == true) return
+        val powerManager = getSystemService(PowerManager::class.java)
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.SCREEN_DIM_WAKE_LOCK or PowerManager.ACQUIRE_CAUSES_WAKEUP,
+            "EventSignal:AutomationScreenLock",
+        ).apply {
+            setReferenceCounted(false)
+            runCatching { acquire() }
+                .onFailure { stateStore.saveLastStatus("wake_lock_failed:${it.javaClass.simpleName}") }
+        }
+    }
+
+    private fun releaseWakeLock() {
+        wakeLock?.let { lock ->
+            if (lock.isHeld) {
+                runCatching { lock.release() }
+            }
+        }
+        wakeLock = null
+    }
+
     private var socketLoopStarted = false
+
+    private var stopWatcherStarted = false
+
+    private fun startStopWatcher() {
+        if (stopWatcherStarted) return
+        stopWatcherStarted = true
+        scope.launch {
+            while (isActive) {
+                delay(1_000)
+                if (!AutomationRuntime.running) {
+                    releaseWakeLock()
+                    webSocket?.cancel()
+                    stopSelf()
+                    return@launch
+                }
+            }
+        }
+    }
 
     private fun startSignalSocket() {
         if (socketLoopStarted) return
