@@ -80,6 +80,9 @@ type PredictionSettings = {
   up_threshold: string;
   down_threshold: string;
   min_confidence: string;
+  technical_weight: string;
+  probability_weight: string;
+  volatility_floor: string;
   updated_at?: string | null;
 };
 
@@ -323,7 +326,10 @@ function App() {
     interval_seconds: 5,
     up_threshold: "2.6",
     down_threshold: "-2.6",
-    min_confidence: "0.62"
+    min_confidence: "0.62",
+    technical_weight: "0.35",
+    probability_weight: "0.65",
+    volatility_floor: "0.00016"
   });
   const [predictionObservations, setPredictionObservations] = useState<PredictionObservation[]>([]);
   const [workerName, setWorkerName] = useState("");
@@ -1121,6 +1127,10 @@ function PredictionPage({
     setEditing(false);
   }
 
+  function observationMetrics(row: PredictionObservation) {
+    return predictionMetrics(row.feature_snapshot);
+  }
+
   return (
     <>
       <section className="connection">
@@ -1150,6 +1160,18 @@ function PredictionPage({
         <label>
           最低置信度
           <input value={draft.min_confidence} onChange={(event) => updateDraft({ min_confidence: event.target.value })} />
+        </label>
+        <label>
+          技术分权重
+          <input value={draft.technical_weight} onChange={(event) => updateDraft({ technical_weight: event.target.value })} />
+        </label>
+        <label>
+          概率分权重
+          <input value={draft.probability_weight} onChange={(event) => updateDraft({ probability_weight: event.target.value })} />
+        </label>
+        <label>
+          波动率下限
+          <input value={draft.volatility_floor} onChange={(event) => updateDraft({ volatility_floor: event.target.value })} />
         </label>
         <button className="primary" onClick={saveDraft}>
           <Power size={18} />
@@ -1189,32 +1211,51 @@ function PredictionPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "方向", "分数", "置信度", "价格", "原因"]}
+          columns={["时间", "方向", "模型分", "涨概率", "跌概率", "置信度", "技术分", "原因"]}
           pageSize={20}
           rows={observations.map((row) => ({
             id: row.id,
-            cells: [
-              shortTime(row.created_at),
-              <ToneText tone={directionTone(row.direction)}>{labelDirection(row.direction)}</ToneText>,
-              row.score || "-",
-              row.confidence,
-              row.entry_price,
-              row.reason || "-"
-            ],
-            details: {
-              时间: shortTime(row.created_at),
-              来源: row.source,
-              交易对: row.symbol,
-              周期: `${row.period_seconds}s`,
-              模型: row.model_version,
-              方向: labelDirection(row.direction),
-              分数: row.score || "-",
-              置信度: row.confidence,
-              预测收益: row.predicted_return,
-              入场价: row.entry_price,
-              原因: row.reason || "-",
-              特征: JSON.stringify(row.feature_snapshot)
-            }
+            cells: (() => {
+              const metrics = observationMetrics(row);
+              return [
+                shortTime(row.created_at),
+                <ToneText tone={directionTone(row.direction)}>{labelDirection(row.direction)}</ToneText>,
+                metrics.modelScore || row.score || "-",
+                metrics.upProbability,
+                metrics.downProbability,
+                percent(row.confidence),
+                metrics.technicalScore,
+                row.reason || "-"
+              ];
+            })(),
+            details: (() => {
+              const metrics = observationMetrics(row);
+              return {
+                时间: shortTime(row.created_at),
+                来源: row.source,
+                交易对: row.symbol,
+                周期: `${row.period_seconds}s`,
+                模型: row.model_version,
+                方向: labelDirection(row.direction),
+                模型分: metrics.modelScore || row.score || "-",
+                技术分: metrics.technicalScore,
+                概率分: metrics.probabilityScore,
+                技术权重: metrics.technicalWeight,
+                概率权重: metrics.probabilityWeight,
+                上涨概率: metrics.upProbability,
+                下跌概率: metrics.downProbability,
+                边际概率: metrics.edgeProbability,
+                置信度: percent(row.confidence),
+                预期到期涨跌幅: metrics.expectedExpiryReturn,
+                到期波动率: metrics.expiryVolatility,
+                波动率下限: metrics.volatilityFloor,
+                入场参考: metrics.strikeReference,
+                预测收益: row.predicted_return,
+                入场价: row.entry_price,
+                原因: row.reason || "-",
+                特征: JSON.stringify(row.feature_snapshot)
+              };
+            })()
           }))}
         />
       </section>
@@ -1955,10 +1996,48 @@ function percent(value?: string) {
   return `${(parsed * 100).toFixed(0)}%`;
 }
 
+function percentValue(value: unknown, digits = 1) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "-";
+  return `${(parsed * 100).toFixed(digits)}%`;
+}
+
 function formatNumber(value?: string | null) {
   const parsed = Number(value);
   if (!Number.isFinite(parsed)) return value || "-";
   return parsed.toLocaleString("zh-CN", { maximumFractionDigits: 4 });
+}
+
+function formatMetric(value: unknown, digits = 4) {
+  const parsed = Number(value);
+  if (!Number.isFinite(parsed)) return "-";
+  return parsed.toFixed(digits);
+}
+
+function snapshotValue(snapshot: Record<string, unknown>, path: string[]) {
+  let current: unknown = snapshot;
+  for (const key of path) {
+    if (!current || typeof current !== "object" || !(key in current)) return undefined;
+    current = (current as Record<string, unknown>)[key];
+  }
+  return current;
+}
+
+function predictionMetrics(snapshot: Record<string, unknown>) {
+  return {
+    modelScore: formatMetric(snapshotValue(snapshot, ["scores", "model_score"])),
+    technicalScore: formatMetric(snapshotValue(snapshot, ["scores", "technical_score"])),
+    probabilityScore: formatMetric(snapshotValue(snapshot, ["scores", "probability_score"])),
+    technicalWeight: percentValue(snapshotValue(snapshot, ["scores", "technical_weight"])),
+    probabilityWeight: percentValue(snapshotValue(snapshot, ["scores", "probability_weight"])),
+    upProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "up_probability"])),
+    downProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "down_probability"])),
+    edgeProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "edge_probability"])),
+    expectedExpiryReturn: percentValue(snapshotValue(snapshot, ["expiry_model", "expected_expiry_return"]), 3),
+    expiryVolatility: percentValue(snapshotValue(snapshot, ["expiry_model", "expiry_volatility"]), 3),
+    volatilityFloor: percentValue(snapshotValue(snapshot, ["expiry_model", "volatility_floor"]), 3),
+    strikeReference: String(snapshotValue(snapshot, ["expiry_model", "strike_reference"]) || "-")
+  };
 }
 
 function accountMatchText(status?: string | null) {

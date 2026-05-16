@@ -90,6 +90,9 @@ const DEFAULT_PREDICTION_STALE_SECONDS: i64 = 5;
 const DEFAULT_PREDICTION_UP_THRESHOLD: f64 = 8.00;
 const DEFAULT_PREDICTION_DOWN_THRESHOLD: f64 = -8.00;
 const DEFAULT_PREDICTION_MIN_CONFIDENCE: f64 = 0.72;
+const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
+const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
+const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
@@ -1061,6 +1064,9 @@ struct PredictionConfig {
     up_threshold: f64,
     down_threshold: f64,
     min_confidence: f64,
+    technical_weight: f64,
+    probability_weight: f64,
+    volatility_floor: f64,
     market_data_base_url: String,
     market_ws_url: String,
     market_ws_reconnect_seconds: u64,
@@ -1074,6 +1080,9 @@ struct PredictionSettings {
     up_threshold: Decimal,
     down_threshold: Decimal,
     min_confidence: Decimal,
+    technical_weight: Decimal,
+    probability_weight: Decimal,
+    volatility_floor: Decimal,
     updated_at: Option<DateTime<Utc>>,
 }
 
@@ -1085,6 +1094,9 @@ impl Default for PredictionSettings {
             up_threshold: decimal_from_f64(DEFAULT_PREDICTION_UP_THRESHOLD, 10),
             down_threshold: decimal_from_f64(DEFAULT_PREDICTION_DOWN_THRESHOLD, 10),
             min_confidence: decimal_from_f64(DEFAULT_PREDICTION_MIN_CONFIDENCE, 6),
+            technical_weight: decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6),
+            probability_weight: decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6),
+            volatility_floor: decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8),
             updated_at: None,
         }
     }
@@ -1518,6 +1530,21 @@ impl PredictionConfig {
                 DEFAULT_PREDICTION_MIN_CONFIDENCE,
                 0.0,
             ),
+            technical_weight: env_f64(
+                "PREDICTION_TECHNICAL_WEIGHT",
+                DEFAULT_PREDICTION_TECHNICAL_WEIGHT,
+                0.0,
+            ),
+            probability_weight: env_f64(
+                "PREDICTION_PROBABILITY_WEIGHT",
+                DEFAULT_PREDICTION_PROBABILITY_WEIGHT,
+                0.0,
+            ),
+            volatility_floor: env_f64(
+                "PREDICTION_VOLATILITY_FLOOR",
+                DEFAULT_PREDICTION_VOLATILITY_FLOOR,
+                0.0,
+            ),
             market_data_base_url: env::var("MARKET_DATA_PRIMARY")
                 .unwrap_or_else(|_| DEFAULT_MARKET_DATA_PRIMARY.to_string())
                 .trim_end_matches('/')
@@ -1556,6 +1583,21 @@ impl PredictionConfig {
             .to_string()
             .parse::<f64>()
             .unwrap_or(self.min_confidence);
+        next.technical_weight = settings
+            .technical_weight
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.technical_weight);
+        next.probability_weight = settings
+            .probability_weight
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.probability_weight);
+        next.volatility_floor = settings
+            .volatility_floor
+            .to_string()
+            .parse::<f64>()
+            .unwrap_or(self.volatility_floor);
         next.signal_cooldown_seconds = self.signal_cooldown_seconds.max(0);
         next
     }
@@ -4918,7 +4960,7 @@ fn build_prediction_decision(
     let seconds_to_expiry = period_seconds;
     let drift_return = clamp(score / 10_000.0, -0.0020, 0.0020);
     let expected_expiry_return = drift_return;
-    let minute_volatility = volatility.max(0.00016);
+    let minute_volatility = volatility.max(config.volatility_floor);
     let live_volatility =
         (live_ret_1.abs() * 0.85 + live_ret_3.abs() * 0.55 + ret_1.abs() * 0.35).max(0.00006);
     let expiry_volatility =
@@ -4934,7 +4976,14 @@ fn build_prediction_decision(
         } else {
             -1.0
         };
-    let model_score = clamp(score * 0.35 + probability_score * 0.65, -12.0, 12.0);
+    let weight_total = (config.technical_weight + config.probability_weight).max(f64::EPSILON);
+    let technical_weight = config.technical_weight / weight_total;
+    let probability_weight = config.probability_weight / weight_total;
+    let model_score = clamp(
+        score * technical_weight + probability_score * probability_weight,
+        -12.0,
+        12.0,
+    );
     let confidence = clamp(edge_probability, 0.0, 0.99);
     let predicted_return = clamp(expected_expiry_return, -0.003, 0.003);
     let mut direction = if model_score >= config.up_threshold {
@@ -5019,6 +5068,8 @@ fn build_prediction_decision(
                 "model_score": model_score,
                 "technical_score": score,
                 "probability_score": probability_score,
+                "technical_weight": technical_weight,
+                "probability_weight": probability_weight,
                 "continuation_score": continuation_score,
                 "momentum_score": momentum_score,
                 "trend_score": trend_score,
@@ -5065,7 +5116,8 @@ fn build_prediction_decision(
                 "expected_expiry_return": expected_expiry_return,
                 "minute_volatility": minute_volatility,
                 "live_volatility": live_volatility,
-                "expiry_volatility": expiry_volatility
+                "expiry_volatility": expiry_volatility,
+                "volatility_floor": config.volatility_floor
             },
             "returns": {
                 "live_ret_1": live_ret_1,
@@ -6602,6 +6654,30 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
             "min_confidence must be between 0 and 0.99",
         ));
     }
+    if settings.technical_weight < Decimal::ZERO || settings.technical_weight > dec!(1.00) {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "technical_weight must be between 0 and 1",
+        ));
+    }
+    if settings.probability_weight < Decimal::ZERO || settings.probability_weight > dec!(1.00) {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "probability_weight must be between 0 and 1",
+        ));
+    }
+    if settings.technical_weight + settings.probability_weight <= Decimal::ZERO {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "at least one prediction score weight must be positive",
+        ));
+    }
+    if settings.volatility_floor < dec!(0.00001) || settings.volatility_floor > dec!(0.00200) {
+        return Err(AppError::bad_request(
+            "PREDICTION_SETTING_OUT_OF_RANGE",
+            "volatility_floor must be between 0.00001 and 0.002",
+        ));
+    }
     Ok(())
 }
 
@@ -8027,7 +8103,8 @@ async fn db_save_platform_trading_settings(
 async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings, AppError> {
     sqlx::query(
         r#"
-        select enabled, interval_seconds, up_threshold, down_threshold, min_confidence, updated_at
+        select enabled, interval_seconds, up_threshold, down_threshold, min_confidence,
+               technical_weight, probability_weight, volatility_floor, updated_at
         from prediction_settings
         where id = true
         "#,
@@ -8041,6 +8118,15 @@ async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings
             up_threshold: row.get("up_threshold"),
             down_threshold: row.get("down_threshold"),
             min_confidence: row.get("min_confidence"),
+            technical_weight: row
+                .try_get("technical_weight")
+                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6)),
+            probability_weight: row
+                .try_get("probability_weight")
+                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6)),
+            volatility_floor: row
+                .try_get("volatility_floor")
+                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8)),
             updated_at: row.get("updated_at"),
         })
         .unwrap_or_default()
@@ -8055,14 +8141,18 @@ async fn db_save_prediction_settings(
     sqlx::query(
         r#"
         insert into prediction_settings
-          (id, enabled, interval_seconds, up_threshold, down_threshold, min_confidence, updated_at)
-        values (true, $1, $2, $3, $4, $5, now())
+          (id, enabled, interval_seconds, up_threshold, down_threshold, min_confidence,
+           technical_weight, probability_weight, volatility_floor, updated_at)
+        values (true, $1, $2, $3, $4, $5, $6, $7, $8, now())
         on conflict (id) do update set
           enabled = excluded.enabled,
           interval_seconds = excluded.interval_seconds,
           up_threshold = excluded.up_threshold,
           down_threshold = excluded.down_threshold,
           min_confidence = excluded.min_confidence,
+          technical_weight = excluded.technical_weight,
+          probability_weight = excluded.probability_weight,
+          volatility_floor = excluded.volatility_floor,
           updated_at = now()
         "#,
     )
@@ -8071,6 +8161,9 @@ async fn db_save_prediction_settings(
     .bind(settings.up_threshold)
     .bind(settings.down_threshold)
     .bind(settings.min_confidence)
+    .bind(settings.technical_weight)
+    .bind(settings.probability_weight)
+    .bind(settings.volatility_floor)
     .execute(pool)
     .await
     .map(|_| ())
