@@ -23,14 +23,23 @@ class ScreenRecognitionService {
         val observedBalanceUsdt = extractObservedBalanceUsdt(texts)
         val structure = detectEventContractStructure(texts, amountFieldFound, upButtonFound, downButtonFound)
         val confidence = pageConfidence(packageName, structure, profile)
+        val isTargetPackage = isTargetPackage(packageName, profile)
+        val isEventContractPage = structure.isEventContractPage ||
+            (
+                isTargetPackage &&
+                    structure.hasSymbol &&
+                    structure.hasAmountArea &&
+                    structure.hasDirectionArea &&
+                    (structure.hasTimeUnit || structure.hasEventTitle || structure.hasPaymentArea)
+                )
         val amountReady = amountFieldFound || structure.hasAmountArea
         val directionReady = (upButtonFound && downButtonFound) || structure.hasDirectionArea
 
         return RecognizedScreen(
             packageName = packageName,
-            screenName = inferScreenName(structure, texts),
+            screenName = inferScreenName(structure, texts, isEventContractPage),
             confidence = confidence,
-            safeToAct = structure.isEventContractPage &&
+            safeToAct = isEventContractPage &&
                 amountReady &&
                 directionReady &&
                 confidence >= profile.minRecognitionConfidence,
@@ -43,9 +52,13 @@ class ScreenRecognitionService {
         )
     }
 
-    private fun inferScreenName(structure: EventContractStructure, texts: List<String>): String =
+    private fun inferScreenName(
+        structure: EventContractStructure,
+        texts: List<String>,
+        isEventContractPage: Boolean,
+    ): String =
         when {
-            structure.isEventContractPage -> "event_contract"
+            isEventContractPage -> "event_contract"
             structure.hasEventTitle -> "possible_event_contract"
             texts.any { it.contains("BTC", ignoreCase = true) } -> "possible_btc_contract"
             texts.any { it.contains("USDT", ignoreCase = true) } -> "possible_balance_or_amount"
@@ -57,11 +70,8 @@ class ScreenRecognitionService {
         structure: EventContractStructure,
         profile: AutomationProfile,
     ): Double {
-        val packageScore = if (
-            profile.targetPackageNames.isEmpty() ||
-            profile.targetPackageNames.any { it.equals(packageName, ignoreCase = true) }
-        ) {
-            0.04
+        val packageScore = if (isTargetPackage(packageName, profile)) {
+            0.08
         } else {
             0.02
         }
@@ -74,6 +84,10 @@ class ScreenRecognitionService {
                 (if (structure.hasPaymentArea) 0.04 else 0.0)
         return (packageScore + structureScore).coerceIn(0.0, 1.0)
     }
+
+    private fun isTargetPackage(packageName: String, profile: AutomationProfile): Boolean =
+        profile.targetPackageNames.isEmpty() ||
+            profile.targetPackageNames.any { it.equals(packageName, ignoreCase = true) }
 
     private fun matchedKeywords(texts: List<String>, keywords: List<String>): List<String> =
         keywords.filter { keyword ->
