@@ -4788,8 +4788,9 @@ fn build_prediction_decision(
     let live_ret_3 =
         rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 90)
             .unwrap_or(ret_3);
-    // Event contracts are 10-minute direction bets. A few seconds of pullback
-    // at an extreme is not enough to flip against a still-alive trend.
+    // Event contracts settle against the strike at contract commencement.
+    // Model the probability that price is above or below the entry strike at
+    // the selected 10-minute expiry, then use technical features as drift.
     let upper_extreme = clamp((boll_pos - 0.82) / 0.18, 0.0, 1.0);
     let lower_extreme = clamp((0.18 - boll_pos) / 0.18, 0.0, 1.0);
     let up_move_intensity = clamp(
@@ -4910,16 +4911,42 @@ fn build_prediction_decision(
         } else {
             (continuation_score, "none")
         };
-    let confidence = clamp(1.0 / (1.0 + (-score.abs() / 2.8).exp()), 0.0, 0.99);
-    let predicted_return = clamp(score / 10_000.0, -0.003, 0.003);
-    let mut direction = if score >= config.up_threshold {
+
+    let period_seconds = f64::from(DEFAULT_PERIOD_SECONDS);
+    let elapsed_seconds = cycle.progress * period_seconds;
+    let remaining_seconds = (period_seconds - elapsed_seconds).clamp(1.0, period_seconds);
+    let seconds_to_expiry = period_seconds;
+    let drift_return = clamp(score / 10_000.0, -0.0020, 0.0020);
+    let expected_expiry_return = drift_return;
+    let minute_volatility = volatility.max(0.00016);
+    let live_volatility =
+        (live_ret_1.abs() * 0.85 + live_ret_3.abs() * 0.55 + ret_1.abs() * 0.35).max(0.00006);
+    let expiry_volatility =
+        (minute_volatility * (seconds_to_expiry / 60.0).sqrt()).max(live_volatility * 1.8);
+    let z_to_reference = expected_expiry_return / expiry_volatility.max(0.00005);
+    let up_probability = normal_cdf(z_to_reference);
+    let down_probability = 1.0 - up_probability;
+    let edge_probability = up_probability.max(down_probability);
+    let probability_score = (edge_probability - 0.5)
+        * 20.0
+        * if up_probability >= down_probability {
+            1.0
+        } else {
+            -1.0
+        };
+    let model_score = clamp(score * 0.35 + probability_score * 0.65, -12.0, 12.0);
+    let confidence = clamp(edge_probability, 0.0, 0.99);
+    let predicted_return = clamp(expected_expiry_return, -0.003, 0.003);
+    let mut direction = if model_score >= config.up_threshold {
         "UP".to_string()
-    } else if score <= config.down_threshold {
+    } else if model_score <= config.down_threshold {
         "DOWN".to_string()
     } else {
         "HOLD".to_string()
     };
-    let mut reason = format!("score {score:.4} confidence {confidence:.4}");
+    let mut reason = format!(
+        "score {model_score:.4} confidence {confidence:.4} expiry_prob up {up_probability:.4} down {down_probability:.4}"
+    );
     if age_seconds > config.stale_seconds {
         direction = "HOLD".to_string();
         reason = format!("hold stale data age {age_seconds}s");
@@ -4963,7 +4990,7 @@ fn build_prediction_decision(
         confidence,
         predicted_return,
         entry_price: snapshot.latest_price,
-        score,
+        score: model_score,
         cycle_start,
         cycle_end: cycle_start + Duration::seconds(DEFAULT_PERIOD_SECONDS as i64),
         signal_cooldown_seconds: config.signal_cooldown_seconds,
@@ -4989,6 +5016,9 @@ fn build_prediction_decision(
                 "basis_score": basis_score
             },
             "scores": {
+                "model_score": model_score,
+                "technical_score": score,
+                "probability_score": probability_score,
                 "continuation_score": continuation_score,
                 "momentum_score": momentum_score,
                 "trend_score": trend_score,
@@ -5020,8 +5050,22 @@ fn build_prediction_decision(
             "cycle": {
                 "start_ms": cycle.start_ms,
                 "progress": cycle.progress,
+                "elapsed_seconds": elapsed_seconds,
+                "remaining_seconds": remaining_seconds,
                 "open_price": cycle.open_price,
                 "return_from_open": cycle.return_from_open
+            },
+            "expiry_model": {
+                "strike_reference": "entry_price",
+                "up_probability": up_probability,
+                "down_probability": down_probability,
+                "edge_probability": edge_probability,
+                "z_to_reference": z_to_reference,
+                "drift_return": drift_return,
+                "expected_expiry_return": expected_expiry_return,
+                "minute_volatility": minute_volatility,
+                "live_volatility": live_volatility,
+                "expiry_volatility": expiry_volatility
             },
             "returns": {
                 "live_ret_1": live_ret_1,
@@ -5230,6 +5274,22 @@ fn sign(value: f64) -> f64 {
     } else {
         0.0
     }
+}
+
+fn normal_cdf(value: f64) -> f64 {
+    0.5 * (1.0 + erf(value / 2.0_f64.sqrt()))
+}
+
+fn erf(value: f64) -> f64 {
+    let sign = if value < 0.0 { -1.0 } else { 1.0 };
+    let x = value.abs();
+    let t = 1.0 / (1.0 + 0.3275911 * x);
+    let y = 1.0
+        - (((((1.061405429 * t - 1.453152027) * t) + 1.421413741) * t - 0.284496736) * t
+            + 0.254829592)
+            * t
+            * (-x * x).exp();
+    sign * y
 }
 
 async fn binance_income_events_with_client(
