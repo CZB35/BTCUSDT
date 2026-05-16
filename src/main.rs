@@ -80,6 +80,7 @@ const DEFAULT_RESERVATION_RELEASE_INTERVAL_SECONDS: u64 = 2;
 const DEFAULT_RESERVATION_NO_ACK_RELEASE_SECONDS: i64 = 30;
 const DEFAULT_RESERVATION_ORDER_TIMEOUT_SECONDS: i64 = 90;
 const DEFAULT_RESERVATION_RELEASE_LIMIT: i64 = 100;
+const DEFAULT_MAX_ACTIVE_EVENT_ORDERS_PER_USER: usize = 3;
 const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUERY_LIMIT: i64 = 50;
 const MAX_QUERY_LIMIT: i64 = 500;
@@ -892,6 +893,7 @@ struct PlatformTradingSettings {
     stake_percent: Decimal,
     min_stake_usdt: Decimal,
     max_single_stake_usdt: Decimal,
+    max_active_event_orders_per_user: i32,
     first_deposit_min_usdt: Decimal,
     deposit_fee_rate: Decimal,
     direct_referral_rate: Decimal,
@@ -905,6 +907,7 @@ impl Default for PlatformTradingSettings {
             stake_percent: DEFAULT_STAKE_PERCENT,
             min_stake_usdt: MIN_EVENT_STAKE,
             max_single_stake_usdt: MAX_EVENT_STAKE,
+            max_active_event_orders_per_user: DEFAULT_MAX_ACTIVE_EVENT_ORDERS_PER_USER as i32,
             first_deposit_min_usdt: FIRST_DEPOSIT_MIN_AMOUNT,
             deposit_fee_rate: DEPOSIT_FEE_RATE,
             direct_referral_rate: DIRECT_REFERRAL_RATE,
@@ -6345,6 +6348,14 @@ fn validate_platform_trading_settings(settings: &PlatformTradingSettings) -> Res
             "max_single_stake_usdt must be between 5 and 250",
         ));
     }
+    if settings.max_active_event_orders_per_user < 1
+        || settings.max_active_event_orders_per_user > 20
+    {
+        return Err(AppError::bad_request(
+            "PLATFORM_SETTING_OUT_OF_RANGE",
+            "max_active_event_orders_per_user must be between 1 and 20",
+        ));
+    }
     if settings.first_deposit_min_usdt < MIN_DEPOSIT_AMOUNT {
         return Err(AppError::bad_request(
             "PLATFORM_SETTING_OUT_OF_RANGE",
@@ -6604,7 +6615,12 @@ async fn authorize_signal_for_user(
     user_id: Uuid,
     signal: &SignalCore,
 ) -> SignalApiResponse {
-    let trading = load_trading_settings(state, user_id).await;
+    let platform_settings = load_platform_settings(state).await;
+    let trading = if state.db.is_some() {
+        TradingSettings::from(&platform_settings)
+    } else {
+        load_trading_settings(state, user_id).await
+    };
     let automation = load_automation_settings(state, user_id).await;
     let balance = load_balance(state, user_id).await;
     let exchange_snapshot = match load_exchange_balance_snapshot(state, user_id).await {
@@ -6687,6 +6703,13 @@ async fn authorize_signal_for_user(
     if status == "reserved" && balance.available < fee_reserve {
         status = "fee_reserve_insufficient".to_string();
     }
+    if status == "reserved" && state.db.is_none() {
+        let active_orders =
+            active_event_order_count_memory(state, user_id, signal.cycle_start).await;
+        if active_orders >= max_active_event_orders_per_user(&platform_settings) {
+            status = "active_order_limit_reached".to_string();
+        }
+    }
 
     let mut reservation_id = None;
     let mut balance_after = balance.available;
@@ -6709,7 +6732,7 @@ async fn authorize_signal_for_user(
         };
 
         if let Some(pool) = state.db.as_ref() {
-            match db_reserve_or_load_signal_fee(pool, &reservation).await {
+            match db_reserve_or_load_signal_fee(pool, &reservation, &platform_settings).await {
                 Ok(after) => {
                     balance_after = after.available;
                     reservation_id = Some(id);
@@ -6730,6 +6753,9 @@ async fn authorize_signal_for_user(
                 }
                 Err(err) if err.code == "BALANCE_INSUFFICIENT" => {
                     status = "fee_reserve_insufficient".to_string();
+                }
+                Err(err) if err.code == "ACTIVE_ORDER_LIMIT_REACHED" => {
+                    status = "active_order_limit_reached".to_string();
                 }
                 Err(err) => {
                     return signal_response_with_status(
@@ -7119,6 +7145,45 @@ fn calculated_stake(
         stake = MAX_EVENT_STAKE;
     }
     stake.floor()
+}
+
+fn max_active_event_orders_per_user(settings: &PlatformTradingSettings) -> usize {
+    usize::try_from(settings.max_active_event_orders_per_user)
+        .ok()
+        .filter(|value| *value >= 1)
+        .unwrap_or(DEFAULT_MAX_ACTIVE_EVENT_ORDERS_PER_USER)
+}
+
+async fn active_event_order_count_memory(
+    state: &SharedState,
+    user_id: Uuid,
+    cycle_start: DateTime<Utc>,
+) -> usize {
+    let signals = state.signals.read().await;
+    let signal_cycles = signals
+        .iter()
+        .filter(|signal| {
+            signal.symbol == DEFAULT_SYMBOL
+                && signal.period_seconds == DEFAULT_PERIOD_SECONDS
+                && signal.cycle_start <= cycle_start
+                && signal.cycle_end > cycle_start
+        })
+        .map(|signal| signal.id)
+        .collect::<std::collections::HashSet<_>>();
+    if signal_cycles.is_empty() {
+        return 0;
+    }
+    state
+        .reservations
+        .read()
+        .await
+        .values()
+        .filter(|reservation| {
+            reservation.user_id == user_id
+                && matches!(reservation.status.as_str(), "reserved" | "order_submitted")
+                && signal_cycles.contains(&reservation.signal_id)
+        })
+        .count()
 }
 
 fn page_is_fresh(page: &AutomationPageState) -> bool {
@@ -7669,6 +7734,7 @@ async fn db_load_platform_trading_settings(
     sqlx::query(
         r#"
         select stake_percent, min_stake_usdt, max_single_stake_usdt,
+               max_active_event_orders_per_user,
                first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
                indirect_referral_rate, updated_at
         from platform_trading_settings
@@ -7682,6 +7748,7 @@ async fn db_load_platform_trading_settings(
             stake_percent: row.get("stake_percent"),
             min_stake_usdt: row.get("min_stake_usdt"),
             max_single_stake_usdt: row.get("max_single_stake_usdt"),
+            max_active_event_orders_per_user: row.get("max_active_event_orders_per_user"),
             first_deposit_min_usdt: row.get("first_deposit_min_usdt"),
             deposit_fee_rate: row.get("deposit_fee_rate"),
             direct_referral_rate: row.get("direct_referral_rate"),
@@ -7699,6 +7766,7 @@ async fn db_platform_settings_tx(
     sqlx::query(
         r#"
         select stake_percent, min_stake_usdt, max_single_stake_usdt,
+               max_active_event_orders_per_user,
                first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
                indirect_referral_rate, updated_at
         from platform_trading_settings
@@ -7712,6 +7780,7 @@ async fn db_platform_settings_tx(
             stake_percent: row.get("stake_percent"),
             min_stake_usdt: row.get("min_stake_usdt"),
             max_single_stake_usdt: row.get("max_single_stake_usdt"),
+            max_active_event_orders_per_user: row.get("max_active_event_orders_per_user"),
             first_deposit_min_usdt: row.get("first_deposit_min_usdt"),
             deposit_fee_rate: row.get("deposit_fee_rate"),
             direct_referral_rate: row.get("direct_referral_rate"),
@@ -7731,13 +7800,14 @@ async fn db_save_platform_trading_settings(
         r#"
         insert into platform_trading_settings
           (id, stake_percent, min_stake_usdt, max_single_stake_usdt,
-           first_deposit_min_usdt, deposit_fee_rate, direct_referral_rate,
-           indirect_referral_rate, updated_at)
-        values (true, $1, $2, $3, $4, $5, $6, $7, $8)
+           max_active_event_orders_per_user, first_deposit_min_usdt, deposit_fee_rate,
+           direct_referral_rate, indirect_referral_rate, updated_at)
+        values (true, $1, $2, $3, $4, $5, $6, $7, $8, $9)
         on conflict (id) do update set
           stake_percent = excluded.stake_percent,
           min_stake_usdt = excluded.min_stake_usdt,
           max_single_stake_usdt = excluded.max_single_stake_usdt,
+          max_active_event_orders_per_user = excluded.max_active_event_orders_per_user,
           first_deposit_min_usdt = excluded.first_deposit_min_usdt,
           deposit_fee_rate = excluded.deposit_fee_rate,
           direct_referral_rate = excluded.direct_referral_rate,
@@ -7748,6 +7818,7 @@ async fn db_save_platform_trading_settings(
     .bind(settings.stake_percent)
     .bind(settings.min_stake_usdt)
     .bind(settings.max_single_stake_usdt)
+    .bind(settings.max_active_event_orders_per_user)
     .bind(settings.first_deposit_min_usdt)
     .bind(settings.deposit_fee_rate)
     .bind(settings.direct_referral_rate)
@@ -9533,6 +9604,7 @@ fn withdrawal_from_row(row: sqlx::postgres::PgRow) -> WithdrawalRecord {
 async fn db_reserve_signal_fee(
     pool: &PgPool,
     reservation: &SignalReservation,
+    settings: &PlatformTradingSettings,
 ) -> Result<BalanceRecord, AppError> {
     let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
     let balance_row = sqlx::query(
@@ -9548,6 +9620,39 @@ async fn db_reserve_signal_fee(
     .await
     .map_err(AppError::from_sqlx)?
     .ok_or_else(|| AppError::bad_request("BALANCE_NOT_FOUND", "balance not found"))?;
+    let max_active_orders = max_active_event_orders_per_user(settings) as i64;
+    let active_orders: i64 = sqlx::query(
+        r#"
+        select count(*) as count
+        from signal_reservations r
+        join signals s on s.id = r.signal_id
+        where r.user_id = $1
+          and s.symbol = $2
+          and s.period_seconds = $3
+          and s.cycle_start <= (
+            select cycle_start from signals where id = $4
+          )
+          and s.cycle_end > (
+            select cycle_start from signals where id = $4
+          )
+          and r.status in ('reserved', 'order_submitted')
+        "#,
+    )
+    .bind(reservation.user_id)
+    .bind(DEFAULT_SYMBOL)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .bind(reservation.signal_id)
+    .fetch_one(&mut *tx)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .get("count");
+    if active_orders >= max_active_orders {
+        tx.rollback().await.map_err(AppError::from_sqlx)?;
+        return Err(AppError::conflict(
+            "ACTIVE_ORDER_LIMIT_REACHED",
+            "active event contract order limit reached for this cycle",
+        ));
+    }
     let available: Decimal = balance_row.get("available");
     let frozen: Decimal = balance_row.get("frozen");
     if available < reservation.fee_reserve_usdt {
@@ -9628,8 +9733,9 @@ async fn db_reserve_signal_fee(
 async fn db_reserve_or_load_signal_fee(
     pool: &PgPool,
     reservation: &SignalReservation,
+    settings: &PlatformTradingSettings,
 ) -> Result<BalanceRecord, AppError> {
-    match db_reserve_signal_fee(pool, reservation).await {
+    match db_reserve_signal_fee(pool, reservation, settings).await {
         Ok(balance) => Ok(balance),
         Err(err) if is_unique_violation(&err) => Err(AppError::conflict(
             "SIGNAL_RESERVATION_ALREADY_EXISTS",

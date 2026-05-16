@@ -239,6 +239,7 @@ type PlatformTradingSettings = {
   stake_percent: string;
   min_stake_usdt: string;
   max_single_stake_usdt: string;
+  max_active_event_orders_per_user: number;
   first_deposit_min_usdt: string;
   deposit_fee_rate: string;
   direct_referral_rate: string;
@@ -334,6 +335,7 @@ function App() {
     stake_percent: "0.05",
     min_stake_usdt: "5",
     max_single_stake_usdt: "250",
+    max_active_event_orders_per_user: 3,
     first_deposit_min_usdt: "100",
     deposit_fee_rate: "0.25",
     direct_referral_rate: "0.09",
@@ -421,13 +423,11 @@ function App() {
 
   async function loadPredictionLive(nextToken = token) {
     if (!nextToken.trim()) return;
-    const [nextOverview, nextPredictionSettings, nextPredictionObservations] = await Promise.all([
+    const [nextOverview, nextPredictionObservations] = await Promise.all([
       adminFetch<AdminOverview>("/v1/admin/overview", nextToken),
-      adminFetch<PredictionSettings>("/v1/admin/prediction-settings", nextToken),
       adminFetch<PredictionObservation[]>("/v1/admin/prediction-observations", nextToken)
     ]);
     if (nextOverview) setOverview(nextOverview);
-    if (nextPredictionSettings) setPredictionSettings(nextPredictionSettings);
     if (nextPredictionObservations) setPredictionObservations(nextPredictionObservations);
   }
 
@@ -1031,6 +1031,21 @@ function SettingsPage({
           />
         </label>
         <label>
+          同周期最多连开单数
+          <input
+            value={draft.max_active_event_orders_per_user}
+            onChange={(event) =>
+              setDraft({
+                ...draft,
+                max_active_event_orders_per_user: Number(event.target.value) || 3
+              })
+            }
+            placeholder="3"
+          />
+        </label>
+      </div>
+      <div className="form-row">
+        <label>
           更新时间
           <input value={shortTime(settings.updated_at)} readOnly />
         </label>
@@ -1088,12 +1103,23 @@ function PredictionPage({
   settings: PredictionSettings;
   runtime?: PredictionStatus;
   observations: PredictionObservation[];
-  onSave: (settings: PredictionSettings) => void;
+  onSave: (settings: PredictionSettings) => void | Promise<void>;
 }) {
   const [draft, setDraft] = useState(settings);
+  const [editing, setEditing] = useState(false);
   useEffect(() => {
-    setDraft(settings);
-  }, [settings]);
+    if (!editing) setDraft(settings);
+  }, [settings, editing]);
+
+  function updateDraft(patch: Partial<PredictionSettings>) {
+    setEditing(true);
+    setDraft({ ...draft, ...patch });
+  }
+
+  async function saveDraft() {
+    await onSave(draft);
+    setEditing(false);
+  }
 
   return (
     <>
@@ -1102,7 +1128,7 @@ function PredictionPage({
           <input
             type="checkbox"
             checked={draft.enabled}
-            onChange={(event) => setDraft({ ...draft, enabled: event.target.checked })}
+            onChange={(event) => updateDraft({ enabled: event.target.checked })}
           />
           <span>启用自动预测循环</span>
         </label>
@@ -1110,22 +1136,22 @@ function PredictionPage({
           检查间隔（秒）
           <input
             value={draft.interval_seconds}
-            onChange={(event) => setDraft({ ...draft, interval_seconds: Number(event.target.value) || 5 })}
+            onChange={(event) => updateDraft({ interval_seconds: Number(event.target.value) || 5 })}
           />
         </label>
         <label>
           看涨阈值
-          <input value={draft.up_threshold} onChange={(event) => setDraft({ ...draft, up_threshold: event.target.value })} />
+          <input value={draft.up_threshold} onChange={(event) => updateDraft({ up_threshold: event.target.value })} />
         </label>
         <label>
           看跌阈值
-          <input value={draft.down_threshold} onChange={(event) => setDraft({ ...draft, down_threshold: event.target.value })} />
+          <input value={draft.down_threshold} onChange={(event) => updateDraft({ down_threshold: event.target.value })} />
         </label>
         <label>
           最低置信度
-          <input value={draft.min_confidence} onChange={(event) => setDraft({ ...draft, min_confidence: event.target.value })} />
+          <input value={draft.min_confidence} onChange={(event) => updateDraft({ min_confidence: event.target.value })} />
         </label>
-        <button className="primary" onClick={() => onSave(draft)}>
+        <button className="primary" onClick={saveDraft}>
           <Power size={18} />
           保存预测配置
         </button>

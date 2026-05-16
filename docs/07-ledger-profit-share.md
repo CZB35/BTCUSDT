@@ -23,7 +23,7 @@ expected_profit = stake * EVENT_CONTRACT_PAYOUT_RATIO
 fee_reserve = expected_profit * 0.30
 ```
 
-Automatic mode receives a tradeable signal only if the page gate is fresh and `available >= fee_reserve`. The backend moves `fee_reserve` from `available` to `frozen` while building the WebSocket `signal.created` event and returns `reservation_id` with that event. Display/history endpoints do not create reservations.
+Automatic mode receives a tradeable signal only if the page gate is fresh and `available >= fee_reserve`. The backend also caps active event-contract reservations per user and event window using the admin-managed `max_active_event_orders_per_user` setting, defaulting to 3. The backend moves `fee_reserve` from `available` to `frozen` while building the WebSocket `signal.created` event and returns `reservation_id` with that event. Display/history endpoints do not create reservations.
 
 ## Settlement Rule
 
