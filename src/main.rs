@@ -1123,6 +1123,7 @@ struct PredictionDecision {
 #[derive(Default)]
 struct MarketDataState {
     candles: BTreeMap<i64, MarketCandle>,
+    price_points: BTreeMap<i64, f64>,
     latest_price: Option<f64>,
     latest_price_time_ms: Option<i64>,
     latest_source: Option<String>,
@@ -1138,6 +1139,7 @@ struct MarketDataState {
 #[derive(Clone)]
 struct MarketDataSnapshot {
     candles: Vec<MarketCandle>,
+    price_points: Vec<(i64, f64)>,
     latest_price: f64,
     latest_price_time_ms: i64,
     latest_source: String,
@@ -1159,8 +1161,17 @@ impl MarketDataState {
             .cloned()
             .collect::<Vec<_>>();
         candles.reverse();
+        let mut price_points = self
+            .price_points
+            .iter()
+            .rev()
+            .take(candle_limit.saturating_mul(60).max(600))
+            .map(|(time_ms, price)| (*time_ms, *price))
+            .collect::<Vec<_>>();
+        price_points.reverse();
         Some(MarketDataSnapshot {
             candles,
+            price_points,
             latest_price,
             latest_price_time_ms,
             latest_source: self
@@ -4449,6 +4460,15 @@ async fn preheat_market_data(
         market.latest_price = Some(latest.close);
         market.latest_price_time_ms = Some(latest.close_time_ms);
         market.latest_source = Some("preheat_index_kline_1m".to_string());
+        let price_points = market
+            .candles
+            .values()
+            .map(|candle| (candle.close_time_ms, candle.close))
+            .collect::<Vec<_>>();
+        for (time_ms, price) in price_points {
+            market.price_points.insert(time_ms, price);
+        }
+        trim_market_price_points(&mut market, config.candle_limit * 60 * 2);
     }
     market.preheated_at = Some(Utc::now());
     market.last_error = None;
@@ -4610,6 +4630,8 @@ async fn update_market_index_price(
     market.latest_price = Some(price);
     market.latest_price_time_ms = Some(event_time_ms);
     market.latest_source = Some("indexPrice".to_string());
+    market.price_points.insert(event_time_ms, price);
+    trim_market_price_points(&mut market, DEFAULT_PREDICTION_CANDLE_LIMIT * 60 * 2);
     if let Some(mark_price) = mark_price {
         market.latest_mark_price = Some(parse_market_f64(&mark_price)?);
     }
@@ -4655,6 +4677,15 @@ fn trim_market_candles(market: &mut MarketDataState, max_len: usize) {
     }
 }
 
+fn trim_market_price_points(market: &mut MarketDataState, max_len: usize) {
+    while market.price_points.len() > max_len.max(600) {
+        let Some(first) = market.price_points.keys().next().copied() else {
+            break;
+        };
+        market.price_points.remove(&first);
+    }
+}
+
 fn parse_market_f64(value: &str) -> Result<f64, AppError> {
     value
         .parse::<f64>()
@@ -4697,19 +4728,32 @@ fn build_prediction_decision(
             "not enough warm candles",
         ));
     }
-    let closes = candles
+    let closed_closes = candles
         .iter()
         .map(|candle| candle.close)
         .collect::<Vec<_>>();
+    let closes = live_close_series(
+        &closed_closes,
+        snapshot.latest_price,
+        snapshot.latest_price_time_ms,
+        latest.close_time_ms,
+    );
     let volumes = candles
         .iter()
         .map(|candle| candle.volume)
         .collect::<Vec<_>>();
-    let ret_1 = return_n(&closes, 1);
-    let ret_3 = return_n(&closes, 3);
-    let ret_5 = return_n(&closes, 5);
-    let ret_10 = return_n(&closes, 10);
-    let ret_30 = return_n(&closes, 30);
+    let closed_ret_1 = return_n(&closed_closes, 1);
+    let closed_ret_3 = return_n(&closed_closes, 3);
+    let ret_1 = rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 60)
+        .unwrap_or_else(|| return_n(&closes, 1));
+    let ret_3 = rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 180)
+        .unwrap_or_else(|| return_n(&closes, 3));
+    let ret_5 = rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 300)
+        .unwrap_or_else(|| return_n(&closes, 5));
+    let ret_10 = rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 600)
+        .unwrap_or_else(|| return_n(&closes, 10));
+    let ret_30 = rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 1800)
+        .unwrap_or_else(|| return_n(&closes, 30));
     let ema5 = ema_last(&closes, 5);
     let ema10 = ema_last(&closes, 10);
     let ema20 = ema_last(&closes, 20);
@@ -4721,13 +4765,18 @@ fn build_prediction_decision(
     let body_ratio = candle_body_ratio(latest);
     let price_time = millis_to_utc(snapshot.latest_price_time_ms)?;
     let age_seconds = (Utc::now() - price_time).num_seconds();
+    let cycle = event_cycle_context(
+        candles,
+        snapshot.latest_price,
+        snapshot.latest_price_time_ms,
+    );
 
-    let live_ret_1 = ratio_delta(snapshot.latest_price, latest.close);
-    let live_ret_3 = if closes.len() > 2 {
-        ratio_delta(snapshot.latest_price, closes[closes.len() - 3])
-    } else {
-        0.0
-    };
+    let live_ret_1 =
+        rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 30)
+            .unwrap_or_else(|| ratio_delta(snapshot.latest_price, latest.close));
+    let live_ret_3 =
+        rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 90)
+            .unwrap_or(ret_3);
     let momentum_score = live_ret_1 * 1450.0
         + live_ret_3 * 900.0
         + ret_1 * 950.0
@@ -4767,6 +4816,7 @@ fn build_prediction_decision(
         .latest_futures_kline_price
         .map(|price| ratio_delta(price, snapshot.latest_price))
         .unwrap_or(0.0);
+    let cycle_score = cycle.return_from_open * 520.0;
     let basis_score = clamp(
         mark_index_basis * 800.0 + trade_index_basis * 500.0,
         -0.8,
@@ -4778,6 +4828,7 @@ fn build_prediction_decision(
         + mean_reversion_score
         + candle_score
         + live_score
+        + cycle_score
         + basis_score;
     let confidence = clamp(1.0 / (1.0 + (-score.abs() / 2.8).exp()), 0.0, 0.99);
     let predicted_return = clamp(score / 10_000.0, -0.003, 0.003);
@@ -4830,8 +4881,21 @@ fn build_prediction_decision(
             "trade_index_basis": trade_index_basis,
             "futures_kline_index_basis": futures_kline_index_basis,
             "basis_score": basis_score,
+            "momentum_score": momentum_score,
+            "trend_score": trend_score,
+            "volume_score": volume_score,
+            "mean_reversion_score": mean_reversion_score,
+            "candle_score": candle_score,
+            "live_score": live_score,
+            "cycle_score": cycle_score,
+            "cycle_start_ms": cycle.start_ms,
+            "cycle_progress": cycle.progress,
+            "cycle_open_price": cycle.open_price,
+            "cycle_return_from_open": cycle.return_from_open,
             "live_ret_1": live_ret_1,
             "live_ret_3": live_ret_3,
+            "closed_ret_1": closed_ret_1,
+            "closed_ret_3": closed_ret_3,
             "ret_1": ret_1,
             "ret_3": ret_3,
             "ret_5": ret_5,
@@ -4873,6 +4937,67 @@ fn return_n(values: &[f64], n: usize) -> f64 {
         0.0
     } else {
         ratio_delta(values[values.len() - 1], values[values.len() - 1 - n])
+    }
+}
+
+fn live_close_series(
+    closed_closes: &[f64],
+    latest_price: f64,
+    latest_price_time_ms: i64,
+    latest_closed_candle_close_time_ms: i64,
+) -> Vec<f64> {
+    let mut closes = closed_closes.to_vec();
+    if latest_price_time_ms > latest_closed_candle_close_time_ms.saturating_add(500) {
+        closes.push(latest_price);
+    } else if let Some(last) = closes.last_mut() {
+        *last = latest_price;
+    }
+    closes
+}
+
+fn rolling_price_return(
+    points: &[(i64, f64)],
+    latest_time_ms: i64,
+    lookback_seconds: i64,
+) -> Option<f64> {
+    let target_time_ms = latest_time_ms.checked_sub(lookback_seconds.checked_mul(1_000)?)?;
+    let (_, past_price) = points
+        .iter()
+        .rev()
+        .find(|(time_ms, _)| *time_ms <= target_time_ms)?;
+    Some(ratio_delta(
+        points.last().map(|(_, price)| *price)?,
+        *past_price,
+    ))
+}
+
+struct EventCycleContext {
+    start_ms: i64,
+    progress: f64,
+    open_price: f64,
+    return_from_open: f64,
+}
+
+fn event_cycle_context(
+    candles: &[MarketCandle],
+    latest_price: f64,
+    latest_price_time_ms: i64,
+) -> EventCycleContext {
+    let period_ms = i64::from(DEFAULT_PERIOD_SECONDS) * 1_000;
+    let start_ms = latest_price_time_ms - latest_price_time_ms.rem_euclid(period_ms);
+    let open_price = candles
+        .iter()
+        .rev()
+        .find(|candle| candle.open_time_ms <= start_ms)
+        .map(|candle| candle.open)
+        .or_else(|| candles.first().map(|candle| candle.open))
+        .unwrap_or(latest_price);
+    let elapsed_ms = (latest_price_time_ms - start_ms).clamp(0, period_ms);
+    EventCycleContext {
+        start_ms,
+        progress: elapsed_ms as f64 / period_ms as f64,
+        open_price,
+        return_from_open: ratio_delta(latest_price, open_price),
     }
 }
 
