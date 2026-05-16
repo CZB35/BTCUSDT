@@ -2674,10 +2674,18 @@ async fn signal_history(
     let user_id = require_android_user(&state, &headers).await?;
     let signals = match state.db.as_ref() {
         Some(pool) => db_signal_history(pool, 50).await?,
-        None => state.signals.read().await.clone(),
+        None => state
+            .signals
+            .read()
+            .await
+            .iter()
+            .rev()
+            .take(50)
+            .cloned()
+            .collect(),
     };
     let mut out = Vec::with_capacity(signals.len());
-    for signal in signals.iter().rev().take(50) {
+    for signal in signals.iter().take(50) {
         out.push(display_signal_for_user(&state, user_id, signal).await);
     }
     Ok(Json(out))
@@ -5737,15 +5745,18 @@ async fn admin_signals(
     ensure_admin(&state, &headers).await?;
     let signals = match state.db.as_ref() {
         Some(pool) => db_signal_history(pool, 200).await?,
-        None => state.signals.read().await.clone(),
-    };
-    Ok(Json(
-        signals
+        None => state
+            .signals
+            .read()
+            .await
             .iter()
             .rev()
             .take(200)
-            .map(signal_api_response)
+            .cloned()
             .collect(),
+    };
+    Ok(Json(
+        signals.iter().take(200).map(signal_api_response).collect(),
     ))
 }
 
