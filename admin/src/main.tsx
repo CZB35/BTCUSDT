@@ -108,6 +108,7 @@ type SignalRecord = {
   symbol: string;
   direction: string;
   confidence: string;
+  entry_price?: string;
   suggested_stake: string;
   fee_reserve_usdt: string;
   authorization_status: string;
@@ -138,6 +139,7 @@ type OrderRecord = {
   symbol: string;
   direction: string;
   stake_usdt: string;
+  entry_price?: string | null;
   automation_confidence?: string | null;
   order_status: string;
   created_at: string;
@@ -150,6 +152,8 @@ type ReportRecord = {
   result: string;
   direction: string;
   stake_usdt: string;
+  entry_price?: string | null;
+  expiry_price?: string | null;
   gross_profit?: string | null;
   report_status: string;
   created_at: string;
@@ -159,6 +163,13 @@ type SettlementRecord = {
   id: string;
   user_id: string;
   execution_report_id: string;
+  signal_id?: string | null;
+  symbol?: string | null;
+  direction?: string | null;
+  stake_usdt?: string | null;
+  entry_price?: string | null;
+  expiry_price?: string | null;
+  result?: string | null;
   gross_profit: string;
   profit_share_fee: string;
   loss_rebate: string;
@@ -957,13 +968,14 @@ function SignalsPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "交易对", "方向", "金额", "置信度", "预扣", "状态"]}
+          columns={["时间", "交易对", "方向", "入场价", "金额", "置信度", "预扣", "状态"]}
           rows={signals.map((signal) => ({
             id: signal.id,
             cells: [
               shortTime(signal.cycle_end),
               signal.symbol,
               <ToneText tone={directionTone(signal.direction)}>{labelDirection(signal.direction)}</ToneText>,
+              signal.entry_price || "-",
               `${signal.suggested_stake || "-"} USDT`,
               percent(signal.confidence),
               `${signal.fee_reserve_usdt || "-"} USDT`,
@@ -973,6 +985,7 @@ function SignalsPage({
               信号ID: signal.signal_id || signal.id,
               交易对: signal.symbol,
               方向: labelDirection(signal.direction),
+              入场价: signal.entry_price || "-",
               建议金额: `${signal.suggested_stake || "-"} USDT`,
               预扣金额: `${signal.fee_reserve_usdt || "-"} USDT`,
               置信度: percent(signal.confidence),
@@ -1211,7 +1224,7 @@ function PredictionPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "方向", "模型分", "涨概率", "跌概率", "置信度", "技术分", "原因"]}
+          columns={["时间", "方向", "价格", "模型分", "涨概率", "跌概率", "置信度", "技术分", "原因"]}
           pageSize={20}
           rows={observations.map((row) => ({
             id: row.id,
@@ -1220,6 +1233,7 @@ function PredictionPage({
               return [
                 shortTime(row.created_at),
                 <ToneText tone={directionTone(row.direction)}>{labelDirection(row.direction)}</ToneText>,
+                row.entry_price || "-",
                 metrics.modelScore || row.score || "-",
                 metrics.upProbability,
                 metrics.downProbability,
@@ -1496,13 +1510,14 @@ function OrdersPage({ orders, reports, onSettle }: { orders: OrderRecord[]; repo
           </div>
         </div>
         <DataTable
-          columns={["时间", "用户", "方向", "金额", "来源", "状态", "信号"]}
+          columns={["时间", "用户", "方向", "入场价", "金额", "来源", "状态", "信号"]}
           rows={orders.map((order) => ({
             id: order.id,
             cells: [
               shortTime(order.created_at),
               shortId(order.user_id, 8),
               <ToneText tone={directionTone(order.direction)}>{labelDirection(order.direction)}</ToneText>,
+              order.entry_price || "-",
               `${order.stake_usdt} USDT`,
               order.source,
               order.order_status,
@@ -1515,6 +1530,7 @@ function OrdersPage({ orders, reports, onSettle }: { orders: OrderRecord[]; repo
               客户端订单: order.client_order_id,
               交易对: order.symbol,
               方向: labelDirection(order.direction),
+              入场价: order.entry_price || "-",
               下单金额: `${order.stake_usdt} USDT`,
               来源: order.source,
               自动化置信度: order.automation_confidence || "-",
@@ -1697,13 +1713,15 @@ function ReportsTable({
         </div>
       </div>
       <DataTable
-        columns={["时间", "用户", "方向", "金额", "结果", "毛盈利", "状态", "操作"]}
+        columns={["时间", "用户", "方向", "入场价", "到期价", "金额", "结果", "毛盈利", "状态", "操作"]}
         rows={reports.map((report) => ({
           id: report.id,
           cells: [
             shortTime(report.created_at),
             shortId(report.user_id, 8),
             <ToneText tone={directionTone(report.direction)}>{labelDirection(report.direction)}</ToneText>,
+            report.entry_price || "-",
+            report.expiry_price || "-",
             `${report.stake_usdt} USDT`,
             resultLabel(report.result),
             report.gross_profit || "-",
@@ -1717,6 +1735,8 @@ function ReportsTable({
             用户ID: report.user_id,
             信号ID: report.signal_id,
             方向: labelDirection(report.direction),
+            入场价: report.entry_price || "-",
+            到期价: report.expiry_price || "-",
             下单金额: `${report.stake_usdt} USDT`,
             结果: resultLabel(report.result),
             毛盈利: report.gross_profit || "-",
@@ -1739,12 +1759,15 @@ function SettlementsPage({ settlements }: { settlements: SettlementRecord[] }) {
         </div>
       </div>
       <DataTable
-        columns={["时间", "用户", "毛盈利", "平台扣费", "亏损返还", "用户净额", "状态"]}
+        columns={["时间", "用户", "方向", "入场价", "到期价", "毛盈利", "平台扣费", "亏损返还", "用户净额", "状态"]}
         rows={settlements.map((row) => ({
           id: row.id,
           cells: [
             shortTime(row.created_at),
             shortId(row.user_id, 8),
+            <ToneText tone={directionTone(row.direction || undefined)}>{labelDirection(row.direction || undefined)}</ToneText>,
+            row.entry_price || "-",
+            row.expiry_price || "-",
             row.gross_profit,
             row.profit_share_fee,
             row.loss_rebate,
@@ -1755,6 +1778,13 @@ function SettlementsPage({ settlements }: { settlements: SettlementRecord[] }) {
             结算ID: row.id,
             用户ID: row.user_id,
             回报ID: row.execution_report_id,
+            信号ID: row.signal_id || "-",
+            交易对: row.symbol || "-",
+            方向: labelDirection(row.direction || undefined),
+            下单金额: row.stake_usdt ? `${row.stake_usdt} USDT` : "-",
+            入场价: row.entry_price || "-",
+            到期价: row.expiry_price || "-",
+            结果: resultLabel(row.result || undefined),
             毛盈利: row.gross_profit,
             平台扣费: row.profit_share_fee,
             亏损返还: row.loss_rebate,

@@ -1290,6 +1290,7 @@ struct EventContractOrderRecord {
     period_seconds: i32,
     direction: String,
     stake_usdt: Decimal,
+    entry_price: Option<Decimal>,
     automation_profile: Option<String>,
     automation_confidence: Option<Decimal>,
     action_trace_id: Option<String>,
@@ -1328,6 +1329,13 @@ struct SettlementRecord {
     id: Uuid,
     execution_report_id: Uuid,
     user_id: Uuid,
+    signal_id: Option<String>,
+    symbol: Option<String>,
+    direction: Option<String>,
+    stake_usdt: Option<Decimal>,
+    entry_price: Option<Decimal>,
+    expiry_price: Option<Decimal>,
+    result: Option<String>,
     gross_profit: Decimal,
     profit_share_fee: Decimal,
     loss_rebate: Decimal,
@@ -5436,6 +5444,7 @@ async fn submit_order(
         period_seconds: req.period_seconds,
         direction,
         stake_usdt,
+        entry_price: None,
         automation_profile: req.automation_profile,
         automation_confidence: parse_optional_decimal(
             req.automation_confidence.as_deref(),
@@ -7379,7 +7388,7 @@ async fn settle_order_from_binance_income(
         period_seconds: order.period_seconds,
         direction: order.direction.clone(),
         stake_usdt: order.stake_usdt,
-        entry_price: None,
+        entry_price: order.entry_price,
         expiry_price: None,
         payout_ratio: Some(DEFAULT_PAYOUT_RATIO),
         gross_profit: Some(gross_profit),
@@ -7608,6 +7617,13 @@ async fn settle_execution_report(
         id: Uuid::now_v7(),
         execution_report_id: report.id,
         user_id: report.user_id,
+        signal_id: Some(report.signal_id.clone()),
+        symbol: Some(report.symbol.clone()),
+        direction: Some(report.direction.clone()),
+        stake_usdt: Some(report.stake_usdt),
+        entry_price: report.entry_price,
+        expiry_price: report.expiry_price,
+        result: Some(report.result.clone()),
         gross_profit,
         profit_share_fee,
         loss_rebate,
@@ -10508,6 +10524,7 @@ fn event_order_from_row(row: sqlx::postgres::PgRow) -> EventContractOrderRecord 
         period_seconds: row.get("period_seconds"),
         direction: row.get("direction"),
         stake_usdt: row.get("stake_usdt"),
+        entry_price: row.try_get("entry_price").unwrap_or(None),
         automation_profile: row.get("automation_profile"),
         automation_confidence: row.get("automation_confidence"),
         action_trace_id: row.get("action_trace_id"),
@@ -10708,13 +10725,15 @@ async fn db_pending_exchange_orders(
 ) -> Result<Vec<EventContractOrderRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
-               period_seconds, direction, stake_usdt, automation_profile,
-               automation_confidence, action_trace_id, raw_audit, order_status, reported_at, created_at
-        from event_contract_orders
-        where exchange_verification_status in ('unverified', 'pending')
-          and mod(abs(hashtext(user_id::text)), $1) = $2
-        order by created_at asc
+        select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
+               o.order_status, o.reported_at, o.created_at
+        from event_contract_orders o
+        left join signals s on s.id::text = o.signal_ref
+        where o.exchange_verification_status in ('unverified', 'pending')
+          and mod(abs(hashtext(o.user_id::text)), $1) = $2
+        order by o.created_at asc
         limit $3
         "#,
     )
@@ -10735,20 +10754,22 @@ async fn db_confirmed_exchange_orders_due_for_settlement(
 ) -> Result<Vec<EventContractOrderRecord>, AppError> {
     sqlx::query(
         r#"
-        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
-               period_seconds, direction, stake_usdt, automation_profile,
-               automation_confidence, action_trace_id, raw_audit, order_status, reported_at, created_at
-        from event_contract_orders
-        where exchange_verification_status = 'confirmed'
-          and exchange_ref is not null
-          and created_at <= $1
-          and mod(abs(hashtext(user_id::text)), $2) = $3
+        select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
+               o.order_status, o.reported_at, o.created_at
+        from event_contract_orders o
+        left join signals s on s.id::text = o.signal_ref
+        where o.exchange_verification_status = 'confirmed'
+          and o.exchange_ref is not null
+          and o.created_at <= $1
+          and mod(abs(hashtext(o.user_id::text)), $2) = $3
           and not exists (
             select 1 from execution_reports r
-            where r.user_id = event_contract_orders.user_id
-              and r.signal_id::text = event_contract_orders.signal_ref
+            where r.user_id = o.user_id
+              and r.signal_id::text = o.signal_ref
           )
-        order by created_at asc
+        order by o.created_at asc
         limit $4
         "#,
     )
@@ -11083,6 +11104,13 @@ async fn db_settle_execution_report_tx(
         id: Uuid::now_v7(),
         execution_report_id: report.id,
         user_id: report.user_id,
+        signal_id: Some(report.signal_id.clone()),
+        symbol: Some(report.symbol.clone()),
+        direction: Some(report.direction.clone()),
+        stake_usdt: Some(report.stake_usdt),
+        entry_price: report.entry_price,
+        expiry_price: report.expiry_price,
+        result: Some(report.result.clone()),
         gross_profit,
         profit_share_fee,
         loss_rebate,
@@ -11502,22 +11530,23 @@ async fn db_admin_orders(
     let status = status_filter(query);
     sqlx::query(
         r#"
-        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
-               period_seconds, direction, stake_usdt, automation_profile,
-               automation_confidence, action_trace_id, raw_audit, order_status,
-               reported_at, created_at
-        from event_contract_orders
-        where ($1::text is null or order_status = $1)
+        select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
+               o.order_status, o.reported_at, o.created_at
+        from event_contract_orders o
+        left join signals s on s.id::text = o.signal_ref
+        where ($1::text is null or o.order_status = $1)
           and (
             $2::text is null
-            or client_order_id ilike $2 escape '\'
-            or signal_ref ilike $2 escape '\'
-            or user_id::text ilike $2 escape '\'
-            or symbol ilike $2 escape '\'
-            or direction ilike $2 escape '\'
-            or order_status ilike $2 escape '\'
+            or o.client_order_id ilike $2 escape '\'
+            or o.signal_ref ilike $2 escape '\'
+            or o.user_id::text ilike $2 escape '\'
+            or o.symbol ilike $2 escape '\'
+            or o.direction ilike $2 escape '\'
+            or o.order_status ilike $2 escape '\'
           )
-        order by created_at desc
+        order by o.created_at desc
         limit $3 offset $4
         "#,
     )
@@ -11541,22 +11570,23 @@ async fn db_orders_for_user(
     let status = status_filter(query);
     sqlx::query(
         r#"
-        select id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
-               period_seconds, direction, stake_usdt, automation_profile,
-               automation_confidence, action_trace_id, raw_audit, order_status,
-               reported_at, created_at
-        from event_contract_orders
-        where user_id = $1
-          and ($2::text is null or order_status = $2)
+        select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
+               o.order_status, o.reported_at, o.created_at
+        from event_contract_orders o
+        left join signals s on s.id::text = o.signal_ref
+        where o.user_id = $1
+          and ($2::text is null or o.order_status = $2)
           and (
             $3::text is null
-            or client_order_id ilike $3 escape '\'
-            or signal_ref ilike $3 escape '\'
-            or symbol ilike $3 escape '\'
-            or direction ilike $3 escape '\'
-            or order_status ilike $3 escape '\'
+            or o.client_order_id ilike $3 escape '\'
+            or o.signal_ref ilike $3 escape '\'
+            or o.symbol ilike $3 escape '\'
+            or o.direction ilike $3 escape '\'
+            or o.order_status ilike $3 escape '\'
           )
-        order by created_at desc
+        order by o.created_at desc
         limit $4 offset $5
         "#,
     )
@@ -11583,6 +11613,7 @@ fn order_from_row(row: sqlx::postgres::PgRow) -> EventContractOrderRecord {
         period_seconds: row.get("period_seconds"),
         direction: row.get("direction"),
         stake_usdt: row.get("stake_usdt"),
+        entry_price: row.try_get("entry_price").unwrap_or(None),
         automation_profile: row.get("automation_profile"),
         automation_confidence: row.get("automation_confidence"),
         action_trace_id: row.get("action_trace_id"),
@@ -11705,18 +11736,26 @@ async fn db_admin_settlements(
     let status = status_filter(query);
     sqlx::query(
         r#"
-        select id, execution_report_id, user_id, gross_profit, profit_share_fee,
-               loss_rebate, user_net_profit, status, created_at
-        from settlements
-        where ($1::text is null or status = $1)
+        select st.id, st.execution_report_id, st.user_id,
+               er.signal_id::text as signal_id, er.symbol, er.direction, er.stake_usdt,
+               er.entry_price, er.expiry_price, er.result,
+               st.gross_profit, st.profit_share_fee, st.loss_rebate,
+               st.user_net_profit, st.status, st.created_at
+        from settlements st
+        left join execution_reports er on er.id = st.execution_report_id
+        where ($1::text is null or st.status = $1)
           and (
             $2::text is null
-            or id::text ilike $2 escape '\'
-            or execution_report_id::text ilike $2 escape '\'
-            or user_id::text ilike $2 escape '\'
-            or status ilike $2 escape '\'
+            or st.id::text ilike $2 escape '\'
+            or st.execution_report_id::text ilike $2 escape '\'
+            or st.user_id::text ilike $2 escape '\'
+            or er.signal_id::text ilike $2 escape '\'
+            or er.symbol ilike $2 escape '\'
+            or er.direction ilike $2 escape '\'
+            or er.result ilike $2 escape '\'
+            or st.status ilike $2 escape '\'
           )
-        order by created_at desc
+        order by st.created_at desc
         limit $3 offset $4
         "#,
     )
@@ -11740,18 +11779,26 @@ async fn db_settlements_for_user(
     let status = status_filter(query);
     sqlx::query(
         r#"
-        select id, execution_report_id, user_id, gross_profit, profit_share_fee,
-               loss_rebate, user_net_profit, status, created_at
-        from settlements
-        where user_id = $1
-          and ($2::text is null or status = $2)
+        select st.id, st.execution_report_id, st.user_id,
+               er.signal_id::text as signal_id, er.symbol, er.direction, er.stake_usdt,
+               er.entry_price, er.expiry_price, er.result,
+               st.gross_profit, st.profit_share_fee, st.loss_rebate,
+               st.user_net_profit, st.status, st.created_at
+        from settlements st
+        left join execution_reports er on er.id = st.execution_report_id
+        where st.user_id = $1
+          and ($2::text is null or st.status = $2)
           and (
             $3::text is null
-            or id::text ilike $3 escape '\'
-            or execution_report_id::text ilike $3 escape '\'
-            or status ilike $3 escape '\'
+            or st.id::text ilike $3 escape '\'
+            or st.execution_report_id::text ilike $3 escape '\'
+            or er.signal_id::text ilike $3 escape '\'
+            or er.symbol ilike $3 escape '\'
+            or er.direction ilike $3 escape '\'
+            or er.result ilike $3 escape '\'
+            or st.status ilike $3 escape '\'
           )
-        order by created_at desc
+        order by st.created_at desc
         limit $4 offset $5
         "#,
     )
@@ -11771,6 +11818,13 @@ fn settlement_from_row(row: sqlx::postgres::PgRow) -> SettlementRecord {
         id: row.get("id"),
         execution_report_id: row.get("execution_report_id"),
         user_id: row.get("user_id"),
+        signal_id: row.try_get("signal_id").ok(),
+        symbol: row.try_get("symbol").ok(),
+        direction: row.try_get("direction").ok(),
+        stake_usdt: row.try_get("stake_usdt").ok(),
+        entry_price: row.try_get("entry_price").ok(),
+        expiry_price: row.try_get("expiry_price").ok(),
+        result: row.try_get("result").ok(),
         gross_profit: row.get("gross_profit"),
         profit_share_fee: row.get("profit_share_fee"),
         loss_rebate: row.get("loss_rebate"),
