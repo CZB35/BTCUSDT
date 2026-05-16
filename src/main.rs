@@ -4788,8 +4788,8 @@ fn build_prediction_decision(
     let live_ret_3 =
         rolling_price_return(&snapshot.price_points, snapshot.latest_price_time_ms, 90)
             .unwrap_or(ret_3);
-    // Event contracts punish late entries hard. At band extremes we either wait,
-    // or only reverse after live price confirms a rejection/reclaim.
+    // Event contracts are 10-minute direction bets. A few seconds of pullback
+    // at an extreme is not enough to flip against a still-alive trend.
     let upper_extreme = clamp((boll_pos - 0.82) / 0.18, 0.0, 1.0);
     let lower_extreme = clamp((0.18 - boll_pos) / 0.18, 0.0, 1.0);
     let up_move_intensity = clamp(
@@ -4804,38 +4804,18 @@ fn build_prediction_decision(
     );
     let live_reclaiming = snapshot.latest_price >= latest.close || latest.close >= latest.open;
     let live_rejecting = snapshot.latest_price <= latest.close || latest.close <= latest.open;
-    let bottom_reversal_confirmed = lower_extreme > 0.25
-        && (cycle.return_from_open < -0.00070 || ret_3 < -0.00070 || ret_5 < -0.00100)
-        && live_ret_1 > 0.00010
-        && live_ret_1 > live_ret_3 * 0.35
+    let bottom_reversal_setup = lower_extreme > 0.55
+        && (cycle.return_from_open < -0.00120 || ret_3 < -0.00100 || ret_5 < -0.00120)
+        && live_ret_1 > 0.00018
+        && live_ret_3 > 0.00005
+        && ret_1 > 0.00005
         && live_reclaiming;
-    let top_reversal_confirmed = upper_extreme > 0.25
-        && (cycle.return_from_open > 0.00070 || ret_3 > 0.00070 || ret_5 > 0.00100)
-        && live_ret_1 < -0.00010
-        && live_ret_1 < live_ret_3 * 0.35
+    let top_reversal_setup = upper_extreme > 0.55
+        && (cycle.return_from_open > 0.00120 || ret_3 > 0.00100 || ret_5 > 0.00120)
+        && live_ret_1 < -0.00018
+        && live_ret_3 < -0.00005
+        && ret_1 < -0.00005
         && live_rejecting;
-    let bottom_reversal_signal_score = if bottom_reversal_confirmed {
-        6.4 + lower_extreme * 1.2
-            + clamp(live_ret_1 * 5500.0, 0.0, 1.8)
-            + clamp(
-                (-cycle.return_from_open).max(-ret_3).max(-ret_5) * 850.0,
-                0.0,
-                1.4,
-            )
-    } else {
-        0.0
-    };
-    let top_reversal_signal_score = if top_reversal_confirmed {
-        -6.4 - upper_extreme * 1.2
-            - clamp((-live_ret_1) * 5500.0, 0.0, 1.8)
-            - clamp(
-                cycle.return_from_open.max(ret_3).max(ret_5) * 850.0,
-                0.0,
-                1.4,
-            )
-    } else {
-        0.0
-    };
     let momentum_score = live_ret_1 * 1450.0
         + live_ret_3 * 900.0
         + ret_1 * 950.0
@@ -4854,15 +4834,8 @@ fn build_prediction_decision(
             0.0
         };
     let volume_score = clamp(volume_z, -2.5, 2.5) * sign(ret_1 + ret_3) * 0.28;
-    let mean_reversion_score = lower_extreme * (1.05 + down_move_intensity * 1.20)
-        - upper_extreme * (1.05 + up_move_intensity * 1.20)
-        + if bottom_reversal_confirmed {
-            1.10
-        } else if top_reversal_confirmed {
-            -1.10
-        } else {
-            0.0
-        };
+    let mean_reversion_score = lower_extreme * (0.75 + down_move_intensity * 0.85)
+        - upper_extreme * (0.75 + up_move_intensity * 0.85);
     let candle_score = body_ratio * sign(latest.close - latest.open) * 0.22;
     let live_score = ratio_delta(snapshot.latest_price, ema5) * 260.0;
     let mark_index_basis = snapshot
@@ -4891,23 +4864,52 @@ fn build_prediction_decision(
         + live_score
         + cycle_score
         + basis_score;
-    let (score, reversal_mode) = if bottom_reversal_signal_score >= config.up_threshold
-        && continuation_score > config.down_threshold * 0.75
-    {
-        (
-            bottom_reversal_signal_score.max(continuation_score),
-            "bottom_reversal",
-        )
-    } else if top_reversal_signal_score <= config.down_threshold
-        && continuation_score < config.up_threshold * 0.75
-    {
-        (
-            top_reversal_signal_score.min(continuation_score),
-            "top_reversal",
-        )
+
+    let up_continuation_alive =
+        cycle.return_from_open > 0.00120 && ret_3 > 0.00025 && ret_5 > 0.00055;
+    let down_continuation_alive =
+        cycle.return_from_open < -0.00120 && ret_3 < -0.00025 && ret_5 < -0.00055;
+    let top_trend_damage = continuation_score < -1.25
+        && momentum_score < -0.40
+        && (ret_1 < -0.00020 || live_ret_3 < -0.00045);
+    let bottom_trend_damage = continuation_score > 1.25
+        && momentum_score > 0.40
+        && (ret_1 > 0.00020 || live_ret_3 > 0.00045);
+    let top_reversal_confirmed = top_reversal_setup && top_trend_damage && !up_continuation_alive;
+    let bottom_reversal_confirmed =
+        bottom_reversal_setup && bottom_trend_damage && !down_continuation_alive;
+    let bottom_reversal_bias = if bottom_reversal_confirmed {
+        5.4 + lower_extreme * 0.95
+            + clamp(live_ret_1 * 4500.0, 0.0, 1.6)
+            + clamp(
+                (-cycle.return_from_open).max(-ret_3).max(-ret_5) * 750.0,
+                0.0,
+                1.2,
+            )
     } else {
-        (continuation_score, "none")
+        0.0
     };
+    let top_reversal_bias = if top_reversal_confirmed {
+        -5.4 - upper_extreme * 0.95
+            - clamp((-live_ret_1) * 4500.0, 0.0, 1.6)
+            - clamp(
+                cycle.return_from_open.max(ret_3).max(ret_5) * 750.0,
+                0.0,
+                1.2,
+            )
+    } else {
+        0.0
+    };
+    let bottom_reversal_signal_score = continuation_score + bottom_reversal_bias;
+    let top_reversal_signal_score = continuation_score + top_reversal_bias;
+    let (score, reversal_mode) =
+        if bottom_reversal_confirmed && bottom_reversal_signal_score >= config.up_threshold {
+            (bottom_reversal_signal_score, "bottom_reversal")
+        } else if top_reversal_confirmed && top_reversal_signal_score <= config.down_threshold {
+            (top_reversal_signal_score, "top_reversal")
+        } else {
+            (continuation_score, "none")
+        };
     let confidence = clamp(1.0 / (1.0 + (-score.abs() / 2.8).exp()), 0.0, 0.99);
     let predicted_return = clamp(score / 10_000.0, -0.003, 0.003);
     let mut direction = if score >= config.up_threshold {
@@ -4936,6 +4938,7 @@ fn build_prediction_decision(
         && reversal_mode == "none"
         && upper_extreme > 0.75
         && up_move_intensity > 0.45
+        && (live_ret_1 < -0.00005 || live_ret_3 < -0.00015 || ret_1 < -0.00010)
     {
         direction = "HOLD".to_string();
         reason = format!(
@@ -4946,6 +4949,7 @@ fn build_prediction_decision(
         && reversal_mode == "none"
         && lower_extreme > 0.75
         && down_move_intensity > 0.45
+        && (live_ret_1 > 0.00005 || live_ret_3 > 0.00015 || ret_1 > 0.00010)
     {
         direction = "HOLD".to_string();
         reason = format!(
@@ -5000,10 +5004,18 @@ fn build_prediction_decision(
                 "lower_extreme": lower_extreme,
                 "up_move_intensity": up_move_intensity,
                 "down_move_intensity": down_move_intensity,
+                "bottom_setup": bottom_reversal_setup,
+                "top_setup": top_reversal_setup,
+                "bottom_trend_damage": bottom_trend_damage,
+                "top_trend_damage": top_trend_damage,
+                "up_continuation_alive": up_continuation_alive,
+                "down_continuation_alive": down_continuation_alive,
                 "bottom_confirmed": bottom_reversal_confirmed,
                 "top_confirmed": top_reversal_confirmed,
                 "bottom_signal_score": bottom_reversal_signal_score,
-                "top_signal_score": top_reversal_signal_score
+                "top_signal_score": top_reversal_signal_score,
+                "bottom_bias": bottom_reversal_bias,
+                "top_bias": top_reversal_bias
             },
             "cycle": {
                 "start_ms": cycle.start_ms,
