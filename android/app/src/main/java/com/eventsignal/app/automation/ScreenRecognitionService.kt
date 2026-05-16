@@ -23,15 +23,16 @@ class ScreenRecognitionService {
         val observedBalanceUsdt = extractObservedBalanceUsdt(texts)
         val structure = detectEventContractStructure(texts, amountFieldFound, upButtonFound, downButtonFound)
         val confidence = pageConfidence(packageName, structure, profile)
+        val amountReady = amountFieldFound || structure.hasAmountArea
+        val directionReady = (upButtonFound && downButtonFound) || structure.hasDirectionArea
 
         return RecognizedScreen(
             packageName = packageName,
             screenName = inferScreenName(structure, texts),
             confidence = confidence,
             safeToAct = structure.isEventContractPage &&
-                amountFieldFound &&
-                upButtonFound &&
-                downButtonFound &&
+                amountReady &&
+                directionReady &&
                 confidence >= profile.minRecognitionConfidence,
             pageKeywordHits = pageKeywordHits,
             amountFieldFound = amountFieldFound,
@@ -88,10 +89,11 @@ class ScreenRecognitionService {
         val normalizedTexts = texts.map { it.normalized() }
         val allText = normalizedTexts.joinToString(" ")
         val hasEventTitle = allText.contains("事件合约") ||
+            allText.contains("合约") ||
             allText.contains("EVENTCONTRACT", ignoreCase = true)
         val hasSymbol = allText.contains("BTCUSDT", ignoreCase = true)
         val hasTimeUnit = allText.contains("时间单位") ||
-            listOf("1分", "5分", "10分钟", "10分钟", "15分", "30分", "1小时", "10M", "10MIN").any { token ->
+            listOf("1分", "5分", "10分钟", "10分", "15分", "30分", "1小时", "10M", "10MIN").any { token ->
                 allText.contains(token, ignoreCase = true)
             }
         val hasAmountArea = amountFieldFound ||

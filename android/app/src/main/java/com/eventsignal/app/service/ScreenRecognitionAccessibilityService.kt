@@ -8,6 +8,7 @@ import com.eventsignal.app.automation.AutomationStateStore
 import com.eventsignal.app.automation.BuiltInProfiles
 import com.eventsignal.app.automation.RecognizedScreen
 import com.eventsignal.app.automation.ScreenRecognitionService
+import com.eventsignal.app.automation.findAutomationRoot
 import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.domain.AutomationPageStateRequest
 import kotlinx.coroutines.CoroutineScope
@@ -77,11 +78,11 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
         if (!AutomationRuntime.running) return
         val settings = stateStore.loadSettings()
         if (!settings.automationEnabled || settings.executionMode != "automatic") return
-        val root = rootInActiveWindow ?: run {
+        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
+        val root = findAutomationRoot(profile) ?: run {
             stateStore.clearRecognitionState("\u9875\u9762\u95f8\u95e8\uff1a\u672a\u8bfb\u5230\u7a97\u53e3")
             return
         }
-        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
         val screen = recognition.recognize(root, null, profile)
         saveScreenState(screen, if (screen.safeToAct) "\u9875\u9762\u95f8\u95e8\u5df2\u5c31\u7eea" else "\u9875\u9762\u95f8\u95e8\u672a\u5c31\u7eea")
         val payload = AutomationPageStateRequest(
@@ -127,13 +128,13 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
     }
 
     private fun calibrateCurrentPage() {
-        val root = rootInActiveWindow ?: run {
+        val settings = stateStore.loadSettings()
+        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
+        val root = findAutomationRoot(profile) ?: run {
             stateStore.clearRecognitionState("\u8bc6\u522b\u5931\u8d25\uff1a\u672a\u8bfb\u5230\u5f53\u524d\u7a97\u53e3")
             stateStore.saveLastStatus("calibration_missing_active_window")
             return
         }
-        val settings = stateStore.loadSettings()
-        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
         val screen = recognition.recognize(root, null, profile)
         saveScreenState(
             screen,
@@ -161,12 +162,12 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
             stateStore.saveLastStatus("execution_failed_missing_signal")
             return
         }
-        val root = rootInActiveWindow ?: run {
+        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
+        val root = findAutomationRoot(profile) ?: run {
             stateStore.clearRecognitionState("\u6267\u884c\u5931\u8d25\uff1a\u672a\u8bfb\u5230\u5f53\u524d\u7a97\u53e3")
             stateStore.saveLastStatus("execution_failed_missing_active_window")
             return
         }
-        val profile = BuiltInProfiles.byId(settings.targetAppProfile)
         val screen = recognition.recognize(root, null, profile)
         saveScreenState(
             screen,

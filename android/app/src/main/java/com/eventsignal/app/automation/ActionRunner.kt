@@ -52,7 +52,7 @@ class ActionRunner(
             return
         }
 
-        val root = service.rootInActiveWindow ?: run {
+        val root = service.findAutomationRoot(profile) ?: run {
             stateStore.saveLastStatus("missing_root_window")
             releaseReservation(signal, "missing_root_window")
             return
@@ -91,7 +91,7 @@ class ActionRunner(
         }
 
         SystemClock.sleep(300)
-        val refreshedRoot = service.rootInActiveWindow ?: run {
+        val refreshedRoot = service.findAutomationRoot(profile) ?: run {
             saveActionState(screen, amountFieldFound = true, upButton != null, downButton != null, "金额已输入，页面丢失")
             stateStore.saveLastStatus("missing_root_window_after_input")
             releaseReservation(signal, "missing_root_window_after_input")
@@ -351,7 +351,7 @@ class ActionRunner(
     private fun clickConfirm(profile: AutomationProfile): Boolean {
         repeat(20) {
             SystemClock.sleep(250)
-            val root = service.rootInActiveWindow ?: return@repeat
+            val root = service.findAutomationRoot(profile) ?: return@repeat
             val confirm = findButton(flatten(root), profile.confirmButtonKeywords)
             if (confirm != null && click(confirm)) {
                 return true
