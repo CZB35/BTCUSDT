@@ -542,6 +542,10 @@ fn start_prediction_loop(state: &SharedState) {
                     update_prediction_runtime(&state, &decision).await;
                     if let Some(pool) = state.db.as_ref() {
                         let _ = db_insert_prediction_observation(pool, &decision).await;
+                        if let Err(err) = db_settle_due_signal_outcomes(pool, 100).await {
+                            let mut runtime = state.prediction_runtime.write().await;
+                            runtime.last_error = Some(err.message);
+                        }
                     }
                     if decision.direction == "UP" || decision.direction == "DOWN" {
                         if let Err(err) = emit_prediction_signal(&state, &decision).await {
@@ -9481,6 +9485,59 @@ async fn db_insert_prediction_observation(
     .map_err(AppError::from_sqlx)
 }
 
+async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64, AppError> {
+    sqlx::query(
+        r#"
+        with due as (
+          select s.id, s.symbol, s.period_seconds, s.cycle_start, s.cycle_end,
+                 s.direction, s.entry_price, s.model_version
+          from signals s
+          where s.cycle_end <= now()
+            and not exists (
+              select 1 from signal_outcomes o where o.signal_id = s.id
+            )
+          order by s.cycle_end asc
+          limit $1
+        ),
+        priced as (
+          select due.*,
+                 expiry.entry_price as expiry_price
+          from due
+          join lateral (
+            select o.entry_price
+            from prediction_observations o
+            where o.symbol = due.symbol
+              and o.period_seconds = due.period_seconds
+              and o.created_at >= due.cycle_end
+            order by o.created_at asc
+            limit 1
+          ) expiry on true
+        )
+        insert into signal_outcomes
+          (signal_id, symbol, period_seconds, cycle_start, cycle_end, direction,
+           entry_price, expiry_price, result, source, model_version, settled_at, created_at)
+        select id, symbol, period_seconds, cycle_start, cycle_end, direction,
+               entry_price, expiry_price,
+               case
+                 when direction = 'UP' and expiry_price > entry_price then 'win'
+                 when direction = 'DOWN' and expiry_price < entry_price then 'win'
+                 else 'loss'
+               end as result,
+               'prediction_observation',
+               model_version,
+               now(),
+               now()
+        from priced
+        on conflict (signal_id) do nothing
+        "#,
+    )
+    .bind(limit.max(1))
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
+    .map_err(AppError::from_sqlx)
+}
+
 async fn db_prediction_calibration(
     pool: &PgPool,
     config: &PredictionConfig,
@@ -12133,14 +12190,29 @@ async fn db_build_stats(
         select
           count(*) filter (where upper(result) = 'WIN') as wins,
           count(*) filter (where upper(result) = 'LOSS') as losses
-        from execution_reports
+        from signal_outcomes
         "#,
     )
     .fetch_one(pool)
     .await
     .map_err(AppError::from_sqlx)?;
-    let wins = outcome_row.get::<i64, _>("wins") as usize;
-    let losses = outcome_row.get::<i64, _>("losses") as usize;
+    let mut wins = outcome_row.get::<i64, _>("wins") as usize;
+    let mut losses = outcome_row.get::<i64, _>("losses") as usize;
+    if wins + losses == 0 {
+        let report_row = sqlx::query(
+            r#"
+            select
+              count(*) filter (where upper(result) = 'WIN') as wins,
+              count(*) filter (where upper(result) = 'LOSS') as losses
+            from execution_reports
+            "#,
+        )
+        .fetch_one(pool)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        wins = report_row.get::<i64, _>("wins") as usize;
+        losses = report_row.get::<i64, _>("losses") as usize;
+    }
     let settled = wins + losses;
     let hit_rate = if settled == 0 {
         "0".to_string()
