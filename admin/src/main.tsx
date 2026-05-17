@@ -1264,7 +1264,7 @@ function PredictionPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "方向", "价格", "模型分", "涨概率", "跌概率", "置信度", "技术分", "原因"]}
+          columns={["时间", "方向", "价格", "模型分", "涨概率", "跌概率", "原始置信度", "技术分", "原因"]}
           pageSize={20}
           rows={observations.map((row) => ({
             id: row.id,
@@ -1277,7 +1277,7 @@ function PredictionPage({
                 metrics.modelScore || row.score || "-",
                 metrics.upProbability,
                 metrics.downProbability,
-                percent(row.confidence),
+                metrics.rawConfidence,
                 metrics.technicalScore,
                 row.reason || "-"
               ];
@@ -1299,7 +1299,8 @@ function PredictionPage({
                 上涨概率: metrics.upProbability,
                 下跌概率: metrics.downProbability,
                 边际概率: metrics.edgeProbability,
-                置信度: percent(row.confidence),
+                原始置信度: metrics.rawConfidence,
+                下发置信度: percent(row.confidence),
                 预期到期涨跌幅: metrics.expectedExpiryReturn,
                 到期波动率: metrics.expiryVolatility,
                 波动率下限: metrics.volatilityFloor,
@@ -2138,6 +2139,7 @@ function snapshotValue(snapshot: Record<string, unknown>, path: string[]) {
 function predictionMetrics(snapshot: Record<string, unknown>) {
   return {
     modelScore: formatMetric(snapshotValue(snapshot, ["scores", "model_score"])),
+    rawConfidence: percentValue(snapshotValue(snapshot, ["scores", "raw_confidence"])),
     technicalScore: formatMetric(snapshotValue(snapshot, ["scores", "technical_score"])),
     probabilityScore: formatMetric(snapshotValue(snapshot, ["scores", "probability_score"])),
     technicalWeight: percentValue(snapshotValue(snapshot, ["scores", "technical_weight"])),
