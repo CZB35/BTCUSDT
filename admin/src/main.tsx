@@ -119,6 +119,9 @@ type SignalRecord = {
   trade_authorized?: boolean;
   cycle_end: string;
   model_version?: string;
+  outcome_result?: string | null;
+  outcome_expiry_price?: string | null;
+  outcome_settled_at?: string | null;
 };
 
 type UserRecord = {
@@ -976,7 +979,7 @@ function SignalsPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "交易对", "方向", "入场价", "金额", "置信度", "预扣", "状态"]}
+          columns={["时间", "交易对", "方向", "入场价", "到期价", "结果", "金额", "置信度", "状态"]}
           rows={signals.map((signal) => ({
             id: signal.id,
             cells: [
@@ -984,9 +987,10 @@ function SignalsPage({
               signal.symbol,
               <ToneText tone={directionTone(signal.direction)}>{labelDirection(signal.direction)}</ToneText>,
               signal.entry_price || "-",
+              signal.outcome_expiry_price || "-",
+              <ToneText tone={resultTone(signal.outcome_result)}>{signalOutcomeLabel(signal.outcome_result)}</ToneText>,
               `${signal.suggested_stake || "-"} USDT`,
               percent(signal.confidence),
-              `${signal.fee_reserve_usdt || "-"} USDT`,
               signal.authorization_status || "-"
             ],
             details: {
@@ -994,6 +998,9 @@ function SignalsPage({
               交易对: signal.symbol,
               方向: labelDirection(signal.direction),
               入场价: signal.entry_price || "-",
+              到期价: signal.outcome_expiry_price || "-",
+              信号结果: signalOutcomeLabel(signal.outcome_result),
+              结算时间: shortTime(signal.outcome_settled_at),
               建议金额: `${signal.suggested_stake || "-"} USDT`,
               预扣金额: `${signal.fee_reserve_usdt || "-"} USDT`,
               置信度: percent(signal.confidence),
@@ -1844,6 +1851,8 @@ function SignalSummary({ signal }: { signal?: SignalRecord }) {
         <div><dt>建议金额</dt><dd>{signal?.suggested_stake || "-"} USDT</dd></div>
         <div><dt>预扣</dt><dd>{signal?.fee_reserve_usdt || "-"} USDT</dd></div>
         <div><dt>状态</dt><dd>{signal?.authorization_status || "-"}</dd></div>
+        <div><dt>结果</dt><dd>{signalOutcomeLabel(signal?.outcome_result)}</dd></div>
+        <div><dt>到期价</dt><dd>{signal?.outcome_expiry_price || "-"}</dd></div>
         <div><dt>周期结束</dt><dd>{shortTime(signal?.cycle_end)}</dd></div>
       </dl>
     </div>
@@ -2044,6 +2053,19 @@ function resultLabel(result?: string) {
   if (result === "WIN") return "盈利";
   if (result === "LOSS") return "亏损";
   return result || "-";
+}
+
+function signalOutcomeLabel(result?: string | null) {
+  if (!result) return "待结算";
+  if (result.toLowerCase() === "win") return "赢";
+  if (result.toLowerCase() === "loss") return "输";
+  return result;
+}
+
+function resultTone(result?: string | null) {
+  if (result?.toLowerCase() === "win") return "price-up";
+  if (result?.toLowerCase() === "loss") return "price-down";
+  return "";
 }
 
 function shortTime(value?: string | null) {

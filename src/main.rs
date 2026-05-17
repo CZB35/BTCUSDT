@@ -999,6 +999,9 @@ struct SignalCore {
     suggested_stake: Decimal,
     model_version: String,
     created_at: DateTime<Utc>,
+    outcome_result: Option<String>,
+    outcome_expiry_price: Option<Decimal>,
+    outcome_settled_at: Option<DateTime<Utc>>,
 }
 
 impl SignalCore {
@@ -1017,6 +1020,9 @@ impl SignalCore {
             suggested_stake,
             model_version: PREDICTION_MODEL_VERSION.to_string(),
             created_at: now,
+            outcome_result: None,
+            outcome_expiry_price: None,
+            outcome_settled_at: None,
         }
     }
 
@@ -1044,6 +1050,9 @@ impl SignalCore {
             suggested_stake: MIN_EVENT_STAKE,
             model_version: PREDICTION_MODEL_VERSION.to_string(),
             created_at: Utc::now(),
+            outcome_result: None,
+            outcome_expiry_price: None,
+            outcome_settled_at: None,
         }
     }
 }
@@ -2174,6 +2183,9 @@ struct SignalApiResponse {
     account_balance_delta_usdt: Option<String>,
     balance_available_after_reserve: String,
     model_version: String,
+    outcome_result: Option<String>,
+    outcome_expiry_price: Option<String>,
+    outcome_settled_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Serialize)]
@@ -7519,6 +7531,9 @@ async fn display_signal_for_user(
         account_balance_delta_usdt: None,
         balance_available_after_reserve: money(balance.available),
         model_version: signal.model_version.clone(),
+        outcome_result: signal.outcome_result.clone(),
+        outcome_expiry_price: signal.outcome_expiry_price.map(money),
+        outcome_settled_at: signal.outcome_settled_at,
     }
 }
 
@@ -7743,6 +7758,9 @@ async fn authorize_signal_for_user(
         account_balance_delta_usdt: account_match.delta.map(money),
         balance_available_after_reserve: money(balance_after),
         model_version: signal.model_version.clone(),
+        outcome_result: signal.outcome_result.clone(),
+        outcome_expiry_price: signal.outcome_expiry_price.map(money),
+        outcome_settled_at: signal.outcome_settled_at,
     }
 }
 
@@ -7770,6 +7788,9 @@ fn signal_api_response(signal: &SignalCore) -> SignalApiResponse {
         account_balance_delta_usdt: None,
         balance_available_after_reserve: money(Decimal::ZERO),
         model_version: signal.model_version.clone(),
+        outcome_result: signal.outcome_result.clone(),
+        outcome_expiry_price: signal.outcome_expiry_price.map(money),
+        outcome_settled_at: signal.outcome_settled_at,
     }
 }
 
@@ -7806,6 +7827,9 @@ fn signal_response_with_status(
         account_balance_delta_usdt: None,
         balance_available_after_reserve: money(balance_after),
         model_version: signal.model_version.clone(),
+        outcome_result: signal.outcome_result.clone(),
+        outcome_expiry_price: signal.outcome_expiry_price.map(money),
+        outcome_settled_at: signal.outcome_settled_at,
     }
 }
 
@@ -9487,10 +9511,9 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
         r#"
         with due as (
           select s.id, s.symbol, s.period_seconds, s.cycle_start, s.cycle_end,
-                 s.direction, s.entry_price, s.model_version
+                 s.direction, s.entry_price, s.model_version, s.created_at
           from signals s
           where s.cycle_end <= now()
-            and s.model_version = $2
             and not exists (
               select 1 from signal_outcomes o where o.signal_id = s.id
             )
@@ -9499,8 +9522,18 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
         ),
         priced as (
           select due.*,
+                 coalesce(nullif(due.entry_price, 0), entry.entry_price) as settled_entry_price,
                  expiry.entry_price as expiry_price
           from due
+          join lateral (
+            select o.entry_price
+            from prediction_observations o
+            where o.symbol = due.symbol
+              and o.period_seconds = due.period_seconds
+              and o.created_at >= due.created_at
+            order by o.created_at asc
+            limit 1
+          ) entry on true
           join lateral (
             select o.entry_price
             from prediction_observations o
@@ -9515,10 +9548,10 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
           (signal_id, symbol, period_seconds, cycle_start, cycle_end, direction,
            entry_price, expiry_price, result, source, model_version, settled_at, created_at)
         select id, symbol, period_seconds, cycle_start, cycle_end, direction,
-               entry_price, expiry_price,
+               settled_entry_price, expiry_price,
                case
-                 when direction = 'UP' and expiry_price > entry_price then 'win'
-                 when direction = 'DOWN' and expiry_price < entry_price then 'win'
+                 when direction = 'UP' and expiry_price > settled_entry_price then 'win'
+                 when direction = 'DOWN' and expiry_price < settled_entry_price then 'win'
                  else 'loss'
                end as result,
                'prediction_observation',
@@ -9530,7 +9563,6 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
         "#,
     )
     .bind(limit.max(1))
-    .bind(PREDICTION_MODEL_VERSION)
     .execute(pool)
     .await
     .map(|result| result.rows_affected())
@@ -9715,8 +9747,9 @@ async fn db_latest_signal(pool: &PgPool) -> Result<Option<SignalCore>, AppError>
     sqlx::query(
         r#"
         select id, symbol, period_seconds, cycle_start, cycle_end, direction, confidence,
-               predicted_return, entry_price, suggested_stake, model_version, created_at
-        from signals
+               predicted_return, entry_price, suggested_stake, model_version, created_at,
+               outcome_result, outcome_expiry_price, outcome_settled_at
+        from signals_with_outcome
         order by created_at desc
         limit 1
         "#,
@@ -9731,8 +9764,9 @@ async fn db_signal_history(pool: &PgPool, limit: i64) -> Result<Vec<SignalCore>,
     sqlx::query(
         r#"
         select id, symbol, period_seconds, cycle_start, cycle_end, direction, confidence,
-               predicted_return, entry_price, suggested_stake, model_version, created_at
-        from signals
+               predicted_return, entry_price, suggested_stake, model_version, created_at,
+               outcome_result, outcome_expiry_price, outcome_settled_at
+        from signals_with_outcome
         order by created_at desc
         limit $1
         "#,
@@ -9758,6 +9792,9 @@ fn signal_from_row(row: sqlx::postgres::PgRow) -> SignalCore {
         suggested_stake: row.get("suggested_stake"),
         model_version: row.get("model_version"),
         created_at: row.get("created_at"),
+        outcome_result: row.try_get("outcome_result").ok(),
+        outcome_expiry_price: row.try_get("outcome_expiry_price").ok(),
+        outcome_settled_at: row.try_get("outcome_settled_at").ok(),
     }
 }
 
