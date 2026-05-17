@@ -83,10 +83,15 @@ class ScreenRecognitionAccessibilityService : AccessibilityService() {
         val profile = BuiltInProfiles.byId(settings.targetAppProfile)
         val root = findAutomationRoot(profile) ?: run {
             stateStore.clearRecognitionState("\u9875\u9762\u95f8\u95e8\uff1a\u672a\u8bfb\u5230\u7a97\u53e3")
+            queuePageGateReport(RecognizedScreen.Unknown)
             return
         }
         val screen = recognition.recognize(root, null, profile)
         saveScreenState(screen, if (screen.safeToAct) "\u9875\u9762\u95f8\u95e8\u5df2\u5c31\u7eea" else "\u9875\u9762\u95f8\u95e8\u672a\u5c31\u7eea")
+        queuePageGateReport(screen)
+    }
+
+    private fun queuePageGateReport(screen: RecognizedScreen) {
         val payload = AutomationPageStateRequest(
             pageReady = screen.safeToAct,
             screenName = screen.screenName,

@@ -277,21 +277,16 @@ class AutomationForegroundService : Service() {
         }
         if (!signal.tradeAuthorized) {
             when (signal.authorizationStatus) {
-                "fee_reserve_insufficient" -> {
-                    stateStore.saveRuntimeDesired(false)
-                    AutomationRuntime.stop()
-                    stateStore.saveLastStatus("ws_signal_not_authorized_fee_reserve_insufficient")
-                }
+                "fee_reserve_insufficient" -> stateStore.saveLastStatus("ws_signal_not_authorized_fee_reserve_insufficient")
                 "mismatch",
                 "observed_balance_missing",
                 "exchange_balance_missing",
                 "exchange_balance_stale",
+                "page_state_missing",
+                "page_state_stale",
+                "page_not_ready",
                 "unknown",
-                -> {
-                    stateStore.saveRuntimeDesired(false)
-                    AutomationRuntime.stop()
-                    stateStore.saveLastStatus("ws_signal_not_authorized_account_gate")
-                }
+                -> stateStore.saveLastStatus("ws_signal_not_authorized_account_gate:${signal.authorizationStatus}")
                 else -> stateStore.saveLastStatus("ws_signal_not_authorized")
             }
             return

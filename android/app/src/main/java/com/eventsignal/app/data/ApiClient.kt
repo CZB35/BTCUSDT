@@ -111,11 +111,11 @@ class ApiClient(context: Context) {
     }
 
     fun getLatestSignal(): Result<SignalSnapshot> = runCatching {
-        val request = signedRequest("/v1/signals/latest").get().build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("latest signal failed: ${response.code}")
-            SignalJsonParser.parse(response.body?.string().orEmpty())
-        }
+        SignalJsonParser.parse(
+            executeSigned("/v1/signals/latest", "latest signal failed") {
+                get().build()
+            },
+        )
     }
 
     fun websocketRequest(): Result<Request> = runCatching {
@@ -141,19 +141,19 @@ class ApiClient(context: Context) {
     }
 
     fun getAutomationSettings(): Result<AutomationSettings> = runCatching {
-        val request = signedRequest("/v1/user-settings/automation").get().build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("automation settings failed: ${response.code}")
-            json.decodeFromString<AutomationSettings>(response.body?.string().orEmpty())
-        }
+        json.decodeFromString<AutomationSettings>(
+            executeSigned("/v1/user-settings/automation", "automation settings failed") {
+                get().build()
+            },
+        )
     }
 
     fun getExchangeStatus(): Result<ExchangeCredentialStatus> = runCatching {
-        val request = signedRequest("/v1/exchange/binance").get().build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("exchange status failed: ${response.code}")
-            json.decodeFromString<ExchangeCredentialStatus>(response.body?.string().orEmpty())
-        }
+        json.decodeFromString<ExchangeCredentialStatus>(
+            executeSigned("/v1/exchange/binance", "exchange status failed") {
+                get().build()
+            },
+        )
     }
 
     fun saveExchangeCredentials(apiKey: String, apiSecret: String): Result<ExchangeCredentialResponse> = runCatching {
@@ -163,43 +163,40 @@ class ApiClient(context: Context) {
                 apiSecret = apiSecret.trim(),
             ),
         ).toRequestBody(mediaType)
-        val request = signedRequest("/v1/exchange/binance").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("exchange bind failed: ${response.code}")
-            json.decodeFromString<ExchangeCredentialResponse>(response.body?.string().orEmpty())
-        }
+        json.decodeFromString<ExchangeCredentialResponse>(
+            executeSigned("/v1/exchange/binance", "exchange bind failed") {
+                post(body).build()
+            },
+        )
     }
 
     fun saveAutomationSettings(settings: AutomationSettings): Result<AutomationSettings> = runCatching {
         val body = json.encodeToString(settings).toRequestBody(mediaType)
-        val request = signedRequest("/v1/user-settings/automation").put(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("save automation settings failed: ${response.code}")
-            json.decodeFromString<AutomationSettings>(response.body?.string().orEmpty())
-        }
+        json.decodeFromString<AutomationSettings>(
+            executeSigned("/v1/user-settings/automation", "save automation settings failed") {
+                put(body).build()
+            },
+        )
     }
 
     fun submitAutomationPageState(state: AutomationPageStateRequest): Result<Unit> = runCatching {
         val body = json.encodeToString(state).toRequestBody(mediaType)
-        val request = signedRequest("/v1/automation/page-state").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("automation page state failed: ${response.code}")
+        executeSigned("/v1/automation/page-state", "automation page state failed") {
+            post(body).build()
         }
     }
 
     fun submitExecutionReport(report: ExecutionReportRequest): Result<Unit> = runCatching {
         val body = json.encodeToString(report).toRequestBody(mediaType)
-        val request = signedRequest("/v1/execution-reports").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("execution report failed: ${response.code}")
+        executeSigned("/v1/execution-reports", "execution report failed") {
+            post(body).build()
         }
     }
 
     fun submitEventContractOrder(order: EventContractOrderRequest): Result<Unit> = runCatching {
         val body = json.encodeToString(order).toRequestBody(mediaType)
-        val request = signedRequest("/v1/event-contract-orders").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("event contract order failed: ${response.code}")
+        executeSigned("/v1/event-contract-orders", "event contract order failed") {
+            post(body).build()
         }
     }
 
@@ -210,26 +207,24 @@ class ApiClient(context: Context) {
                 reason = reason,
             ),
         ).toRequestBody(mediaType)
-        val request = signedRequest("/v1/signal-reservations/release").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("release reservation failed: ${response.code}")
+        executeSigned("/v1/signal-reservations/release", "release reservation failed") {
+            post(body).build()
         }
     }
 
     fun ackSignalDelivery(ack: SignalDeliveryAckRequest): Result<Unit> = runCatching {
         val body = json.encodeToString(ack).toRequestBody(mediaType)
-        val request = signedRequest("/v1/signals/deliveries/ack").post(body).build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("signal delivery ack failed: ${response.code}")
+        executeSigned("/v1/signals/deliveries/ack", "signal delivery ack failed") {
+            post(body).build()
         }
     }
 
     fun getAppRuntimeSummary(): Result<AppRuntimeSummary> = runCatching {
-        val request = signedRequest("/v1/app/runtime-summary").get().build()
-        http.newCall(request).execute().use { response ->
-            if (!response.isSuccessful) error("runtime summary failed: ${response.code}")
-            json.decodeFromString<AppRuntimeSummary>(response.body?.string().orEmpty())
-        }
+        json.decodeFromString<AppRuntimeSummary>(
+            executeSigned("/v1/app/runtime-summary", "runtime summary failed") {
+                get().build()
+            },
+        )
     }
 
     private fun authedRequest(path: String): Request.Builder {
@@ -242,6 +237,9 @@ class ApiClient(context: Context) {
     }
 
     private fun signedRequest(path: String): Request.Builder {
+        if ((accessToken.isNullOrBlank() || appSessionKey.isNullOrBlank()) && !refreshToken.isNullOrBlank()) {
+            refreshSessionForRetry()
+        }
         val key = appSessionKey?.trim().orEmpty()
         if (key.isBlank()) error("app session key is required")
         val timestamp = System.currentTimeMillis().toString()
@@ -251,6 +249,38 @@ class ApiClient(context: Context) {
             .header("X-ES-Nonce", nonce)
             .header("X-ES-Signature", appSignature(key, timestamp, nonce))
     }
+
+    private fun executeSigned(
+        path: String,
+        errorPrefix: String,
+        create: Request.Builder.() -> Request,
+    ): String {
+        var retried = false
+        while (true) {
+            var shouldRetry = false
+            var output: String? = null
+            val request = signedRequest(path).create()
+            http.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                if (response.code == 401 && !retried && refreshSessionForRetry()) {
+                    shouldRetry = true
+                } else {
+                    if (!response.isSuccessful) {
+                        error(friendlyError(responseBody) ?: "$errorPrefix: HTTP ${response.code}")
+                    }
+                    output = responseBody
+                }
+            }
+            if (shouldRetry) {
+                retried = true
+                continue
+            }
+            return output.orEmpty()
+        }
+    }
+
+    private fun refreshSessionForRetry(): Boolean =
+        refreshSession().isSuccess
 
     private fun auth(path: String, walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         runCatching {

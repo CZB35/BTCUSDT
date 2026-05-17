@@ -9,7 +9,6 @@ import com.eventsignal.app.data.EventSignalRepository
 import com.eventsignal.app.domain.AutomationSettings
 import com.eventsignal.app.domain.EventContractOrderRequest
 import com.eventsignal.app.domain.SignalSnapshot
-import com.eventsignal.app.service.AutomationRuntime
 import java.time.Instant
 
 class ActionRunner(
@@ -154,21 +153,16 @@ class ActionRunner(
 
     private fun pauseForUnauthorizedSignal(signal: SignalSnapshot) {
         when (signal.authorizationStatus) {
-            "fee_reserve_insufficient" -> {
-                stateStore.saveRuntimeDesired(false)
-                AutomationRuntime.stop()
-                stateStore.saveLastStatus("signal_not_authorized_fee_reserve_insufficient")
-            }
+            "fee_reserve_insufficient" -> stateStore.saveLastStatus("signal_not_authorized_fee_reserve_insufficient")
             "mismatch",
             "observed_balance_missing",
             "exchange_balance_missing",
             "exchange_balance_stale",
+            "page_state_missing",
+            "page_state_stale",
+            "page_not_ready",
             "unknown",
-            -> {
-                stateStore.saveRuntimeDesired(false)
-                AutomationRuntime.stop()
-                stateStore.saveLastStatus("signal_not_authorized_account_gate")
-            }
+            -> stateStore.saveLastStatus("signal_not_authorized_account_gate:${signal.authorizationStatus}")
             else -> stateStore.saveLastStatus("signal_not_authorized")
         }
     }
