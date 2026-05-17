@@ -100,6 +100,8 @@ const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.65;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
+const PREDICTION_MIN_RAW_CONFIDENCE: f64 = 0.60;
+const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 = 0.60;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -5460,40 +5462,28 @@ fn prediction_candidate(
             }
         }
         "trend_up" => {
-            let pullback_reclaim = model_score > 0.6
-                && ret_5 > 0.00055
-                && ret_1 > -0.00020
-                && live_ret_1 > 0.00003
-                && upper_extreme < 0.75;
-            if pullback_reclaim {
-                Some(PredictionCandidate {
-                    direction: "UP".to_string(),
-                    mode: "trend_pullback".to_string(),
-                    rule: "up_pullback_reclaim".to_string(),
-                    raw_confidence,
-                })
-            } else {
-                None
-            }
+            let _ = (model_score, ret_5, ret_1, live_ret_1, upper_extreme);
+            None
         }
         "trend_down" => {
-            let bounce_reject = model_score < -0.6
-                && ret_5 < -0.00055
-                && ret_1 < 0.00020
-                && live_ret_1 < -0.00003
-                && lower_extreme < 0.75;
-            if bounce_reject {
-                Some(PredictionCandidate {
-                    direction: "DOWN".to_string(),
-                    mode: "trend_pullback".to_string(),
-                    rule: "down_bounce_reject".to_string(),
-                    raw_confidence,
-                })
-            } else {
-                None
-            }
+            let _ = (model_score, ret_5, ret_1, live_ret_1, lower_extreme);
+            None
         }
         _ => None,
+    }
+}
+
+fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
+    match (
+        candidate.direction.as_str(),
+        candidate.mode.as_str(),
+        candidate.rule.as_str(),
+    ) {
+        ("DOWN", "mean_reversion", "overheated_pullback") => 0.60,
+        ("UP", "mean_reversion", "oversold_rebound") => 0.62,
+        ("DOWN", "impulse_fade", "up_impulse_fading") => 0.62,
+        ("UP", "impulse_fade", "down_impulse_fading") => 0.62,
+        _ => PREDICTION_MIN_RAW_CONFIDENCE,
     }
 }
 
@@ -5513,6 +5503,20 @@ async fn apply_prediction_calibration(
         merge_prediction_calibration(decision, &calibration, None);
         return Ok(());
     };
+    let min_raw_confidence = prediction_candidate_min_confidence(&candidate);
+    if candidate.raw_confidence < min_raw_confidence {
+        let mut calibration = PredictionCalibration::disabled(config);
+        calibration.reason = format!(
+            "hold candidate raw confidence {:.4} < {:.4} mode {} rule {} direction {}",
+            candidate.raw_confidence,
+            min_raw_confidence,
+            candidate.mode,
+            candidate.rule,
+            candidate.direction
+        );
+        merge_prediction_calibration(decision, &calibration, Some(&candidate));
+        return Ok(());
+    }
     let calibration = db_prediction_calibration(pool, config, &candidate).await?;
     merge_prediction_calibration(decision, &calibration, Some(&candidate));
     Ok(())
@@ -9353,7 +9357,7 @@ async fn db_prediction_calibration(
             and o.feature_snapshot->'decision'->>'candidate_mode' = $3
             and o.feature_snapshot->'decision'->>'candidate_rule' = $4
             and o.feature_snapshot->'decision'->>'candidate_direction' = $5
-            and coalesce((o.feature_snapshot->'decision'->>'pre_filter_passed')::boolean, false)
+            and (o.feature_snapshot->'scores'->>'raw_confidence')::float8 >= $7
           order by floor(extract(epoch from o.created_at) / $6::double precision), o.created_at desc
         ),
         scored as (
@@ -9376,6 +9380,10 @@ async fn db_prediction_calibration(
     .bind(&candidate.rule)
     .bind(&candidate.direction)
     .bind(config.calibration_sample_seconds.max(1))
+    .bind(
+        prediction_candidate_min_confidence(candidate)
+            .max(PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR),
+    )
     .fetch_one(pool)
     .await
     .map_err(AppError::from_sqlx)?;
