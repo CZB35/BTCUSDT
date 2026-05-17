@@ -94,17 +94,14 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v4";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v5";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
 const PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY: f64 = 0.62;
-const PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY: f64 = 0.66;
 const PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE: f64 = 0.70;
-const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY: f64 = 0.62;
-const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE: f64 = 0.70;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
 const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 =
     PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
@@ -1152,6 +1149,41 @@ impl Default for PredictionSettings {
     }
 }
 
+fn normalize_prediction_settings(mut settings: PredictionSettings) -> PredictionSettings {
+    settings.up_threshold = decimal_from_f64(DEFAULT_PREDICTION_UP_THRESHOLD, 10);
+    settings.down_threshold = decimal_from_f64(DEFAULT_PREDICTION_DOWN_THRESHOLD, 10);
+    if settings.min_confidence < decimal_from_f64(DEFAULT_PREDICTION_MIN_CONFIDENCE, 6) {
+        settings.min_confidence = decimal_from_f64(DEFAULT_PREDICTION_MIN_CONFIDENCE, 6);
+    }
+    settings.technical_weight = decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6);
+    settings.probability_weight = decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6);
+    if settings.volatility_floor < decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8) {
+        settings.volatility_floor = decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8);
+    }
+    if settings.calibration_lookback_minutes
+        < DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32
+    {
+        settings.calibration_lookback_minutes =
+            DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32;
+    }
+    if settings.calibration_min_samples < DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES {
+        settings.calibration_min_samples = DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES;
+    }
+    if settings.calibration_min_win_rate
+        < decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE, 6)
+    {
+        settings.calibration_min_win_rate =
+            decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE, 6);
+    }
+    if settings.calibration_min_ev_usdt
+        < decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT, 4)
+    {
+        settings.calibration_min_ev_usdt =
+            decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT, 4);
+    }
+    settings
+}
+
 #[derive(Clone, Serialize)]
 struct PredictionObservationRecord {
     id: Uuid,
@@ -1707,7 +1739,8 @@ impl PredictionConfig {
             .min_confidence
             .to_string()
             .parse::<f64>()
-            .unwrap_or(self.min_confidence);
+            .unwrap_or(self.min_confidence)
+            .max(PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY);
         next.technical_weight = settings
             .technical_weight
             .to_string()
@@ -1725,12 +1758,15 @@ impl PredictionConfig {
             .unwrap_or(self.volatility_floor);
         next.calibration_lookback_minutes =
             i64::from(settings.calibration_lookback_minutes).max(10);
-        next.calibration_min_samples = settings.calibration_min_samples.max(1);
+        next.calibration_min_samples = settings
+            .calibration_min_samples
+            .max(DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES);
         next.calibration_min_win_rate = settings
             .calibration_min_win_rate
             .to_string()
             .parse::<f64>()
-            .unwrap_or(self.calibration_min_win_rate);
+            .unwrap_or(self.calibration_min_win_rate)
+            .max(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE);
         next.calibration_min_ev_usdt = settings
             .calibration_min_ev_usdt
             .to_string()
@@ -5187,10 +5223,9 @@ fn build_prediction_decision(
         .as_ref()
         .filter(|candidate| candidate.direction == "UP" && candidate.mode == "structure_edge")
         .map(|_| {
-            config.min_confidence.clamp(
-                PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
-                PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY,
-            )
+            config
+                .min_confidence
+                .max(PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY)
         })
         .unwrap_or(config.min_confidence);
     let mut direction = candidate
@@ -5202,10 +5237,6 @@ fn build_prediction_decision(
         .map(|candidate| candidate.raw_confidence)
         .unwrap_or(base_confidence);
     let mut reason = match candidate.as_ref() {
-        Some(candidate) if candidate.direction == "HOLD" => format!(
-            "hold shadow {} mode {} rule {} raw_confidence {:.4} structure {:.4}",
-            candidate.direction, candidate.mode, candidate.rule, candidate.raw_confidence, candidate.structure_score
-        ),
         Some(candidate) => format!(
             "candidate {} mode {} rule {} score {:.4} raw_confidence {:.4}",
             candidate.direction, candidate.mode, candidate.rule, model_score, candidate.raw_confidence
@@ -5298,33 +5329,8 @@ fn build_prediction_decision(
                     "trend_live_ret_1": 0.00008
                 },
                 "candidate": {
-                    "top_upper_extreme": 0.55,
-                    "top_cycle_ret": 0.00070,
-                    "top_ret_3": 0.00045,
-                    "top_ret_5": 0.00070,
-                    "top_up_move_intensity": 0.15,
-                    "bottom_lower_extreme": 0.35,
-                    "bottom_cycle_ret": -0.00025,
-                    "bottom_ret_3": -0.00035,
-                    "bottom_ret_5": -0.00070,
-                    "bottom_down_move_intensity": 0.05,
                     "structure_edge_up_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
-                    "structure_edge_up_max_configured_probability": PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY,
-                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE,
-                    "shadow_down_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
-                    "shadow_down_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE,
-                    "mean_reversion_live_ret_1_limit": 0.00035,
-                    "mean_reversion_live_ret_3_limit": 0.00055,
-                    "impulse_fade_live_ret_1": 0.00005,
-                    "impulse_fade_ret_1": 0.00020,
-                    "impulse_fade_live_ret_3": 0.00025,
-                    "trend_pullback_score": 0.6,
-                    "trend_pullback_ret_5": 0.00055,
-                    "trend_pullback_ret_1": 0.00020,
-                    "trend_pullback_live_ret_1": 0.00003,
-                    "trend_pullback_extreme_max": 0.75,
-                    "min_reversal_structure_score": 0.55,
-                    "min_impulse_fade_structure_score": 0.62
+                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE
                 },
                 "payout": {
                     "stake_usdt": MIN_EVENT_STAKE,
@@ -5480,9 +5486,9 @@ fn prediction_candidate(
     _ret_5: f64,
     _cycle_ret: f64,
     up_probability: f64,
-    down_probability: f64,
+    _down_probability: f64,
     up_structure: f64,
-    down_structure: f64,
+    _down_structure: f64,
 ) -> Option<PredictionCandidate> {
     if matches!(market_regime, "chaos" | "quiet") {
         return None;
@@ -5497,18 +5503,6 @@ fn prediction_candidate(
             rule: format!("{market_regime}_up"),
             raw_confidence: up_probability,
             structure_score: up_structure,
-        });
-    }
-
-    if down_probability >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY
-        && down_structure >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE
-    {
-        return Some(PredictionCandidate {
-            direction: "HOLD".to_string(),
-            mode: "shadow_down".to_string(),
-            rule: format!("{market_regime}_down_shadow"),
-            raw_confidence: down_probability,
-            structure_score: down_structure,
         });
     }
 
@@ -6462,6 +6456,7 @@ async fn admin_save_prediction_settings(
     Json(req): Json<PredictionSettings>,
 ) -> Result<Json<PredictionSettings>, AppError> {
     ensure_admin(&state, &headers).await?;
+    let req = normalize_prediction_settings(req);
     validate_prediction_settings(&req)?;
     if let Some(pool) = state.db.as_ref() {
         db_save_prediction_settings(pool, &req).await?;
@@ -7267,10 +7262,10 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
             "down_threshold must be negative",
         ));
     }
-    if settings.min_confidence < Decimal::ZERO || settings.min_confidence > dec!(0.99) {
+    if settings.min_confidence < dec!(0.62) || settings.min_confidence > dec!(0.99) {
         return Err(AppError::bad_request(
             "PREDICTION_SETTING_OUT_OF_RANGE",
-            "min_confidence must be between 0 and 0.99",
+            "min_confidence must be between 0.62 and 0.99",
         ));
     }
     if settings.technical_weight < Decimal::ZERO || settings.technical_weight > dec!(1.00) {
@@ -7303,26 +7298,26 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
             "calibration_lookback_minutes must be between 10 and 1440",
         ));
     }
-    if settings.calibration_min_samples < 1 || settings.calibration_min_samples > 300 {
+    if settings.calibration_min_samples < 30 || settings.calibration_min_samples > 300 {
         return Err(AppError::bad_request(
             "PREDICTION_SETTING_OUT_OF_RANGE",
-            "calibration_min_samples must be between 1 and 300",
+            "calibration_min_samples must be between 30 and 300",
         ));
     }
-    if settings.calibration_min_win_rate < dec!(0.50)
+    if settings.calibration_min_win_rate < dec!(0.60)
         || settings.calibration_min_win_rate > dec!(0.95)
     {
         return Err(AppError::bad_request(
             "PREDICTION_SETTING_OUT_OF_RANGE",
-            "calibration_min_win_rate must be between 0.50 and 0.95",
+            "calibration_min_win_rate must be between 0.60 and 0.95",
         ));
     }
-    if settings.calibration_min_ev_usdt < dec!(-1.00)
+    if settings.calibration_min_ev_usdt < dec!(0.01)
         || settings.calibration_min_ev_usdt > dec!(5.00)
     {
         return Err(AppError::bad_request(
             "PREDICTION_SETTING_OUT_OF_RANGE",
-            "calibration_min_ev_usdt must be between -1 and 5",
+            "calibration_min_ev_usdt must be between 0.01 and 5",
         ));
     }
     Ok(())
@@ -8768,36 +8763,38 @@ async fn db_load_prediction_settings(pool: &PgPool) -> Result<PredictionSettings
     .fetch_optional(pool)
     .await
     .map(|row| {
-        row.map(|row| PredictionSettings {
-            enabled: row.get("enabled"),
-            interval_seconds: row.get("interval_seconds"),
-            up_threshold: row.get("up_threshold"),
-            down_threshold: row.get("down_threshold"),
-            min_confidence: row.get("min_confidence"),
-            technical_weight: row
-                .try_get("technical_weight")
-                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6)),
-            probability_weight: row
-                .try_get("probability_weight")
-                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6)),
-            volatility_floor: row
-                .try_get("volatility_floor")
-                .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8)),
-            calibration_lookback_minutes: row
-                .try_get("calibration_lookback_minutes")
-                .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32),
-            calibration_min_samples: row
-                .try_get("calibration_min_samples")
-                .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES),
-            calibration_min_win_rate: row.try_get("calibration_min_win_rate").unwrap_or_else(
-                |_| decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE, 6),
-            ),
-            calibration_min_ev_usdt: row.try_get("calibration_min_ev_usdt").unwrap_or_else(|_| {
-                decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT, 4)
-            }),
-            updated_at: row.get("updated_at"),
-        })
-        .unwrap_or_default()
+        normalize_prediction_settings(
+            row.map(|row| PredictionSettings {
+                enabled: row.get("enabled"),
+                interval_seconds: row.get("interval_seconds"),
+                up_threshold: row.get("up_threshold"),
+                down_threshold: row.get("down_threshold"),
+                min_confidence: row.get("min_confidence"),
+                technical_weight: row
+                    .try_get("technical_weight")
+                    .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_TECHNICAL_WEIGHT, 6)),
+                probability_weight: row
+                    .try_get("probability_weight")
+                    .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_PROBABILITY_WEIGHT, 6)),
+                volatility_floor: row
+                    .try_get("volatility_floor")
+                    .unwrap_or_else(|_| decimal_from_f64(DEFAULT_PREDICTION_VOLATILITY_FLOOR, 8)),
+                calibration_lookback_minutes: row
+                    .try_get("calibration_lookback_minutes")
+                    .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES as i32),
+                calibration_min_samples: row
+                    .try_get("calibration_min_samples")
+                    .unwrap_or(DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES),
+                calibration_min_win_rate: row.try_get("calibration_min_win_rate").unwrap_or_else(
+                    |_| decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE, 6),
+                ),
+                calibration_min_ev_usdt: row.try_get("calibration_min_ev_usdt").unwrap_or_else(
+                    |_| decimal_from_f64(DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT, 4),
+                ),
+                updated_at: row.get("updated_at"),
+            })
+            .unwrap_or_default(),
+        )
     })
     .map_err(AppError::from_sqlx)
 }
@@ -9493,6 +9490,7 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
                  s.direction, s.entry_price, s.model_version
           from signals s
           where s.cycle_end <= now()
+            and s.model_version = $2
             and not exists (
               select 1 from signal_outcomes o where o.signal_id = s.id
             )
@@ -9532,6 +9530,7 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
         "#,
     )
     .bind(limit.max(1))
+    .bind(PREDICTION_MODEL_VERSION)
     .execute(pool)
     .await
     .map(|result| result.rows_affected())
@@ -9609,14 +9608,9 @@ async fn db_prediction_calibration(
         0.0
     };
     let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
-    let effective_min_win_rate =
-        if candidate.direction == "UP" && candidate.mode == "structure_edge" {
-            config
-                .calibration_min_win_rate
-                .min(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE)
-        } else {
-            config.calibration_min_win_rate
-        };
+    let effective_min_win_rate = config
+        .calibration_min_win_rate
+        .max(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE);
     let allowed = sample_count >= i64::from(config.calibration_min_samples)
         && win_rate >= effective_min_win_rate
         && ev_usdt >= config.calibration_min_ev_usdt;
@@ -9682,11 +9676,13 @@ async fn db_prediction_observations(
         select id, source, symbol, period_seconds, model_version, direction, confidence,
                predicted_return, entry_price, score, feature_snapshot, reason, created_at
         from prediction_observations
+        where model_version = $2
         order by created_at desc
         limit $1
         "#,
     )
     .bind(limit)
+    .bind(PREDICTION_MODEL_VERSION)
     .fetch_all(pool)
     .await
     .map(|rows| {
@@ -12191,28 +12187,15 @@ async fn db_build_stats(
           count(*) filter (where upper(result) = 'WIN') as wins,
           count(*) filter (where upper(result) = 'LOSS') as losses
         from signal_outcomes
+        where model_version = $1
         "#,
     )
+    .bind(PREDICTION_MODEL_VERSION)
     .fetch_one(pool)
     .await
     .map_err(AppError::from_sqlx)?;
-    let mut wins = outcome_row.get::<i64, _>("wins") as usize;
-    let mut losses = outcome_row.get::<i64, _>("losses") as usize;
-    if wins + losses == 0 {
-        let report_row = sqlx::query(
-            r#"
-            select
-              count(*) filter (where upper(result) = 'WIN') as wins,
-              count(*) filter (where upper(result) = 'LOSS') as losses
-            from execution_reports
-            "#,
-        )
-        .fetch_one(pool)
-        .await
-        .map_err(AppError::from_sqlx)?;
-        wins = report_row.get::<i64, _>("wins") as usize;
-        losses = report_row.get::<i64, _>("losses") as usize;
-    }
+    let wins = outcome_row.get::<i64, _>("wins") as usize;
+    let losses = outcome_row.get::<i64, _>("losses") as usize;
     let settled = wins + losses;
     let hit_rate = if settled == 0 {
         "0".to_string()

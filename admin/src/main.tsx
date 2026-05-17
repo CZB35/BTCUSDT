@@ -339,15 +339,15 @@ function App() {
   const [predictionSettings, setPredictionSettings] = useState<PredictionSettings>({
     enabled: true,
     interval_seconds: 5,
-    up_threshold: "2.6",
-    down_threshold: "-2.6",
+    up_threshold: "8",
+    down_threshold: "-8",
     min_confidence: "0.62",
     technical_weight: "0.35",
     probability_weight: "0.65",
     volatility_floor: "0.00016",
     calibration_lookback_minutes: 180,
     calibration_min_samples: 30,
-    calibration_min_win_rate: "0.65",
+    calibration_min_win_rate: "0.60",
     calibration_min_ev_usdt: "0.01"
   });
   const [predictionObservations, setPredictionObservations] = useState<PredictionObservation[]>([]);
@@ -1171,24 +1171,8 @@ function PredictionPage({
           />
         </label>
         <label>
-          看涨阈值
-          <input value={draft.up_threshold} onChange={(event) => updateDraft({ up_threshold: event.target.value })} />
-        </label>
-        <label>
-          看跌阈值
-          <input value={draft.down_threshold} onChange={(event) => updateDraft({ down_threshold: event.target.value })} />
-        </label>
-        <label>
-          最低置信度
+          看涨概率门槛
           <input value={draft.min_confidence} onChange={(event) => updateDraft({ min_confidence: event.target.value })} />
-        </label>
-        <label>
-          技术分权重
-          <input value={draft.technical_weight} onChange={(event) => updateDraft({ technical_weight: event.target.value })} />
-        </label>
-        <label>
-          概率分权重
-          <input value={draft.probability_weight} onChange={(event) => updateDraft({ probability_weight: event.target.value })} />
         </label>
         <label>
           波动率下限
