@@ -117,6 +117,7 @@ type SignalRecord = {
   fee_reserve_usdt: string;
   authorization_status: string;
   trade_authorized?: boolean;
+  created_at: string;
   cycle_end: string;
   model_version?: string;
   outcome_result?: string | null;
@@ -979,10 +980,11 @@ function SignalsPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "交易对", "方向", "入场价", "到期价", "结果", "金额", "置信度", "状态"]}
+          columns={["下发时间", "周期结束", "交易对", "方向", "入场价", "到期价", "结果", "金额", "置信度", "状态"]}
           rows={signals.map((signal) => ({
             id: signal.id,
             cells: [
+              shortTime(signal.created_at),
               shortTime(signal.cycle_end),
               signal.symbol,
               <ToneText tone={directionTone(signal.direction)}>{labelDirection(signal.direction)}</ToneText>,
@@ -995,6 +997,7 @@ function SignalsPage({
             ],
             details: {
               信号ID: signal.signal_id || signal.id,
+              下发时间: shortTime(signal.created_at),
               交易对: signal.symbol,
               方向: labelDirection(signal.direction),
               入场价: signal.entry_price || "-",
