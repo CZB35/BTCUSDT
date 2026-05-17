@@ -1503,36 +1503,43 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
           </div>
         </div>
         <DataTable
-          columns={["用户", "页面", "识别", "账号", "页面余额", "差值", "更新时间"]}
-          rows={pageStates.map((state) => ({
-            id: `${state.user_id}-${state.updated_at}`,
-            cells: [
-              shortId(state.user_id, 8),
-              state.screen_name,
-              <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
-              <StatusPill active={state.account_match_status === "matched"}>
-                {accountMatchText(state.account_match_status)}
-              </StatusPill>,
-              state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
-              state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
-              shortTime(state.updated_at)
-            ],
-            details: {
-              用户ID: state.user_id,
-              页面: state.screen_name,
-              识别通过: yesNo(state.page_ready),
-              账号一致性: accountMatchText(state.account_match_status),
-              页面余额: state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
-              余额差值: state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
-              置信度: percent(state.confidence),
-              金额框: yesNo(state.amount_field_found),
-              上涨按钮: yesNo(state.up_button_found),
-              下跌按钮: yesNo(state.down_button_found),
-              包名: state.package_name,
-              观察时间: shortTime(state.observed_at),
-              更新时间: shortTime(state.updated_at)
-            }
-          }))}
+          columns={["用户", "页面", "实时", "识别", "账号", "页面余额", "上报延迟", "更新时间"]}
+          rows={pageStates.map((state) => {
+            const liveReady = pageStateLiveReady(state);
+            const fresh = pageStateFresh(state);
+            return {
+              id: `${state.user_id}-${state.updated_at}`,
+              cells: [
+                shortId(state.user_id, 8),
+                state.screen_name,
+                <StatusPill active={liveReady}>{liveReady ? "可执行" : fresh ? "不可执行" : "已过期"}</StatusPill>,
+                <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
+                <StatusPill active={state.account_match_status === "matched"}>
+                  {accountMatchText(state.account_match_status)}
+                </StatusPill>,
+                state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
+                ageLabel(state.updated_at),
+                shortTime(state.updated_at)
+              ],
+              details: {
+                用户ID: state.user_id,
+                页面: state.screen_name,
+                实时可执行: yesNo(liveReady),
+                状态时效: fresh ? "有效" : `已过期，${ageLabel(state.updated_at)}`,
+                识别通过: yesNo(state.page_ready),
+                账号一致性: accountMatchText(state.account_match_status),
+                页面余额: state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
+                余额差值: state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
+                置信度: percent(state.confidence),
+                金额框: yesNo(state.amount_field_found),
+                上涨按钮: yesNo(state.up_button_found),
+                下跌按钮: yesNo(state.down_button_found),
+                包名: state.package_name,
+                观察时间: shortTime(state.observed_at),
+                更新时间: shortTime(state.updated_at)
+              }
+            };
+          })}
         />
       </section>
     </>
@@ -2052,6 +2059,41 @@ function resultLabel(result?: string) {
 function shortTime(value?: string | null) {
   if (!value) return "-";
   return new Date(value).toLocaleString("zh-CN", { hour12: false });
+}
+
+function secondsSince(value?: string | null) {
+  if (!value) return Number.POSITIVE_INFINITY;
+  const ms = Date.now() - new Date(value).getTime();
+  if (!Number.isFinite(ms)) return Number.POSITIVE_INFINITY;
+  return Math.max(0, Math.floor(ms / 1000));
+}
+
+function ageLabel(value?: string | null) {
+  const seconds = secondsSince(value);
+  if (!Number.isFinite(seconds)) return "-";
+  if (seconds < 60) return `${seconds}秒前`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${minutes}分钟前`;
+  const hours = Math.floor(minutes / 60);
+  const restMinutes = minutes % 60;
+  if (hours < 24) return `${hours}小时${restMinutes}分钟前`;
+  const days = Math.floor(hours / 24);
+  return `${days}天前`;
+}
+
+function pageStateFresh(state: PageStateRecord) {
+  return secondsSince(state.updated_at) <= 10;
+}
+
+function pageStateLiveReady(state: PageStateRecord) {
+  return (
+    pageStateFresh(state) &&
+    state.page_ready &&
+    state.screen_name === "event_contract" &&
+    state.amount_field_found &&
+    state.up_button_found &&
+    state.down_button_found
+  );
 }
 
 function shortId(value?: string | null, size = 10) {
