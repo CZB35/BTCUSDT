@@ -150,8 +150,11 @@ private fun MainScreen(repository: EventSignalRepository) {
         signal = nextSignal
         automationSettings = nextSettings
         exchangeStatus = nextExchangeStatus
-        if (binanceApiKey.isBlank()) {
+        if (!nextExchangeStatus.apiKey.isNullOrBlank()) {
             binanceApiKey = nextExchangeStatus.apiKey.orEmpty()
+        }
+        if (nextExchangeStatus.connected) {
+            binanceApiSecret = ""
         }
         debugState = stateStore.loadDebugState()
         connectionState = stateStore.loadConnectionState()
@@ -325,6 +328,9 @@ private fun MainScreen(repository: EventSignalRepository) {
                                         lastVerifiedAt = it.lastVerifiedAt,
                                         lastError = null,
                                     )
+                                    if (it.connected) {
+                                        binanceApiSecret = ""
+                                    }
                                     status = if (exchangeReady(exchangeStatus)) "交易账号已验证" else "交易账号验证失败"
                                 }.onFailure {
                                     status = "绑定失败：${it.message ?: it.javaClass.simpleName}"
@@ -484,7 +490,8 @@ private fun ExchangeCard(
     onApiSecretChange: (String) -> Unit,
     onBind: () -> Unit,
 ) {
-    val secretReady = apiSecret.isNotBlank() || status.connected
+    val hasSavedSecret = status.connected && !status.apiKey.isNullOrBlank()
+    val secretReady = apiSecret.isNotBlank() || hasSavedSecret
     AppCard {
         SectionHeader(
             title = "币安只读 API",
@@ -524,19 +531,23 @@ private fun ExchangeCard(
         OutlinedTextField(
             value = apiSecret,
             onValueChange = onApiSecretChange,
-            label = { Text(if (status.connected) "API Secret（已保存可留空）" else "API Secret") },
+            label = { Text(if (hasSavedSecret) "API Secret（账号已保存，留空使用原密钥）" else "API Secret") },
             singleLine = true,
             visualTransformation = PasswordVisualTransformation(),
             modifier = Modifier.fillMaxWidth(),
         )
         PrimaryButton(
-            text = if (status.connected && apiSecret.isBlank()) "重新验证" else "绑定并验证",
+            text = if (hasSavedSecret && apiSecret.isBlank()) "使用已保存密钥验证" else "绑定并验证",
             modifier = Modifier.fillMaxWidth(),
             enabled = apiKey.isNotBlank() && secretReady,
             onClick = onBind,
         )
         Text(
-            "账号校验通过后才会自动执行信号；已保存的密钥会加密保存在后端和本机。",
+            if (hasSavedSecret) {
+                "API Secret 已加密保存在账号库。留空会使用已保存密钥；需要更换时输入新的 Secret 后重新绑定。"
+            } else {
+                "账号校验通过后才会自动执行信号；密钥会加密保存在账号库，之后不用重复输入。"
+            },
             style = MaterialTheme.typography.bodySmall,
             color = MutedText,
         )
@@ -794,8 +805,9 @@ private fun runtimeStatusLabel(status: String): String = when {
     status.startsWith("ws_signal_execute") -> "收到可执行信号"
     status.startsWith("ws_signal_duplicate_ignored") -> "重复信号已忽略"
     status.startsWith("ws_signal_ignored") -> "信号不可执行"
-    status == "ws_signal_not_authorized_fee_reserve_insufficient" -> "预扣余额不足，已暂停"
-    status == "ws_signal_not_authorized_account_gate" -> "账号校验失败，已暂停"
+    status == "ws_signal_not_authorized_fee_reserve_insufficient" -> "预扣余额不足，跳过本次"
+    status == "ws_signal_not_authorized_account_gate" -> "账号校验失败，跳过本次"
+    status.startsWith("ws_signal_not_authorized_account_gate") -> "账号校验失败，跳过本次"
     status == "ws_signal_not_authorized" -> "信号未授权"
     status == "trading_account_not_verified" -> "交易账号未验证"
     status.startsWith("confirmed") -> "已确认下单"
