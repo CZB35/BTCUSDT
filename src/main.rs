@@ -89,19 +89,25 @@ const DEFAULT_PREDICTION_CANDLE_LIMIT: usize = 720;
 const DEFAULT_PREDICTION_STALE_SECONDS: i64 = 5;
 const DEFAULT_PREDICTION_UP_THRESHOLD: f64 = 8.00;
 const DEFAULT_PREDICTION_DOWN_THRESHOLD: f64 = -8.00;
-const DEFAULT_PREDICTION_MIN_CONFIDENCE: f64 = 0.72;
+const DEFAULT_PREDICTION_MIN_CONFIDENCE: f64 = 0.62;
 const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v3";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v4";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
-const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.65;
+const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
-const PREDICTION_MIN_RAW_CONFIDENCE: f64 = 0.60;
-const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 = 0.60;
+const PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY: f64 = 0.62;
+const PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY: f64 = 0.66;
+const PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE: f64 = 0.70;
+const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY: f64 = 0.62;
+const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE: f64 = 0.70;
+const PREDICTION_MIN_RAW_CONFIDENCE: f64 = PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
+const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 =
+    PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -5173,6 +5179,16 @@ fn build_prediction_decision(
         up_structure,
         down_structure,
     );
+    let effective_min_confidence = candidate
+        .as_ref()
+        .filter(|candidate| candidate.direction == "UP" && candidate.mode == "structure_edge")
+        .map(|_| {
+            config.min_confidence.clamp(
+                PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
+                PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY,
+            )
+        })
+        .unwrap_or(config.min_confidence);
     let mut direction = candidate
         .as_ref()
         .map(|candidate| candidate.direction.clone())
@@ -5182,6 +5198,10 @@ fn build_prediction_decision(
         .map(|candidate| candidate.raw_confidence)
         .unwrap_or(base_confidence);
     let mut reason = match candidate.as_ref() {
+        Some(candidate) if candidate.direction == "HOLD" => format!(
+            "hold shadow {} mode {} rule {} raw_confidence {:.4} structure {:.4}",
+            candidate.direction, candidate.mode, candidate.rule, candidate.raw_confidence, candidate.structure_score
+        ),
         Some(candidate) => format!(
             "candidate {} mode {} rule {} score {:.4} raw_confidence {:.4}",
             candidate.direction, candidate.mode, candidate.rule, model_score, candidate.raw_confidence
@@ -5193,9 +5213,9 @@ fn build_prediction_decision(
     if age_seconds > config.stale_seconds {
         direction = "HOLD".to_string();
         reason = format!("hold stale data age {age_seconds}s");
-    } else if base_confidence < config.min_confidence {
+    } else if confidence < effective_min_confidence {
         direction = "HOLD".to_string();
-        reason = format!("hold low raw confidence {base_confidence:.4}");
+        reason = format!("hold low raw confidence {confidence:.4} < {effective_min_confidence:.4}");
     } else if volatility < 0.00012 {
         direction = "HOLD".to_string();
         reason = format!("hold low volatility {volatility:.6}");
@@ -5207,7 +5227,7 @@ fn build_prediction_decision(
     }
     let pre_filter_passed = matches!(direction.as_str(), "UP" | "DOWN");
     let pre_calibration_direction = direction.clone();
-    let cycle_start = millis_to_utc(snapshot.latest_price_time_ms)?;
+    let cycle_start = millis_to_utc(cycle.start_ms)?;
     Ok(PredictionDecision {
         direction,
         confidence,
@@ -5246,6 +5266,7 @@ fn build_prediction_decision(
                 "up_threshold": config.up_threshold,
                 "down_threshold": config.down_threshold,
                 "min_confidence": config.min_confidence,
+                "effective_min_confidence": effective_min_confidence,
                 "technical_weight": config.technical_weight,
                 "probability_weight": config.probability_weight,
                 "volatility_floor": config.volatility_floor,
@@ -5283,7 +5304,11 @@ fn build_prediction_decision(
                     "bottom_ret_3": -0.00035,
                     "bottom_ret_5": -0.00070,
                     "bottom_down_move_intensity": 0.05,
-                    "candidate_probability_min": 0.60,
+                    "structure_edge_up_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
+                    "structure_edge_up_max_configured_probability": PREDICTION_STRUCTURE_EDGE_MAX_CONFIGURED_UP_PROBABILITY,
+                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE,
+                    "shadow_down_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
+                    "shadow_down_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE,
                     "mean_reversion_live_ret_1_limit": 0.00035,
                     "mean_reversion_live_ret_3_limit": 0.00055,
                     "impulse_fade_live_ret_1": 0.00005,
@@ -5438,18 +5463,18 @@ fn classify_prediction_regime(
 
 #[allow(clippy::too_many_arguments)]
 fn prediction_candidate(
-    model_score: f64,
+    _model_score: f64,
     market_regime: &str,
-    upper_extreme: f64,
-    lower_extreme: f64,
-    up_move_intensity: f64,
-    down_move_intensity: f64,
-    live_ret_1: f64,
-    live_ret_3: f64,
-    ret_1: f64,
-    ret_3: f64,
-    ret_5: f64,
-    cycle_ret: f64,
+    _upper_extreme: f64,
+    _lower_extreme: f64,
+    _up_move_intensity: f64,
+    _down_move_intensity: f64,
+    _live_ret_1: f64,
+    _live_ret_3: f64,
+    _ret_1: f64,
+    _ret_3: f64,
+    _ret_5: f64,
+    _cycle_ret: f64,
     up_probability: f64,
     down_probability: f64,
     up_structure: f64,
@@ -5458,79 +5483,32 @@ fn prediction_candidate(
     if matches!(market_regime, "chaos" | "quiet") {
         return None;
     }
-    let top_overheated =
-        (upper_extreme > 0.55 || cycle_ret > 0.00070 || ret_3 > 0.00045 || ret_5 > 0.00070)
-            && up_move_intensity > 0.15;
-    let bottom_oversold =
-        (lower_extreme > 0.35 || cycle_ret < -0.00025 || ret_3 < -0.00035 || ret_5 < -0.00070)
-            && down_move_intensity > 0.05;
-    match market_regime {
-        "mean_reversion" => {
-            if bottom_oversold
-                && up_probability >= 0.60
-                && up_structure >= 0.55
-                && !(live_ret_1 < -0.00035 && live_ret_3 < -0.00055)
-            {
-                Some(PredictionCandidate {
-                    direction: "UP".to_string(),
-                    mode: "mean_reversion".to_string(),
-                    rule: "oversold_rebound".to_string(),
-                    raw_confidence: up_probability,
-                    structure_score: up_structure,
-                })
-            } else if top_overheated
-                && down_probability >= 0.60
-                && down_structure >= 0.55
-                && !(live_ret_1 > 0.00035 && live_ret_3 > 0.00055)
-            {
-                Some(PredictionCandidate {
-                    direction: "DOWN".to_string(),
-                    mode: "mean_reversion".to_string(),
-                    rule: "overheated_pullback".to_string(),
-                    raw_confidence: down_probability,
-                    structure_score: down_structure,
-                })
-            } else {
-                None
-            }
-        }
-        "impulse" => {
-            let upward_impulse_fading = top_overheated
-                && live_ret_1 <= 0.00005
-                && (ret_1 < 0.00020 || live_ret_3 < 0.00025);
-            let downward_impulse_fading = bottom_oversold
-                && live_ret_1 >= -0.00005
-                && (ret_1 > -0.00020 || live_ret_3 > -0.00025);
-            if upward_impulse_fading && down_probability >= 0.60 && down_structure >= 0.62 {
-                Some(PredictionCandidate {
-                    direction: "DOWN".to_string(),
-                    mode: "impulse_fade".to_string(),
-                    rule: "up_impulse_fading".to_string(),
-                    raw_confidence: down_probability,
-                    structure_score: down_structure,
-                })
-            } else if downward_impulse_fading && up_probability >= 0.60 && up_structure >= 0.62 {
-                Some(PredictionCandidate {
-                    direction: "UP".to_string(),
-                    mode: "impulse_fade".to_string(),
-                    rule: "down_impulse_fading".to_string(),
-                    raw_confidence: up_probability,
-                    structure_score: up_structure,
-                })
-            } else {
-                None
-            }
-        }
-        "trend_up" => {
-            let _ = (model_score, ret_5, ret_1, live_ret_1, upper_extreme);
-            None
-        }
-        "trend_down" => {
-            let _ = (model_score, ret_5, ret_1, live_ret_1, lower_extreme);
-            None
-        }
-        _ => None,
+
+    if up_probability >= PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY
+        && up_structure >= PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE
+    {
+        return Some(PredictionCandidate {
+            direction: "UP".to_string(),
+            mode: "structure_edge".to_string(),
+            rule: format!("{market_regime}_up"),
+            raw_confidence: up_probability,
+            structure_score: up_structure,
+        });
     }
+
+    if down_probability >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY
+        && down_structure >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE
+    {
+        return Some(PredictionCandidate {
+            direction: "HOLD".to_string(),
+            mode: "shadow_down".to_string(),
+            rule: format!("{market_regime}_down_shadow"),
+            raw_confidence: down_probability,
+            structure_score: down_structure,
+        });
+    }
+
+    None
 }
 
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
@@ -5539,10 +5517,7 @@ fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
         candidate.mode.as_str(),
         candidate.rule.as_str(),
     ) {
-        ("DOWN", "mean_reversion", "overheated_pullback") => 0.60,
-        ("UP", "mean_reversion", "oversold_rebound") => 0.62,
-        ("DOWN", "impulse_fade", "up_impulse_fading") => 0.62,
-        ("UP", "impulse_fade", "down_impulse_fading") => 0.62,
+        ("UP", "structure_edge", _) => PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
         _ => PREDICTION_MIN_RAW_CONFIDENCE,
     }
 }
@@ -5624,12 +5599,17 @@ fn merge_prediction_calibration(
     if let Some(candidate) = candidate {
         if calibration.allowed {
             decision.direction = candidate.direction.clone();
-            decision.confidence = calibration.win_rate;
+            decision.confidence = if calibration.sample_count < i64::from(calibration.min_samples) {
+                candidate.raw_confidence
+            } else {
+                calibration.win_rate
+            };
             decision.reason = format!(
-                "send {} mode {} rule {} calibrated win {:.4} ev {:.4} samples {}/{} dir_conf {:.4} structure {:.4}",
+                "send {} mode {} rule {} confidence {:.4} calibrated win {:.4} ev {:.4} samples {}/{} dir_conf {:.4} structure {:.4}",
                 candidate.direction,
                 candidate.mode,
                 candidate.rule,
+                decision.confidence,
                 calibration.win_rate,
                 calibration.ev_usdt,
                 calibration.sample_count,
@@ -9572,10 +9552,31 @@ async fn db_prediction_calibration(
         0.0
     };
     let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
+    let effective_min_win_rate =
+        if candidate.direction == "UP" && candidate.mode == "structure_edge" {
+            config
+                .calibration_min_win_rate
+                .min(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE)
+        } else {
+            config.calibration_min_win_rate
+        };
     let allowed = sample_count >= i64::from(config.calibration_min_samples)
-        && win_rate >= config.calibration_min_win_rate
+        && win_rate >= effective_min_win_rate
         && ev_usdt >= config.calibration_min_ev_usdt;
-    let reason = if sample_count < i64::from(config.calibration_min_samples) {
+    let cold_start_allowed = candidate.direction == "UP"
+        && candidate.mode == "structure_edge"
+        && sample_count < i64::from(config.calibration_min_samples);
+    let allowed = allowed || cold_start_allowed;
+    let reason = if cold_start_allowed {
+        format!(
+            "calibration collecting allowed mode {} rule {} direction {} samples {}/{}",
+            candidate.mode,
+            candidate.rule,
+            candidate.direction,
+            sample_count,
+            config.calibration_min_samples
+        )
+    } else if sample_count < i64::from(config.calibration_min_samples) {
         format!(
             "hold calibration warmup mode {} rule {} direction {} samples {}/{}",
             candidate.mode,
@@ -9584,10 +9585,10 @@ async fn db_prediction_calibration(
             sample_count,
             config.calibration_min_samples
         )
-    } else if win_rate < config.calibration_min_win_rate {
+    } else if win_rate < effective_min_win_rate {
         format!(
             "hold calibration win_rate {:.4} < {:.4} mode {} rule {} samples {}",
-            win_rate, config.calibration_min_win_rate, candidate.mode, candidate.rule, sample_count
+            win_rate, effective_min_win_rate, candidate.mode, candidate.rule, sample_count
         )
     } else if ev_usdt < config.calibration_min_ev_usdt {
         format!(
@@ -9607,7 +9608,7 @@ async fn db_prediction_calibration(
         win_rate,
         ev_usdt,
         min_samples: config.calibration_min_samples,
-        min_win_rate: config.calibration_min_win_rate,
+        min_win_rate: effective_min_win_rate,
         min_ev_usdt: config.calibration_min_ev_usdt,
         lookback_minutes: config.calibration_lookback_minutes,
         sample_seconds: config.calibration_sample_seconds,

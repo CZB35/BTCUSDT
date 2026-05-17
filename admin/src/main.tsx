@@ -1264,7 +1264,7 @@ function PredictionPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "方向", "价格", "模型分", "涨概率", "跌概率", "原始置信度", "技术分", "原因"]}
+          columns={["时间", "方向", "价格", "模型分", "涨概率", "涨结构", "有效门槛", "候选", "原因"]}
           pageSize={20}
           rows={observations.map((row) => ({
             id: row.id,
@@ -1276,9 +1276,9 @@ function PredictionPage({
                 row.entry_price || "-",
                 metrics.modelScore || row.score || "-",
                 metrics.upProbability,
-                metrics.downProbability,
-                metrics.rawConfidence,
-                metrics.technicalScore,
+                metrics.upStructure,
+                metrics.effectiveMinConfidence,
+                metrics.candidateRule,
                 row.reason || "-"
               ];
             })(),
@@ -1298,6 +1298,11 @@ function PredictionPage({
                 概率权重: metrics.probabilityWeight,
                 上涨概率: metrics.upProbability,
                 下跌概率: metrics.downProbability,
+                上涨结构: metrics.upStructure,
+                下跌结构: metrics.downStructure,
+                候选模式: metrics.candidateMode,
+                候选规则: metrics.candidateRule,
+                有效门槛: metrics.effectiveMinConfidence,
                 边际概率: metrics.edgeProbability,
                 原始置信度: metrics.rawConfidence,
                 下发置信度: percent(row.confidence),
@@ -2146,6 +2151,11 @@ function predictionMetrics(snapshot: Record<string, unknown>) {
     probabilityWeight: percentValue(snapshotValue(snapshot, ["scores", "probability_weight"])),
     upProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "up_probability"])),
     downProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "down_probability"])),
+    upStructure: percentValue(snapshotValue(snapshot, ["structure", "up_score"])),
+    downStructure: percentValue(snapshotValue(snapshot, ["structure", "down_score"])),
+    candidateMode: String(snapshotValue(snapshot, ["decision", "candidate_mode"]) || "-"),
+    candidateRule: String(snapshotValue(snapshot, ["decision", "candidate_rule"]) || "-"),
+    effectiveMinConfidence: percentValue(snapshotValue(snapshot, ["config", "effective_min_confidence"])),
     edgeProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "edge_probability"])),
     expectedExpiryReturn: percentValue(snapshotValue(snapshot, ["expiry_model", "expected_expiry_return"]), 3),
     expiryVolatility: percentValue(snapshotValue(snapshot, ["expiry_model", "expiry_volatility"]), 3),
