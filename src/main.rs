@@ -94,7 +94,7 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v2";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v3";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.65;
@@ -1181,6 +1181,7 @@ struct PredictionCandidate {
     mode: String,
     rule: String,
     raw_confidence: f64,
+    structure_score: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -4943,6 +4944,9 @@ fn build_prediction_decision(
     let volume_z = z_score_last(&volumes, 30);
     let volatility = realized_volatility(&closes, 30);
     let body_ratio = candle_body_ratio(latest);
+    let upper_wick_ratio = candle_upper_wick_ratio(latest);
+    let lower_wick_ratio = candle_lower_wick_ratio(latest);
+    let close_position = candle_close_position(latest);
     let price_time = millis_to_utc(snapshot.latest_price_time_ms)?;
     let age_seconds = (Utc::now() - price_time).num_seconds();
     let cycle = event_cycle_context(
@@ -4974,6 +4978,28 @@ fn build_prediction_decision(
     );
     let live_reclaiming = snapshot.latest_price >= latest.close || latest.close >= latest.open;
     let live_rejecting = snapshot.latest_price <= latest.close || latest.close <= latest.open;
+    let up_structure = structure_score_up(
+        latest,
+        close_position,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        live_ret_1,
+        live_ret_3,
+        ret_1,
+        ret_3,
+        cycle.return_from_open,
+    );
+    let down_structure = structure_score_down(
+        latest,
+        close_position,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        live_ret_1,
+        live_ret_3,
+        ret_1,
+        ret_3,
+        cycle.return_from_open,
+    );
     let bottom_reversal_setup = lower_extreme > 0.55
         && (cycle.return_from_open < -0.00120 || ret_3 < -0.00100 || ret_5 < -0.00120)
         && live_ret_1 > 0.00018
@@ -5111,7 +5137,12 @@ fn build_prediction_decision(
         -12.0,
         12.0,
     );
-    let base_confidence = clamp(edge_probability, 0.0, 0.99);
+    let directional_probability = if model_score >= 0.0 {
+        up_probability
+    } else {
+        down_probability
+    };
+    let base_confidence = clamp(directional_probability, 0.0, 0.99);
     let predicted_return = clamp(expected_expiry_return, -0.003, 0.003);
     let market_regime = classify_prediction_regime(
         cycle.return_from_open,
@@ -5137,7 +5168,10 @@ fn build_prediction_decision(
         ret_3,
         ret_5,
         cycle.return_from_open,
-        base_confidence,
+        up_probability,
+        down_probability,
+        up_structure,
+        down_structure,
     );
     let mut direction = candidate
         .as_ref()
@@ -5239,16 +5273,17 @@ fn build_prediction_decision(
                     "trend_live_ret_1": 0.00008
                 },
                 "candidate": {
-                    "top_score": 1.5,
-                    "bottom_score": -1.2,
                     "top_upper_extreme": 0.55,
                     "top_cycle_ret": 0.00070,
                     "top_ret_3": 0.00045,
+                    "top_ret_5": 0.00070,
                     "top_up_move_intensity": 0.15,
                     "bottom_lower_extreme": 0.35,
                     "bottom_cycle_ret": -0.00025,
                     "bottom_ret_3": -0.00035,
+                    "bottom_ret_5": -0.00070,
                     "bottom_down_move_intensity": 0.05,
+                    "candidate_probability_min": 0.60,
                     "mean_reversion_live_ret_1_limit": 0.00035,
                     "mean_reversion_live_ret_3_limit": 0.00055,
                     "impulse_fade_live_ret_1": 0.00005,
@@ -5258,7 +5293,9 @@ fn build_prediction_decision(
                     "trend_pullback_ret_5": 0.00055,
                     "trend_pullback_ret_1": 0.00020,
                     "trend_pullback_live_ret_1": 0.00003,
-                    "trend_pullback_extreme_max": 0.75
+                    "trend_pullback_extreme_max": 0.75,
+                    "min_reversal_structure_score": 0.55,
+                    "min_impulse_fade_structure_score": 0.62
                 },
                 "payout": {
                     "stake_usdt": MIN_EVENT_STAKE,
@@ -5272,6 +5309,7 @@ fn build_prediction_decision(
             "scores": {
                 "model_score": model_score,
                 "raw_confidence": base_confidence,
+                "directional_probability": directional_probability,
                 "technical_score": score,
                 "probability_score": probability_score,
                 "technical_weight": technical_weight,
@@ -5284,6 +5322,13 @@ fn build_prediction_decision(
                 "candle_score": candle_score,
                 "live_score": live_score,
                 "cycle_score": cycle_score
+            },
+            "structure": {
+                "up_score": up_structure,
+                "down_score": down_structure,
+                "close_position": close_position,
+                "upper_wick_ratio": upper_wick_ratio,
+                "lower_wick_ratio": lower_wick_ratio
             },
             "decision": {
                 "model_version": PREDICTION_MODEL_VERSION,
@@ -5405,32 +5450,45 @@ fn prediction_candidate(
     ret_3: f64,
     ret_5: f64,
     cycle_ret: f64,
-    raw_confidence: f64,
+    up_probability: f64,
+    down_probability: f64,
+    up_structure: f64,
+    down_structure: f64,
 ) -> Option<PredictionCandidate> {
     if matches!(market_regime, "chaos" | "quiet") {
         return None;
     }
-    let top_overheated = model_score >= 1.5
-        && (upper_extreme > 0.55 || cycle_ret > 0.00070 || ret_3 > 0.00045)
-        && up_move_intensity > 0.15;
-    let bottom_oversold = model_score <= -1.2
-        && (lower_extreme > 0.35 || cycle_ret < -0.00025 || ret_3 < -0.00035)
-        && down_move_intensity > 0.05;
+    let top_overheated =
+        (upper_extreme > 0.55 || cycle_ret > 0.00070 || ret_3 > 0.00045 || ret_5 > 0.00070)
+            && up_move_intensity > 0.15;
+    let bottom_oversold =
+        (lower_extreme > 0.35 || cycle_ret < -0.00025 || ret_3 < -0.00035 || ret_5 < -0.00070)
+            && down_move_intensity > 0.05;
     match market_regime {
         "mean_reversion" => {
-            if bottom_oversold && !(live_ret_1 < -0.00035 && live_ret_3 < -0.00055) {
+            if bottom_oversold
+                && up_probability >= 0.60
+                && up_structure >= 0.55
+                && !(live_ret_1 < -0.00035 && live_ret_3 < -0.00055)
+            {
                 Some(PredictionCandidate {
                     direction: "UP".to_string(),
                     mode: "mean_reversion".to_string(),
                     rule: "oversold_rebound".to_string(),
-                    raw_confidence,
+                    raw_confidence: up_probability,
+                    structure_score: up_structure,
                 })
-            } else if top_overheated && !(live_ret_1 > 0.00035 && live_ret_3 > 0.00055) {
+            } else if top_overheated
+                && down_probability >= 0.60
+                && down_structure >= 0.55
+                && !(live_ret_1 > 0.00035 && live_ret_3 > 0.00055)
+            {
                 Some(PredictionCandidate {
                     direction: "DOWN".to_string(),
                     mode: "mean_reversion".to_string(),
                     rule: "overheated_pullback".to_string(),
-                    raw_confidence,
+                    raw_confidence: down_probability,
+                    structure_score: down_structure,
                 })
             } else {
                 None
@@ -5443,19 +5501,21 @@ fn prediction_candidate(
             let downward_impulse_fading = bottom_oversold
                 && live_ret_1 >= -0.00005
                 && (ret_1 > -0.00020 || live_ret_3 > -0.00025);
-            if upward_impulse_fading {
+            if upward_impulse_fading && down_probability >= 0.60 && down_structure >= 0.62 {
                 Some(PredictionCandidate {
                     direction: "DOWN".to_string(),
                     mode: "impulse_fade".to_string(),
                     rule: "up_impulse_fading".to_string(),
-                    raw_confidence,
+                    raw_confidence: down_probability,
+                    structure_score: down_structure,
                 })
-            } else if downward_impulse_fading {
+            } else if downward_impulse_fading && up_probability >= 0.60 && up_structure >= 0.62 {
                 Some(PredictionCandidate {
                     direction: "UP".to_string(),
                     mode: "impulse_fade".to_string(),
                     rule: "down_impulse_fading".to_string(),
-                    raw_confidence,
+                    raw_confidence: up_probability,
+                    structure_score: up_structure,
                 })
             } else {
                 None
@@ -5507,12 +5567,13 @@ async fn apply_prediction_calibration(
     if candidate.raw_confidence < min_raw_confidence {
         let mut calibration = PredictionCalibration::disabled(config);
         calibration.reason = format!(
-            "hold candidate raw confidence {:.4} < {:.4} mode {} rule {} direction {}",
+            "hold candidate direction confidence {:.4} < {:.4} mode {} rule {} direction {} structure {:.4}",
             candidate.raw_confidence,
             min_raw_confidence,
             candidate.mode,
             candidate.rule,
-            candidate.direction
+            candidate.direction,
+            candidate.structure_score
         );
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
@@ -5532,11 +5593,25 @@ fn prediction_candidate_from_snapshot(snapshot: &serde_json::Value) -> Option<Pr
         .and_then(|scores| scores.get("raw_confidence"))
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0);
+    let structure_score = match direction.as_str() {
+        "UP" => snapshot
+            .get("structure")
+            .and_then(|structure| structure.get("up_score"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+        "DOWN" => snapshot
+            .get("structure")
+            .and_then(|structure| structure.get("down_score"))
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0),
+        _ => 0.0,
+    };
     Some(PredictionCandidate {
         direction,
         mode,
         rule,
         raw_confidence,
+        structure_score,
     })
 }
 
@@ -5551,14 +5626,16 @@ fn merge_prediction_calibration(
             decision.direction = candidate.direction.clone();
             decision.confidence = calibration.win_rate;
             decision.reason = format!(
-                "send {} mode {} rule {} calibrated win {:.4} ev {:.4} samples {}/{}",
+                "send {} mode {} rule {} calibrated win {:.4} ev {:.4} samples {}/{} dir_conf {:.4} structure {:.4}",
                 candidate.direction,
                 candidate.mode,
                 candidate.rule,
                 calibration.win_rate,
                 calibration.ev_usdt,
                 calibration.sample_count,
-                calibration.min_samples
+                calibration.min_samples,
+                candidate.raw_confidence,
+                candidate.structure_score
             );
         } else {
             decision.direction = "HOLD".to_string();
@@ -5754,6 +5831,105 @@ fn candle_body_ratio(candle: &MarketCandle) -> f64 {
     } else {
         clamp((candle.close - candle.open).abs() / range, 0.0, 1.0)
     }
+}
+
+fn candle_upper_wick_ratio(candle: &MarketCandle) -> f64 {
+    let range = candle.high - candle.low;
+    if range <= f64::EPSILON {
+        0.0
+    } else {
+        clamp(
+            (candle.high - candle.open.max(candle.close)) / range,
+            0.0,
+            1.0,
+        )
+    }
+}
+
+fn candle_lower_wick_ratio(candle: &MarketCandle) -> f64 {
+    let range = candle.high - candle.low;
+    if range <= f64::EPSILON {
+        0.0
+    } else {
+        clamp(
+            (candle.open.min(candle.close) - candle.low) / range,
+            0.0,
+            1.0,
+        )
+    }
+}
+
+fn candle_close_position(candle: &MarketCandle) -> f64 {
+    let range = candle.high - candle.low;
+    if range <= f64::EPSILON {
+        0.5
+    } else {
+        clamp((candle.close - candle.low) / range, 0.0, 1.0)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structure_score_down(
+    candle: &MarketCandle,
+    close_position: f64,
+    upper_wick_ratio: f64,
+    lower_wick_ratio: f64,
+    live_ret_1: f64,
+    live_ret_3: f64,
+    ret_1: f64,
+    ret_3: f64,
+    cycle_ret: f64,
+) -> f64 {
+    let bearish_close = if candle.close < candle.open {
+        0.25
+    } else {
+        0.0
+    };
+    let high_rejection = clamp(upper_wick_ratio * 1.25 - lower_wick_ratio * 0.45, 0.0, 0.45);
+    let close_weakness = clamp((0.58 - close_position) / 0.58, 0.0, 1.0) * 0.25;
+    let short_term_damage = clamp((-live_ret_1 * 2600.0).max(-ret_1 * 2200.0), 0.0, 0.35);
+    let impulse_stalling = if cycle_ret > 0.0006 && live_ret_3 < ret_3 * 0.35 {
+        0.18
+    } else {
+        0.0
+    };
+    clamp(
+        bearish_close + high_rejection + close_weakness + short_term_damage + impulse_stalling,
+        0.0,
+        1.0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn structure_score_up(
+    candle: &MarketCandle,
+    close_position: f64,
+    upper_wick_ratio: f64,
+    lower_wick_ratio: f64,
+    live_ret_1: f64,
+    live_ret_3: f64,
+    ret_1: f64,
+    ret_3: f64,
+    cycle_ret: f64,
+) -> f64 {
+    let bullish_close = if candle.close > candle.open {
+        0.25
+    } else {
+        0.0
+    };
+    let low_rejection = clamp(lower_wick_ratio * 1.25 - upper_wick_ratio * 0.45, 0.0, 0.45);
+    let close_strength = clamp((close_position - 0.42) / 0.58, 0.0, 1.0) * 0.25;
+    let short_term_reclaim = clamp((live_ret_1 * 2600.0).max(ret_1 * 2200.0), 0.0, 0.35);
+    let impulse_stalling = if cycle_ret < -0.0006 && live_ret_3 > ret_3 * 0.35 {
+        0.18
+    } else {
+        0.0
+    };
+    clamp(
+        bullish_close + low_rejection + close_strength + short_term_reclaim + impulse_stalling,
+        0.0,
+        1.0,
+    )
 }
 
 fn average(values: &[f64]) -> f64 {
