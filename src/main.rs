@@ -94,21 +94,32 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v6";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v8";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
-const PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY: f64 = 0.62;
-const PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE: f64 = 0.70;
-const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY: f64 = 0.62;
-const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE: f64 = 0.70;
+const PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY: f64 = 0.63;
+const PREDICTION_MEAN_REVERSION_DOWN_MIN_STRUCTURE: f64 = 0.82;
+const PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY: f64 = 0.63;
+const PREDICTION_MEAN_REVERSION_UP_MIN_STRUCTURE: f64 = 0.84;
+const PREDICTION_TREND_DOWN_MIN_PROBABILITY: f64 = 0.62;
+const PREDICTION_TREND_DOWN_MIN_STRUCTURE: f64 = 0.86;
+const PREDICTION_TREND_UP_MIN_PROBABILITY: f64 = 0.64;
+const PREDICTION_TREND_UP_MIN_STRUCTURE: f64 = 0.84;
+const PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY: f64 = 0.63;
+const PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE: f64 = 0.85;
+const PREDICTION_IMPULSE_UP_MIN_PROBABILITY: f64 = 0.64;
+const PREDICTION_IMPULSE_UP_MIN_STRUCTURE: f64 = 0.82;
+const PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE: f64 = 0.62;
+const PREDICTION_REVERSAL_UP_MIN_STRUCTURE: f64 = 0.35;
+const PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE: f64 = 0.62;
+const PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE: f64 = 0.35;
 const PREDICTION_CONFIRMATION_SECONDS: i64 = 8;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
-const PREDICTION_MIN_RAW_CONFIDENCE: f64 = PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
-const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 =
-    PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
+const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
+const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -1784,7 +1795,7 @@ impl PredictionConfig {
             .to_string()
             .parse::<f64>()
             .unwrap_or(self.min_confidence)
-            .max(PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY);
+            .max(DEFAULT_PREDICTION_MIN_CONFIDENCE);
         next.technical_weight = settings
             .technical_weight
             .to_string()
@@ -5373,10 +5384,22 @@ fn build_prediction_decision(
                     "trend_live_ret_1": 0.00008
                 },
                 "candidate": {
-                    "structure_edge_up_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
-                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE,
-                    "structure_edge_down_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
-                    "structure_edge_down_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE,
+                    "mean_reversion_down_min_probability": PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY,
+                    "mean_reversion_down_min_structure": PREDICTION_MEAN_REVERSION_DOWN_MIN_STRUCTURE,
+                    "mean_reversion_up_min_probability": PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY,
+                    "mean_reversion_up_min_structure": PREDICTION_MEAN_REVERSION_UP_MIN_STRUCTURE,
+                    "trend_down_min_probability": PREDICTION_TREND_DOWN_MIN_PROBABILITY,
+                    "trend_down_min_structure": PREDICTION_TREND_DOWN_MIN_STRUCTURE,
+                    "trend_up_min_probability": PREDICTION_TREND_UP_MIN_PROBABILITY,
+                    "trend_up_min_structure": PREDICTION_TREND_UP_MIN_STRUCTURE,
+                    "impulse_down_min_probability": PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY,
+                    "impulse_down_min_structure": PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE,
+                    "impulse_up_min_probability": PREDICTION_IMPULSE_UP_MIN_PROBABILITY,
+                    "impulse_up_min_structure": PREDICTION_IMPULSE_UP_MIN_STRUCTURE,
+                    "reversal_up_min_setup_confidence": PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
+                    "reversal_up_min_structure": PREDICTION_REVERSAL_UP_MIN_STRUCTURE,
+                    "reversal_down_min_setup_confidence": PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
+                    "reversal_down_min_structure": PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE,
                     "confirmation_seconds": PREDICTION_CONFIRMATION_SECONDS,
                     "confirmation_max_adverse_ret": PREDICTION_CONFIRMATION_MAX_ADVERSE_RET
                 },
@@ -5519,84 +5542,174 @@ fn classify_prediction_regime(
     }
 }
 
+fn make_prediction_candidate(
+    direction: &str,
+    mode: &str,
+    rule: &str,
+    raw_confidence: f64,
+    structure_score: f64,
+) -> PredictionCandidate {
+    PredictionCandidate {
+        direction: direction.to_string(),
+        mode: mode.to_string(),
+        rule: rule.to_string(),
+        raw_confidence,
+        structure_score,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prediction_candidate(
     _model_score: f64,
     market_regime: &str,
-    _upper_extreme: f64,
-    _lower_extreme: f64,
+    upper_extreme: f64,
+    lower_extreme: f64,
     _up_move_intensity: f64,
     _down_move_intensity: f64,
-    _live_ret_1: f64,
-    _live_ret_3: f64,
+    live_ret_1: f64,
+    live_ret_3: f64,
     _ret_1: f64,
-    _ret_3: f64,
+    ret_3: f64,
     _ret_5: f64,
-    _cycle_ret: f64,
+    cycle_ret: f64,
     up_probability: f64,
     down_probability: f64,
     up_structure: f64,
     down_structure: f64,
 ) -> Option<PredictionCandidate> {
-    if matches!(market_regime, "chaos" | "quiet") {
-        return None;
+    if market_regime == "impulse"
+        && lower_extreme >= 0.70
+        && cycle_ret <= -0.0015
+        && live_ret_3 <= -0.0008
+        && live_ret_1 >= -0.00010
+        && up_structure >= PREDICTION_REVERSAL_UP_MIN_STRUCTURE
+    {
+        let setup_confidence = up_probability.max(0.62);
+        return Some(make_prediction_candidate(
+            "UP",
+            "reversal_edge",
+            "reversal_up_from_impulse_down",
+            setup_confidence,
+            up_structure,
+        ));
     }
 
-    let up_ok = up_probability >= PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY
-        && up_structure >= PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE
-        && !matches!(market_regime, "trend_down");
-    let down_ok = down_probability >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY
-        && down_structure >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE
-        && !matches!(market_regime, "trend_up");
+    if market_regime == "impulse"
+        && upper_extreme >= 0.70
+        && cycle_ret >= 0.0015
+        && live_ret_3 >= 0.0008
+        && live_ret_1 <= 0.00010
+        && down_structure >= PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE
+    {
+        let setup_confidence = down_probability.max(0.62);
+        return Some(make_prediction_candidate(
+            "DOWN",
+            "reversal_edge",
+            "reversal_down_from_impulse_up",
+            setup_confidence,
+            down_structure,
+        ));
+    }
 
-    match (up_ok, down_ok) {
-        (true, true) => {
-            let up_edge = (up_probability - 0.5) * 0.65 + up_structure * 0.35;
-            let down_edge = (down_probability - 0.5) * 0.65 + down_structure * 0.35;
-            if up_edge >= down_edge {
-                Some(PredictionCandidate {
-                    direction: "UP".to_string(),
-                    mode: "structure_edge".to_string(),
-                    rule: format!("{market_regime}_up"),
-                    raw_confidence: up_probability,
-                    structure_score: up_structure,
-                })
-            } else {
-                Some(PredictionCandidate {
-                    direction: "DOWN".to_string(),
-                    mode: "structure_edge".to_string(),
-                    rule: format!("{market_regime}_down"),
-                    raw_confidence: down_probability,
-                    structure_score: down_structure,
-                })
-            }
+    match market_regime {
+        "mean_reversion"
+            if down_probability >= PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY
+                && down_structure >= PREDICTION_MEAN_REVERSION_DOWN_MIN_STRUCTURE
+                && live_ret_1 <= 0.0 =>
+        {
+            Some(make_prediction_candidate(
+                "DOWN",
+                "structure_edge",
+                "mean_reversion_down",
+                down_probability,
+                down_structure,
+            ))
         }
-        (true, false) => Some(PredictionCandidate {
-            direction: "UP".to_string(),
-            mode: "structure_edge".to_string(),
-            rule: format!("{market_regime}_up"),
-            raw_confidence: up_probability,
-            structure_score: up_structure,
-        }),
-        (false, true) => Some(PredictionCandidate {
-            direction: "DOWN".to_string(),
-            mode: "structure_edge".to_string(),
-            rule: format!("{market_regime}_down"),
-            raw_confidence: down_probability,
-            structure_score: down_structure,
-        }),
-        (false, false) => None,
+        "mean_reversion"
+            if up_probability >= PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY
+                && up_structure >= PREDICTION_MEAN_REVERSION_UP_MIN_STRUCTURE
+                && live_ret_1 >= 0.0 =>
+        {
+            Some(make_prediction_candidate(
+                "UP",
+                "structure_edge",
+                "mean_reversion_up",
+                up_probability,
+                up_structure,
+            ))
+        }
+        "trend_down"
+            if down_probability >= PREDICTION_TREND_DOWN_MIN_PROBABILITY
+                && down_structure >= PREDICTION_TREND_DOWN_MIN_STRUCTURE
+                && live_ret_3 <= 0.0
+                && lower_extreme < 0.75 =>
+        {
+            Some(make_prediction_candidate(
+                "DOWN",
+                "structure_edge",
+                "trend_down_down",
+                down_probability,
+                down_structure,
+            ))
+        }
+        "trend_up"
+            if up_probability >= PREDICTION_TREND_UP_MIN_PROBABILITY
+                && up_structure >= PREDICTION_TREND_UP_MIN_STRUCTURE
+                && live_ret_3 >= 0.0
+                && upper_extreme < 0.75 =>
+        {
+            Some(make_prediction_candidate(
+                "UP",
+                "structure_edge",
+                "trend_up_up",
+                up_probability,
+                up_structure,
+            ))
+        }
+        "impulse"
+            if down_probability >= PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY
+                && down_structure >= PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE
+                && lower_extreme < 0.60
+                && live_ret_1 <= -0.00010
+                && ret_3 <= -0.00025 =>
+        {
+            Some(make_prediction_candidate(
+                "DOWN",
+                "structure_edge",
+                "impulse_down",
+                down_probability,
+                down_structure,
+            ))
+        }
+        "impulse"
+            if up_probability >= PREDICTION_IMPULSE_UP_MIN_PROBABILITY
+                && up_structure >= PREDICTION_IMPULSE_UP_MIN_STRUCTURE
+                && upper_extreme < 0.60
+                && live_ret_1 >= 0.00010
+                && ret_3 >= 0.00025 =>
+        {
+            Some(make_prediction_candidate(
+                "UP",
+                "structure_edge",
+                "impulse_up",
+                up_probability,
+                up_structure,
+            ))
+        }
+        _ => None,
     }
 }
 
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
-    match (
-        candidate.direction.as_str(),
-        candidate.mode.as_str(),
-        candidate.rule.as_str(),
-    ) {
-        ("UP", "structure_edge", _) => PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
-        ("DOWN", "structure_edge", _) => PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
+    match candidate.rule.as_str() {
+        "reversal_up_from_impulse_down" => PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
+        "reversal_down_from_impulse_up" => PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
+        "mean_reversion_down" => PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY,
+        "mean_reversion_up" => PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY,
+        "trend_down_down" => PREDICTION_TREND_DOWN_MIN_PROBABILITY,
+        "trend_up_up" => PREDICTION_TREND_UP_MIN_PROBABILITY,
+        "impulse_down" => PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY,
+        "impulse_up" => PREDICTION_IMPULSE_UP_MIN_PROBABILITY,
         _ => PREDICTION_MIN_RAW_CONFIDENCE,
     }
 }
