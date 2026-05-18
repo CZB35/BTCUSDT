@@ -980,7 +980,7 @@ function SignalsPage({
           </div>
         </div>
         <DataTable
-          columns={["下发时间", "周期结束", "交易对", "方向", "入场价", "到期价", "结果", "金额", "置信度", "状态"]}
+          columns={["下发时间", "预计到期", "交易对", "方向", "入场价", "到期价", "结果", "金额", "置信度", "状态"]}
           rows={signals.map((signal) => ({
             id: signal.id,
             cells: [
@@ -1010,7 +1010,7 @@ function SignalsPage({
               授权状态: signal.authorization_status || "-",
               是否授权: yesNo(Boolean(signal.trade_authorized)),
               模型版本: signal.model_version || "-",
-              周期结束: shortTime(signal.cycle_end)
+              预计到期: shortTime(signal.cycle_end)
             }
           }))}
         />
@@ -1856,7 +1856,7 @@ function SignalSummary({ signal }: { signal?: SignalRecord }) {
         <div><dt>状态</dt><dd>{signal?.authorization_status || "-"}</dd></div>
         <div><dt>结果</dt><dd>{signalOutcomeLabel(signal?.outcome_result)}</dd></div>
         <div><dt>到期价</dt><dd>{signal?.outcome_expiry_price || "-"}</dd></div>
-        <div><dt>周期结束</dt><dd>{shortTime(signal?.cycle_end)}</dd></div>
+        <div><dt>预计到期</dt><dd>{shortTime(signal?.cycle_end)}</dd></div>
       </dl>
     </div>
   );

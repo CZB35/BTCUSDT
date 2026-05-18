@@ -94,7 +94,7 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v5";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v6";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
@@ -102,6 +102,10 @@ const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
 const PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY: f64 = 0.62;
 const PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE: f64 = 0.70;
+const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY: f64 = 0.62;
+const PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE: f64 = 0.70;
+const PREDICTION_CONFIRMATION_SECONDS: i64 = 8;
+const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
 const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 =
     PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY;
@@ -545,9 +549,26 @@ fn start_prediction_loop(state: &SharedState) {
                         }
                     }
                     if decision.direction == "UP" || decision.direction == "DOWN" {
+                        match confirm_prediction_candidate(&state, &decision).await {
+                            PredictionConfirmation::Waiting(message) => {
+                                let mut runtime = state.prediction_runtime.write().await;
+                                runtime.status = "confirming".to_string();
+                                runtime.message = message;
+                                continue;
+                            }
+                            PredictionConfirmation::Rejected(message) => {
+                                let mut runtime = state.prediction_runtime.write().await;
+                                runtime.status = "holding".to_string();
+                                runtime.message = message;
+                                continue;
+                            }
+                            PredictionConfirmation::Confirmed => {}
+                        }
                         if let Err(err) = emit_prediction_signal(&state, &decision).await {
                             mark_prediction_error(&state, err.message).await;
                         }
+                    } else {
+                        clear_pending_prediction_candidate(&state).await;
                     }
                 }
                 Err(err) => mark_prediction_error(&state, err.message).await,
@@ -594,10 +615,11 @@ async fn emit_prediction_signal(
     state: &SharedState,
     decision: &PredictionDecision,
 ) -> Result<(), AppError> {
+    let signal_created_at = Utc::now();
     {
-        let mut last_cycle = state.prediction_last_emitted_cycle.write().await;
-        if let Some(last) = *last_cycle {
-            let age = (decision.cycle_start - last).num_seconds();
+        let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
+        if let Some(last) = *last_emitted_at {
+            let age = (signal_created_at - last).num_seconds();
             if age >= 0 && age < decision.signal_cooldown_seconds {
                 let mut runtime = state.prediction_runtime.write().await;
                 runtime.status = "duplicate_skipped".to_string();
@@ -610,12 +632,9 @@ async fn emit_prediction_signal(
                 return Ok(());
             }
         }
-        if last_cycle.as_ref() == Some(&decision.cycle_start) {
-            return Ok(());
-        }
-        *last_cycle = Some(decision.cycle_start);
+        *last_emitted_at = Some(signal_created_at);
     }
-    let signal = SignalCore::from_prediction(decision);
+    let signal = SignalCore::from_prediction_at(decision, signal_created_at);
     if let Some(pool) = state.db.as_ref() {
         if !db_insert_signal(pool, &signal).await? {
             return Ok(());
@@ -719,7 +738,8 @@ struct AppState {
     exchange_workers: RwLock<HashMap<Uuid, JoinHandle<()>>>,
     market_data: RwLock<MarketDataState>,
     prediction_runtime: RwLock<PredictionRuntimeStatus>,
-    prediction_last_emitted_cycle: RwLock<Option<DateTime<Utc>>>,
+    prediction_last_emitted_at: RwLock<Option<DateTime<Utc>>>,
+    prediction_pending_candidate: RwLock<Option<PendingPredictionCandidate>>,
     active_ws_connections: RwLock<HashMap<Uuid, Uuid>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
@@ -756,7 +776,8 @@ impl AppState {
             exchange_workers: RwLock::new(HashMap::new()),
             market_data: RwLock::new(MarketDataState::default()),
             prediction_runtime: RwLock::new(PredictionRuntimeStatus::default()),
-            prediction_last_emitted_cycle: RwLock::new(None),
+            prediction_last_emitted_at: RwLock::new(None),
+            prediction_pending_candidate: RwLock::new(None),
             active_ws_connections: RwLock::new(HashMap::new()),
             signal_tx,
             started_at: Utc::now(),
@@ -1036,20 +1057,20 @@ impl SignalCore {
         self.model_version == "manual-signal-v1"
     }
 
-    fn from_prediction(decision: &PredictionDecision) -> Self {
+    fn from_prediction_at(decision: &PredictionDecision, created_at: DateTime<Utc>) -> Self {
         Self {
             id: Uuid::now_v7(),
             symbol: DEFAULT_SYMBOL.to_string(),
             period_seconds: DEFAULT_PERIOD_SECONDS,
-            cycle_start: decision.cycle_start,
-            cycle_end: decision.cycle_end,
+            cycle_start: created_at,
+            cycle_end: created_at + Duration::seconds(DEFAULT_PERIOD_SECONDS as i64),
             direction: decision.direction.clone(),
             confidence: decimal_from_f64(decision.confidence, 6),
             predicted_return: decimal_from_f64(decision.predicted_return, 10),
             entry_price: decimal_from_f64(decision.entry_price, 8),
             suggested_stake: MIN_EVENT_STAKE,
             model_version: PREDICTION_MODEL_VERSION.to_string(),
-            created_at: Utc::now(),
+            created_at,
             outcome_result: None,
             outcome_expiry_price: None,
             outcome_settled_at: None,
@@ -1216,8 +1237,6 @@ struct PredictionDecision {
     predicted_return: f64,
     entry_price: f64,
     score: f64,
-    cycle_start: DateTime<Utc>,
-    cycle_end: DateTime<Utc>,
     signal_cooldown_seconds: i64,
     market_source: String,
     market_age_seconds: i64,
@@ -1233,6 +1252,22 @@ struct PredictionCandidate {
     rule: String,
     raw_confidence: f64,
     structure_score: f64,
+}
+
+#[derive(Clone, Debug)]
+struct PendingPredictionCandidate {
+    direction: String,
+    rule: String,
+    first_seen_at: DateTime<Utc>,
+    entry_price: f64,
+    raw_confidence: f64,
+    structure_score: f64,
+}
+
+enum PredictionConfirmation {
+    Waiting(String),
+    Rejected(String),
+    Confirmed,
 }
 
 #[derive(Clone, Debug)]
@@ -5234,11 +5269,10 @@ fn build_prediction_decision(
     );
     let effective_min_confidence = candidate
         .as_ref()
-        .filter(|candidate| candidate.direction == "UP" && candidate.mode == "structure_edge")
-        .map(|_| {
+        .map(|candidate| {
             config
                 .min_confidence
-                .max(PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY)
+                .max(prediction_candidate_min_confidence(candidate))
         })
         .unwrap_or(config.min_confidence);
     let mut direction = candidate
@@ -5275,15 +5309,12 @@ fn build_prediction_decision(
     }
     let pre_filter_passed = matches!(direction.as_str(), "UP" | "DOWN");
     let pre_calibration_direction = direction.clone();
-    let cycle_start = millis_to_utc(cycle.start_ms)?;
     Ok(PredictionDecision {
         direction,
         confidence,
         predicted_return,
         entry_price: snapshot.latest_price,
         score: model_score,
-        cycle_start,
-        cycle_end: cycle_start + Duration::seconds(DEFAULT_PERIOD_SECONDS as i64),
         signal_cooldown_seconds: config.signal_cooldown_seconds,
         market_source: snapshot.latest_source.clone(),
         market_age_seconds: age_seconds,
@@ -5343,7 +5374,11 @@ fn build_prediction_decision(
                 },
                 "candidate": {
                     "structure_edge_up_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
-                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE
+                    "structure_edge_up_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE,
+                    "structure_edge_down_min_probability": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
+                    "structure_edge_down_min_structure": PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE,
+                    "confirmation_seconds": PREDICTION_CONFIRMATION_SECONDS,
+                    "confirmation_max_adverse_ret": PREDICTION_CONFIRMATION_MAX_ADVERSE_RET
                 },
                 "payout": {
                     "stake_usdt": MIN_EVENT_STAKE,
@@ -5499,27 +5534,59 @@ fn prediction_candidate(
     _ret_5: f64,
     _cycle_ret: f64,
     up_probability: f64,
-    _down_probability: f64,
+    down_probability: f64,
     up_structure: f64,
-    _down_structure: f64,
+    down_structure: f64,
 ) -> Option<PredictionCandidate> {
     if matches!(market_regime, "chaos" | "quiet") {
         return None;
     }
 
-    if up_probability >= PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY
+    let up_ok = up_probability >= PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY
         && up_structure >= PREDICTION_STRUCTURE_EDGE_MIN_UP_STRUCTURE
-    {
-        return Some(PredictionCandidate {
+        && !matches!(market_regime, "trend_down");
+    let down_ok = down_probability >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY
+        && down_structure >= PREDICTION_STRUCTURE_EDGE_MIN_DOWN_STRUCTURE
+        && !matches!(market_regime, "trend_up");
+
+    match (up_ok, down_ok) {
+        (true, true) => {
+            let up_edge = (up_probability - 0.5) * 0.65 + up_structure * 0.35;
+            let down_edge = (down_probability - 0.5) * 0.65 + down_structure * 0.35;
+            if up_edge >= down_edge {
+                Some(PredictionCandidate {
+                    direction: "UP".to_string(),
+                    mode: "structure_edge".to_string(),
+                    rule: format!("{market_regime}_up"),
+                    raw_confidence: up_probability,
+                    structure_score: up_structure,
+                })
+            } else {
+                Some(PredictionCandidate {
+                    direction: "DOWN".to_string(),
+                    mode: "structure_edge".to_string(),
+                    rule: format!("{market_regime}_down"),
+                    raw_confidence: down_probability,
+                    structure_score: down_structure,
+                })
+            }
+        }
+        (true, false) => Some(PredictionCandidate {
             direction: "UP".to_string(),
             mode: "structure_edge".to_string(),
             rule: format!("{market_regime}_up"),
             raw_confidence: up_probability,
             structure_score: up_structure,
-        });
+        }),
+        (false, true) => Some(PredictionCandidate {
+            direction: "DOWN".to_string(),
+            mode: "structure_edge".to_string(),
+            rule: format!("{market_regime}_down"),
+            raw_confidence: down_probability,
+            structure_score: down_structure,
+        }),
+        (false, false) => None,
     }
-
-    None
 }
 
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
@@ -5529,6 +5596,7 @@ fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
         candidate.rule.as_str(),
     ) {
         ("UP", "structure_edge", _) => PREDICTION_STRUCTURE_EDGE_MIN_UP_PROBABILITY,
+        ("DOWN", "structure_edge", _) => PREDICTION_STRUCTURE_EDGE_MIN_DOWN_PROBABILITY,
         _ => PREDICTION_MIN_RAW_CONFIDENCE,
     }
 }
@@ -5599,6 +5667,203 @@ fn prediction_candidate_from_snapshot(snapshot: &serde_json::Value) -> Option<Pr
         raw_confidence,
         structure_score,
     })
+}
+
+async fn clear_pending_prediction_candidate(state: &SharedState) {
+    let mut pending = state.prediction_pending_candidate.write().await;
+    *pending = None;
+}
+
+async fn confirm_prediction_candidate(
+    state: &SharedState,
+    decision: &PredictionDecision,
+) -> PredictionConfirmation {
+    let Some(candidate) = prediction_candidate_from_snapshot(&decision.feature_snapshot) else {
+        clear_pending_prediction_candidate(state).await;
+        return PredictionConfirmation::Rejected("hold no active prediction candidate".to_string());
+    };
+    if candidate.direction != decision.direction {
+        clear_pending_prediction_candidate(state).await;
+        return PredictionConfirmation::Rejected(format!(
+            "hold candidate direction mismatch {} != {}",
+            candidate.direction, decision.direction
+        ));
+    }
+    let min_raw_confidence = prediction_candidate_min_confidence(&candidate);
+    if candidate.raw_confidence < min_raw_confidence {
+        clear_pending_prediction_candidate(state).await;
+        return PredictionConfirmation::Rejected(format!(
+            "hold candidate raw confidence {:.4} < {:.4}",
+            candidate.raw_confidence, min_raw_confidence
+        ));
+    }
+    if let Some(reason) =
+        prediction_candidate_hard_filter_reason(&decision.feature_snapshot, &candidate)
+    {
+        clear_pending_prediction_candidate(state).await;
+        return PredictionConfirmation::Rejected(reason);
+    }
+
+    let now = Utc::now();
+    let mut pending = state.prediction_pending_candidate.write().await;
+    let changed = pending
+        .as_ref()
+        .map(|pending| pending.direction != candidate.direction || pending.rule != candidate.rule)
+        .unwrap_or(true);
+    if changed {
+        *pending = Some(PendingPredictionCandidate {
+            direction: candidate.direction.clone(),
+            rule: candidate.rule.clone(),
+            first_seen_at: now,
+            entry_price: decision.entry_price,
+            raw_confidence: candidate.raw_confidence,
+            structure_score: candidate.structure_score,
+        });
+        return PredictionConfirmation::Waiting(format!(
+            "confirming new candidate {} rule {} 0/{}s raw_confidence {:.4} structure {:.4}",
+            candidate.direction,
+            candidate.rule,
+            PREDICTION_CONFIRMATION_SECONDS,
+            candidate.raw_confidence,
+            candidate.structure_score
+        ));
+    }
+
+    let Some(pending_candidate) = pending.as_mut() else {
+        return PredictionConfirmation::Waiting("confirming candidate".to_string());
+    };
+    pending_candidate.raw_confidence = candidate.raw_confidence;
+    pending_candidate.structure_score = candidate.structure_score;
+
+    let adverse_return = prediction_confirmation_adverse_return(
+        pending_candidate.entry_price,
+        decision.entry_price,
+        candidate.direction.as_str(),
+    );
+    if adverse_return > PREDICTION_CONFIRMATION_MAX_ADVERSE_RET {
+        let message = format!(
+            "hold confirmation adverse {:.6} > {:.6} direction {} rule {}",
+            adverse_return,
+            PREDICTION_CONFIRMATION_MAX_ADVERSE_RET,
+            candidate.direction,
+            candidate.rule
+        );
+        *pending = None;
+        return PredictionConfirmation::Rejected(message);
+    }
+
+    let elapsed_seconds = (now - pending_candidate.first_seen_at).num_seconds();
+    if elapsed_seconds < PREDICTION_CONFIRMATION_SECONDS {
+        return PredictionConfirmation::Waiting(format!(
+            "confirming candidate {} rule {} {}/{}s adverse {:.6} raw_confidence {:.4} structure {:.4}",
+            candidate.direction,
+            candidate.rule,
+            elapsed_seconds.max(0),
+            PREDICTION_CONFIRMATION_SECONDS,
+            adverse_return,
+            candidate.raw_confidence,
+            candidate.structure_score
+        ));
+    }
+
+    *pending = None;
+    PredictionConfirmation::Confirmed
+}
+
+fn prediction_confirmation_adverse_return(
+    initial_price: f64,
+    current_price: f64,
+    direction: &str,
+) -> f64 {
+    if initial_price <= f64::EPSILON || current_price <= f64::EPSILON {
+        return 0.0;
+    }
+    match direction {
+        "UP" => ((initial_price - current_price) / initial_price).max(0.0),
+        "DOWN" => ((current_price - initial_price) / initial_price).max(0.0),
+        _ => 0.0,
+    }
+}
+
+fn prediction_candidate_hard_filter_reason(
+    snapshot: &serde_json::Value,
+    candidate: &PredictionCandidate,
+) -> Option<String> {
+    let boll_pos = prediction_snapshot_f64(snapshot, "shape", "boll_pos");
+    let upper_wick_ratio = prediction_snapshot_f64(snapshot, "structure", "upper_wick_ratio");
+    let lower_wick_ratio = prediction_snapshot_f64(snapshot, "structure", "lower_wick_ratio");
+    let live_ret_1 = prediction_snapshot_f64(snapshot, "returns", "live_ret_1");
+    let live_ret_3 = prediction_snapshot_f64(snapshot, "returns", "live_ret_3");
+    let ret_3 = prediction_snapshot_f64(snapshot, "returns", "ret_3");
+    let cycle_ret = prediction_snapshot_f64(snapshot, "cycle", "return_from_open");
+    let noisy_wick = upper_wick_ratio >= 0.20 || lower_wick_ratio >= 0.20;
+
+    match candidate.direction.as_str() {
+        "UP" => {
+            let high_chase = boll_pos >= 0.90
+                && (candidate.rule.contains("impulse") || cycle_ret >= 0.0010 || ret_3 >= 0.0010);
+            let weak_continuation = live_ret_1 < 0.00010 || live_ret_3 < 0.00015;
+            if high_chase && weak_continuation && noisy_wick {
+                return Some(format!(
+                    "hold high chase weak continuation boll_pos {:.4} live_ret_1 {:.6} live_ret_3 {:.6} wick u {:.3} l {:.3}",
+                    boll_pos,
+                    live_ret_1,
+                    live_ret_3,
+                    upper_wick_ratio,
+                    lower_wick_ratio
+                ));
+            }
+            if high_chase && live_ret_1 <= 0.0 {
+                return Some(format!(
+                    "hold high chase no live continuation boll_pos {:.4} live_ret_1 {:.6}",
+                    boll_pos, live_ret_1
+                ));
+            }
+            if boll_pos <= 0.10 && live_ret_1 < 0.00005 && lower_wick_ratio < 0.18 {
+                return Some(format!(
+                    "hold bottom reversal not confirmed boll_pos {:.4} live_ret_1 {:.6} lower_wick {:.3}",
+                    boll_pos, live_ret_1, lower_wick_ratio
+                ));
+            }
+        }
+        "DOWN" => {
+            let low_chase = boll_pos <= 0.10
+                && (candidate.rule.contains("impulse") || cycle_ret <= -0.0010 || ret_3 <= -0.0010);
+            let weak_continuation = live_ret_1 > -0.00010 || live_ret_3 > -0.00015;
+            if low_chase && weak_continuation && noisy_wick {
+                return Some(format!(
+                    "hold low chase weak continuation boll_pos {:.4} live_ret_1 {:.6} live_ret_3 {:.6} wick u {:.3} l {:.3}",
+                    boll_pos,
+                    live_ret_1,
+                    live_ret_3,
+                    upper_wick_ratio,
+                    lower_wick_ratio
+                ));
+            }
+            if low_chase && live_ret_1 >= 0.0 {
+                return Some(format!(
+                    "hold low chase no live continuation boll_pos {:.4} live_ret_1 {:.6}",
+                    boll_pos, live_ret_1
+                ));
+            }
+            if boll_pos >= 0.90 && live_ret_1 > -0.00005 && upper_wick_ratio < 0.18 {
+                return Some(format!(
+                    "hold top reversal not confirmed boll_pos {:.4} live_ret_1 {:.6} upper_wick {:.3}",
+                    boll_pos, live_ret_1, upper_wick_ratio
+                ));
+            }
+        }
+        _ => {}
+    }
+    None
+}
+
+fn prediction_snapshot_f64(snapshot: &serde_json::Value, section: &str, key: &str) -> f64 {
+    snapshot
+        .get(section)
+        .and_then(|section| section.get(key))
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
 }
 
 fn merge_prediction_calibration(
@@ -9651,20 +9916,7 @@ async fn db_prediction_calibration(
     let allowed = sample_count >= i64::from(config.calibration_min_samples)
         && win_rate >= effective_min_win_rate
         && ev_usdt >= config.calibration_min_ev_usdt;
-    let cold_start_allowed = candidate.direction == "UP"
-        && candidate.mode == "structure_edge"
-        && sample_count < i64::from(config.calibration_min_samples);
-    let allowed = allowed || cold_start_allowed;
-    let reason = if cold_start_allowed {
-        format!(
-            "calibration collecting allowed mode {} rule {} direction {} samples {}/{}",
-            candidate.mode,
-            candidate.rule,
-            candidate.direction,
-            sample_count,
-            config.calibration_min_samples
-        )
-    } else if sample_count < i64::from(config.calibration_min_samples) {
+    let reason = if sample_count < i64::from(config.calibration_min_samples) {
         format!(
             "hold calibration warmup mode {} rule {} direction {} samples {}/{}",
             candidate.mode,
