@@ -94,9 +94,9 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v8";
-const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 180;
-const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 30;
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v9";
+const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 720;
+const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 10;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT: f64 = 0.01;
 const DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS: i64 = 60;
@@ -105,17 +105,22 @@ const PREDICTION_MEAN_REVERSION_DOWN_MIN_STRUCTURE: f64 = 0.82;
 const PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY: f64 = 0.63;
 const PREDICTION_MEAN_REVERSION_UP_MIN_STRUCTURE: f64 = 0.84;
 const PREDICTION_TREND_DOWN_MIN_PROBABILITY: f64 = 0.62;
-const PREDICTION_TREND_DOWN_MIN_STRUCTURE: f64 = 0.86;
+const PREDICTION_TREND_DOWN_MIN_STRUCTURE: f64 = 0.98;
 const PREDICTION_TREND_UP_MIN_PROBABILITY: f64 = 0.64;
-const PREDICTION_TREND_UP_MIN_STRUCTURE: f64 = 0.84;
+const PREDICTION_TREND_UP_MIN_STRUCTURE: f64 = 0.94;
 const PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY: f64 = 0.63;
-const PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE: f64 = 0.85;
+const PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE: f64 = 0.96;
 const PREDICTION_IMPULSE_UP_MIN_PROBABILITY: f64 = 0.64;
-const PREDICTION_IMPULSE_UP_MIN_STRUCTURE: f64 = 0.82;
+const PREDICTION_IMPULSE_UP_MIN_STRUCTURE: f64 = 0.94;
 const PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE: f64 = 0.62;
-const PREDICTION_REVERSAL_UP_MIN_STRUCTURE: f64 = 0.35;
+const PREDICTION_REVERSAL_UP_MIN_STRUCTURE: f64 = 0.50;
 const PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE: f64 = 0.62;
-const PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE: f64 = 0.35;
+const PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE: f64 = 0.55;
+const PREDICTION_REVERSAL_MIN_WICK: f64 = 0.24;
+const PREDICTION_TREND_PULLBACK_MIN_WICK: f64 = 0.35;
+const PREDICTION_IMPULSE_CONFIRM_MIN_WICK: f64 = 0.25;
+const PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS: f64 = 0.40;
+const PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS: f64 = 0.60;
 const PREDICTION_CONFIRMATION_SECONDS: i64 = 8;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
@@ -5277,6 +5282,9 @@ fn build_prediction_decision(
         down_probability,
         up_structure,
         down_structure,
+        upper_wick_ratio,
+        lower_wick_ratio,
+        boll_pos,
     );
     let effective_min_confidence = candidate
         .as_ref()
@@ -5400,6 +5408,11 @@ fn build_prediction_decision(
                     "reversal_up_min_structure": PREDICTION_REVERSAL_UP_MIN_STRUCTURE,
                     "reversal_down_min_setup_confidence": PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
                     "reversal_down_min_structure": PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE,
+                    "reversal_min_wick": PREDICTION_REVERSAL_MIN_WICK,
+                    "trend_pullback_min_wick": PREDICTION_TREND_PULLBACK_MIN_WICK,
+                    "impulse_confirm_min_wick": PREDICTION_IMPULSE_CONFIRM_MIN_WICK,
+                    "mean_reversion_down_min_boll_pos": PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS,
+                    "mean_reversion_up_max_boll_pos": PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS,
                     "confirmation_seconds": PREDICTION_CONFIRMATION_SECONDS,
                     "confirmation_max_adverse_ret": PREDICTION_CONFIRMATION_MAX_ADVERSE_RET
                 },
@@ -5576,12 +5589,16 @@ fn prediction_candidate(
     down_probability: f64,
     up_structure: f64,
     down_structure: f64,
+    upper_wick_ratio: f64,
+    lower_wick_ratio: f64,
+    boll_pos: f64,
 ) -> Option<PredictionCandidate> {
     if market_regime == "impulse"
         && lower_extreme >= 0.70
         && cycle_ret <= -0.0015
         && live_ret_3 <= -0.0008
         && live_ret_1 >= -0.00010
+        && lower_wick_ratio >= PREDICTION_REVERSAL_MIN_WICK
         && up_structure >= PREDICTION_REVERSAL_UP_MIN_STRUCTURE
     {
         let setup_confidence = up_probability.max(0.62);
@@ -5599,6 +5616,7 @@ fn prediction_candidate(
         && cycle_ret >= 0.0015
         && live_ret_3 >= 0.0008
         && live_ret_1 <= 0.00010
+        && upper_wick_ratio >= PREDICTION_REVERSAL_MIN_WICK
         && down_structure >= PREDICTION_REVERSAL_DOWN_MIN_STRUCTURE
     {
         let setup_confidence = down_probability.max(0.62);
@@ -5617,32 +5635,45 @@ fn prediction_candidate(
                 && down_structure >= PREDICTION_MEAN_REVERSION_DOWN_MIN_STRUCTURE
                 && live_ret_1 <= 0.0 =>
         {
-            Some(make_prediction_candidate(
-                "DOWN",
-                "structure_edge",
-                "mean_reversion_down",
-                down_probability,
-                down_structure,
-            ))
+            if boll_pos >= PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS
+                || upper_wick_ratio >= PREDICTION_TREND_PULLBACK_MIN_WICK
+            {
+                Some(make_prediction_candidate(
+                    "DOWN",
+                    "structure_edge",
+                    "mean_reversion_down",
+                    down_probability,
+                    down_structure,
+                ))
+            } else {
+                None
+            }
         }
         "mean_reversion"
             if up_probability >= PREDICTION_MEAN_REVERSION_UP_MIN_PROBABILITY
                 && up_structure >= PREDICTION_MEAN_REVERSION_UP_MIN_STRUCTURE
                 && live_ret_1 >= 0.0 =>
         {
-            Some(make_prediction_candidate(
-                "UP",
-                "structure_edge",
-                "mean_reversion_up",
-                up_probability,
-                up_structure,
-            ))
+            if boll_pos <= PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS
+                || lower_wick_ratio >= PREDICTION_TREND_PULLBACK_MIN_WICK
+            {
+                Some(make_prediction_candidate(
+                    "UP",
+                    "structure_edge",
+                    "mean_reversion_up",
+                    up_probability,
+                    up_structure,
+                ))
+            } else {
+                None
+            }
         }
         "trend_down"
             if down_probability >= PREDICTION_TREND_DOWN_MIN_PROBABILITY
                 && down_structure >= PREDICTION_TREND_DOWN_MIN_STRUCTURE
                 && live_ret_3 <= 0.0
-                && lower_extreme < 0.75 =>
+                && lower_extreme < 0.75
+                && upper_wick_ratio >= PREDICTION_TREND_PULLBACK_MIN_WICK =>
         {
             Some(make_prediction_candidate(
                 "DOWN",
@@ -5656,7 +5687,8 @@ fn prediction_candidate(
             if up_probability >= PREDICTION_TREND_UP_MIN_PROBABILITY
                 && up_structure >= PREDICTION_TREND_UP_MIN_STRUCTURE
                 && live_ret_3 >= 0.0
-                && upper_extreme < 0.75 =>
+                && upper_extreme < 0.75
+                && lower_wick_ratio >= PREDICTION_TREND_PULLBACK_MIN_WICK =>
         {
             Some(make_prediction_candidate(
                 "UP",
@@ -5669,9 +5701,12 @@ fn prediction_candidate(
         "impulse"
             if down_probability >= PREDICTION_IMPULSE_DOWN_MIN_PROBABILITY
                 && down_structure >= PREDICTION_IMPULSE_DOWN_MIN_STRUCTURE
-                && lower_extreme < 0.60
+                && lower_extreme < 0.35
+                && boll_pos >= 0.18
                 && live_ret_1 <= -0.00010
-                && ret_3 <= -0.00025 =>
+                && live_ret_3 <= -0.00025
+                && ret_3 <= -0.00025
+                && upper_wick_ratio >= PREDICTION_IMPULSE_CONFIRM_MIN_WICK =>
         {
             Some(make_prediction_candidate(
                 "DOWN",
@@ -5684,9 +5719,12 @@ fn prediction_candidate(
         "impulse"
             if up_probability >= PREDICTION_IMPULSE_UP_MIN_PROBABILITY
                 && up_structure >= PREDICTION_IMPULSE_UP_MIN_STRUCTURE
-                && upper_extreme < 0.60
+                && upper_extreme < 0.35
+                && boll_pos <= 0.82
                 && live_ret_1 >= 0.00010
-                && ret_3 >= 0.00025 =>
+                && live_ret_3 >= 0.00025
+                && ret_3 >= 0.00025
+                && lower_wick_ratio >= PREDICTION_IMPULSE_CONFIRM_MIN_WICK =>
         {
             Some(make_prediction_candidate(
                 "UP",
@@ -7689,10 +7727,10 @@ fn validate_prediction_settings(settings: &PredictionSettings) -> Result<(), App
             "calibration_lookback_minutes must be between 10 and 1440",
         ));
     }
-    if settings.calibration_min_samples < 30 || settings.calibration_min_samples > 300 {
+    if settings.calibration_min_samples < 10 || settings.calibration_min_samples > 300 {
         return Err(AppError::bad_request(
             "PREDICTION_SETTING_OUT_OF_RANGE",
-            "calibration_min_samples must be between 30 and 300",
+            "calibration_min_samples must be between 10 and 300",
         ));
     }
     if settings.calibration_min_win_rate < dec!(0.60)
