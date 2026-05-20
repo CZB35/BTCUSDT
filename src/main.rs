@@ -94,7 +94,7 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v9";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 720;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 10;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
@@ -121,6 +121,8 @@ const PREDICTION_TREND_PULLBACK_MIN_WICK: f64 = 0.35;
 const PREDICTION_IMPULSE_CONFIRM_MIN_WICK: f64 = 0.25;
 const PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS: f64 = 0.40;
 const PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS: f64 = 0.60;
+const PREDICTION_UP_FALLING_KNIFE_MAX_LOWER_WICK: f64 = 0.30;
+const PREDICTION_UP_FALLING_KNIFE_MIN_BODY_RATIO: f64 = 0.66;
 const PREDICTION_CONFIRMATION_SECONDS: i64 = 8;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
@@ -5413,6 +5415,8 @@ fn build_prediction_decision(
                     "impulse_confirm_min_wick": PREDICTION_IMPULSE_CONFIRM_MIN_WICK,
                     "mean_reversion_down_min_boll_pos": PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS,
                     "mean_reversion_up_max_boll_pos": PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS,
+                    "up_falling_knife_min_body_ratio": PREDICTION_UP_FALLING_KNIFE_MIN_BODY_RATIO,
+                    "up_falling_knife_max_lower_wick": PREDICTION_UP_FALLING_KNIFE_MAX_LOWER_WICK,
                     "confirmation_seconds": PREDICTION_CONFIRMATION_SECONDS,
                     "confirmation_max_adverse_ret": PREDICTION_CONFIRMATION_MAX_ADVERSE_RET
                 },
@@ -5445,6 +5449,7 @@ fn build_prediction_decision(
             "structure": {
                 "up_score": up_structure,
                 "down_score": down_structure,
+                "body_ratio": body_ratio,
                 "close_position": close_position,
                 "upper_wick_ratio": upper_wick_ratio,
                 "lower_wick_ratio": lower_wick_ratio
@@ -5943,6 +5948,7 @@ fn prediction_candidate_hard_filter_reason(
     let boll_pos = prediction_snapshot_f64(snapshot, "shape", "boll_pos");
     let upper_wick_ratio = prediction_snapshot_f64(snapshot, "structure", "upper_wick_ratio");
     let lower_wick_ratio = prediction_snapshot_f64(snapshot, "structure", "lower_wick_ratio");
+    let body_ratio = prediction_snapshot_f64(snapshot, "structure", "body_ratio");
     let live_ret_1 = prediction_snapshot_f64(snapshot, "returns", "live_ret_1");
     let live_ret_3 = prediction_snapshot_f64(snapshot, "returns", "live_ret_3");
     let ret_3 = prediction_snapshot_f64(snapshot, "returns", "ret_3");
@@ -5951,6 +5957,14 @@ fn prediction_candidate_hard_filter_reason(
 
     match candidate.direction.as_str() {
         "UP" => {
+            if body_ratio > PREDICTION_UP_FALLING_KNIFE_MIN_BODY_RATIO
+                && lower_wick_ratio < PREDICTION_UP_FALLING_KNIFE_MAX_LOWER_WICK
+            {
+                return Some(format!(
+                    "hold up falling knife body {:.3} lower_wick {:.3} live_ret_1 {:.6}",
+                    body_ratio, lower_wick_ratio, live_ret_1
+                ));
+            }
             let high_chase = boll_pos >= 0.90
                 && (candidate.rule.contains("impulse") || cycle_ret >= 0.0010 || ret_3 >= 0.0010);
             let weak_continuation = live_ret_1 < 0.00010 || live_ret_3 < 0.00015;
@@ -6015,6 +6029,115 @@ fn prediction_snapshot_f64(snapshot: &serde_json::Value, section: &str, key: &st
         .and_then(|section| section.get(key))
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_candidate(direction: &str) -> PredictionCandidate {
+        make_prediction_candidate(direction, "structure_edge", "test_rule", 0.70, 1.0)
+    }
+
+    #[test]
+    fn up_falling_knife_filter_rejects_solid_drop_without_lower_wick() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.72,
+                "upper_wick_ratio": 0.08,
+                "lower_wick_ratio": 0.12
+            },
+            "returns": {
+                "live_ret_1": -0.00001,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 }
+        });
+
+        let reason = prediction_candidate_hard_filter_reason(&snapshot, &test_candidate("UP"));
+
+        assert!(reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold up falling knife"));
+    }
+
+    #[test]
+    fn up_falling_knife_filter_allows_lower_wick_confirmation() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.72,
+                "upper_wick_ratio": 0.08,
+                "lower_wick_ratio": 0.30
+            },
+            "returns": {
+                "live_ret_1": -0.00001,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 }
+        });
+
+        let reason = prediction_candidate_hard_filter_reason(&snapshot, &test_candidate("UP"));
+
+        assert!(!reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold up falling knife"));
+    }
+
+    #[test]
+    fn up_falling_knife_filter_rejects_even_with_small_live_bounce() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.72,
+                "upper_wick_ratio": 0.08,
+                "lower_wick_ratio": 0.12
+            },
+            "returns": {
+                "live_ret_1": 0.00002,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 }
+        });
+
+        let reason = prediction_candidate_hard_filter_reason(&snapshot, &test_candidate("UP"));
+
+        assert!(reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold up falling knife"));
+    }
+
+    #[test]
+    fn up_falling_knife_filter_does_not_reject_down_candidates() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.72,
+                "upper_wick_ratio": 0.08,
+                "lower_wick_ratio": 0.12
+            },
+            "returns": {
+                "live_ret_1": -0.00001,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 }
+        });
+
+        let reason = prediction_candidate_hard_filter_reason(&snapshot, &test_candidate("DOWN"));
+
+        assert!(!reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold up falling knife"));
+    }
 }
 
 fn merge_prediction_calibration(
