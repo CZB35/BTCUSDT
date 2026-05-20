@@ -6910,7 +6910,6 @@ fn merge_prediction_calibration(
     } else {
         let existing_reason = decision.reason.clone();
         decision.direction = "HOLD".to_string();
-        decision.confidence = 0.0;
         decision.reason = if existing_reason.starts_with("hold ") {
             existing_reason
         } else {

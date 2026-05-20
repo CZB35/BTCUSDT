@@ -1258,7 +1258,7 @@ function PredictionPage({
           </div>
         </div>
         <DataTable
-          columns={["时间", "方向", "价格", "模型分", "涨概率", "涨结构", "有效门槛", "候选", "原因"]}
+          columns={["时间", "方向", "价格", "模型分", "涨概率", "跌概率", "波动概率", "方向门槛", "候选", "原因"]}
           pageSize={20}
           rows={observations.map((row) => ({
             id: row.id,
@@ -1270,8 +1270,9 @@ function PredictionPage({
                 row.entry_price || "-",
                 metrics.modelScore || row.score || "-",
                 metrics.upProbability,
-                metrics.upStructure,
-                metrics.effectiveMinConfidence,
+                metrics.downProbability,
+                metrics.moveProbability,
+                metrics.directionThreshold,
                 metrics.candidateRule,
                 row.reason || "-"
               ];
@@ -1292,6 +1293,9 @@ function PredictionPage({
                 概率权重: metrics.probabilityWeight,
                 上涨概率: metrics.upProbability,
                 下跌概率: metrics.downProbability,
+                波动概率: metrics.moveProbability,
+                波动门槛: metrics.moveThreshold,
+                方向门槛: metrics.directionThreshold,
                 上涨结构: metrics.upStructure,
                 下跌结构: metrics.downStructure,
                 候选模式: metrics.candidateMode,
@@ -2158,10 +2162,23 @@ function predictionMetrics(snapshot: Record<string, unknown>) {
     probabilityScore: formatMetric(snapshotValue(snapshot, ["scores", "probability_score"])),
     technicalWeight: percentValue(snapshotValue(snapshot, ["scores", "technical_weight"])),
     probabilityWeight: percentValue(snapshotValue(snapshot, ["scores", "probability_weight"])),
-    upProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "up_probability"])),
-    downProbability: percentValue(snapshotValue(snapshot, ["expiry_model", "down_probability"])),
-    upStructure: percentValue(snapshotValue(snapshot, ["structure", "up_score"])),
-    downStructure: percentValue(snapshotValue(snapshot, ["structure", "down_score"])),
+    upProbability: percentValue(
+      snapshotValue(snapshot, ["ml", "up_probability"]) ?? snapshotValue(snapshot, ["expiry_model", "up_probability"])
+    ),
+    downProbability: percentValue(
+      snapshotValue(snapshot, ["ml", "down_probability"]) ?? snapshotValue(snapshot, ["expiry_model", "down_probability"])
+    ),
+    moveProbability: percentValue(
+      snapshotValue(snapshot, ["ml", "move_probability"]) ?? snapshotValue(snapshot, ["scores", "move_probability"])
+    ),
+    moveThreshold: percentValue(snapshotValue(snapshot, ["ml", "move_threshold"])),
+    directionThreshold: percentValue(snapshotValue(snapshot, ["ml", "direction_threshold"])),
+    upStructure: percentValue(
+      snapshotValue(snapshot, ["structure", "up_score"]) ?? snapshotValue(snapshot, ["structure", "lower_wick_ratio"])
+    ),
+    downStructure: percentValue(
+      snapshotValue(snapshot, ["structure", "down_score"]) ?? snapshotValue(snapshot, ["structure", "upper_wick_ratio"])
+    ),
     candidateMode: String(snapshotValue(snapshot, ["decision", "candidate_mode"]) || "-"),
     candidateRule: String(snapshotValue(snapshot, ["decision", "candidate_rule"]) || "-"),
     effectiveMinConfidence: percentValue(snapshotValue(snapshot, ["config", "effective_min_confidence"])),
