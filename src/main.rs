@@ -94,7 +94,9 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v1";
+const FALLBACK_PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
+const DEFAULT_EVENT_ML_MODEL_PATH: &str = "models/event_edge_ml_v1.json";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 720;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 10;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
@@ -123,10 +125,10 @@ const PREDICTION_MEAN_REVERSION_DOWN_MIN_BOLL_POS: f64 = 0.40;
 const PREDICTION_MEAN_REVERSION_UP_MAX_BOLL_POS: f64 = 0.60;
 const PREDICTION_UP_FALLING_KNIFE_MAX_LOWER_WICK: f64 = 0.30;
 const PREDICTION_UP_FALLING_KNIFE_MIN_BODY_RATIO: f64 = 0.66;
-const PREDICTION_CONFIRMATION_SECONDS: i64 = 8;
+const PREDICTION_CONFIRMATION_SECONDS: i64 = 5;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
-const PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
+const EVENT_ML_WARM_SECONDS: usize = 3600;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -567,6 +569,12 @@ fn start_prediction_loop(state: &SharedState) {
                         }
                     }
                     if decision.direction == "UP" || decision.direction == "DOWN" {
+                        if prediction_decision_uses_ml(&decision) {
+                            if let Err(err) = emit_prediction_signal(&state, &decision).await {
+                                mark_prediction_error(&state, err.message).await;
+                            }
+                            continue;
+                        }
                         match confirm_prediction_candidate(&state, &decision).await {
                             PredictionConfirmation::Waiting(message) => {
                                 let mut runtime = state.prediction_runtime.write().await;
@@ -755,6 +763,7 @@ struct AppState {
     reservations: RwLock<HashMap<Uuid, SignalReservation>>,
     exchange_workers: RwLock<HashMap<Uuid, JoinHandle<()>>>,
     market_data: RwLock<MarketDataState>,
+    event_ml_model: Option<Arc<EventMlModel>>,
     prediction_runtime: RwLock<PredictionRuntimeStatus>,
     prediction_last_emitted_at: RwLock<Option<DateTime<Utc>>>,
     prediction_pending_candidate: RwLock<Option<PendingPredictionCandidate>>,
@@ -793,6 +802,7 @@ impl AppState {
             reservations: RwLock::new(HashMap::new()),
             exchange_workers: RwLock::new(HashMap::new()),
             market_data: RwLock::new(MarketDataState::default()),
+            event_ml_model: load_event_ml_model().map(Arc::new),
             prediction_runtime: RwLock::new(PredictionRuntimeStatus::default()),
             prediction_last_emitted_at: RwLock::new(None),
             prediction_pending_candidate: RwLock::new(None),
@@ -1263,6 +1273,61 @@ struct PredictionDecision {
     feature_snapshot: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlModel {
+    version: String,
+    symbol: String,
+    period_seconds: i32,
+    thresholds: EventMlThresholds,
+    execution_filter: EventMlExecutionFilter,
+    feature_names: Vec<String>,
+    models: EventMlModels,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlThresholds {
+    move_probability: f64,
+    direction_probability: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlExecutionFilter {
+    up_falling_knife_min_body_share_60: f64,
+    up_falling_knife_max_lower_wick_share_60: f64,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlModels {
+    #[serde(rename = "move")]
+    move_model: EventMlForest,
+    direction: EventMlForest,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlForest {
+    trees: Vec<EventMlTree>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct EventMlTree {
+    children_left: Vec<i32>,
+    children_right: Vec<i32>,
+    feature: Vec<i32>,
+    threshold: Vec<f64>,
+    positive_prob: Vec<f64>,
+}
+
+#[derive(Clone, Debug)]
+struct EventMlPrediction {
+    direction: String,
+    move_probability: f64,
+    up_probability: f64,
+    confidence: f64,
+    score: f64,
+    filtered_reason: Option<String>,
+    features: serde_json::Value,
+}
+
 #[derive(Clone, Debug)]
 struct PredictionCandidate {
     direction: String,
@@ -1325,6 +1390,8 @@ impl PredictionCalibration {
 struct MarketDataState {
     candles: BTreeMap<i64, MarketCandle>,
     price_points: BTreeMap<i64, f64>,
+    second_bars: BTreeMap<i64, MarketSecondBar>,
+    last_second_close: Option<f64>,
     latest_price: Option<f64>,
     latest_price_time_ms: Option<i64>,
     latest_source: Option<String>,
@@ -1337,10 +1404,23 @@ struct MarketDataState {
     preheated_at: Option<DateTime<Utc>>,
 }
 
+#[derive(Clone, Debug)]
+struct MarketSecondBar {
+    second_ms: i64,
+    high: f64,
+    low: f64,
+    close: f64,
+    volume: f64,
+    taker_buy_volume: f64,
+    taker_sell_volume: f64,
+    trade_count: i32,
+}
+
 #[derive(Clone)]
 struct MarketDataSnapshot {
     candles: Vec<MarketCandle>,
     price_points: Vec<(i64, f64)>,
+    second_bars: Vec<MarketSecondBar>,
     latest_price: f64,
     latest_price_time_ms: i64,
     latest_source: String,
@@ -1370,9 +1450,18 @@ impl MarketDataState {
             .map(|(time_ms, price)| (*time_ms, *price))
             .collect::<Vec<_>>();
         price_points.reverse();
+        let mut second_bars = self
+            .second_bars
+            .values()
+            .rev()
+            .take(EVENT_ML_WARM_SECONDS + 700)
+            .cloned()
+            .collect::<Vec<_>>();
+        second_bars.reverse();
         Some(MarketDataSnapshot {
             candles,
             price_points,
+            second_bars,
             latest_price,
             latest_price_time_ms,
             latest_source: self
@@ -1397,8 +1486,16 @@ struct BinanceCombinedStreamMessage {
 struct BinanceAggTradeStream {
     #[serde(rename = "p")]
     price: String,
+    #[serde(rename = "q")]
+    quantity: String,
+    #[serde(rename = "f")]
+    first_trade_id: i64,
+    #[serde(rename = "l")]
+    last_trade_id: i64,
     #[serde(rename = "T")]
     trade_time_ms: i64,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
 }
 
 #[derive(Deserialize)]
@@ -4873,7 +4970,7 @@ async fn apply_market_ws_message(
     if stream.contains("@aggTrade") {
         let trade: BinanceAggTradeStream = serde_json::from_value(combined.data)
             .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
-        update_market_aux_price(state, trade.price, Some(trade.trade_time_ms), "aggTrade").await?;
+        update_market_agg_trade(state, trade).await?;
     } else if stream.contains("@markPrice") {
         let mark: BinanceMarkPriceStream = serde_json::from_value(combined.data)
             .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
@@ -4933,6 +5030,52 @@ async fn update_market_index_price(
     Ok(())
 }
 
+async fn update_market_agg_trade(
+    state: &SharedState,
+    trade: BinanceAggTradeStream,
+) -> Result<(), AppError> {
+    let price = parse_market_f64(&trade.price)?;
+    let quantity = parse_market_f64(&trade.quantity)?;
+    let second_ms = trade.trade_time_ms - trade.trade_time_ms.rem_euclid(1_000);
+    let trade_count = (trade.last_trade_id - trade.first_trade_id + 1).max(1) as i32;
+    let mut market = state.market_data.write().await;
+    fill_missing_second_bars(&mut market, second_ms);
+    let bar = market
+        .second_bars
+        .entry(second_ms)
+        .or_insert_with(|| MarketSecondBar {
+            second_ms,
+            high: price,
+            low: price,
+            close: price,
+            volume: 0.0,
+            taker_buy_volume: 0.0,
+            taker_sell_volume: 0.0,
+            trade_count: 0,
+        });
+    bar.high = bar.high.max(price);
+    bar.low = bar.low.min(price);
+    bar.close = price;
+    bar.volume += quantity;
+    if trade.is_buyer_maker {
+        bar.taker_sell_volume += quantity;
+    } else {
+        bar.taker_buy_volume += quantity;
+    }
+    bar.trade_count += trade_count;
+    market.last_second_close = Some(price);
+    market.latest_trade_price = Some(price);
+    if market.latest_price.is_none() {
+        market.latest_price = Some(price);
+        market.latest_price_time_ms = Some(trade.trade_time_ms);
+        market.latest_source = Some("aggTrade".to_string());
+    }
+    market.last_message_at = Some(Utc::now());
+    market.last_error = None;
+    trim_market_second_bars(&mut market, EVENT_ML_WARM_SECONDS + 1200);
+    Ok(())
+}
+
 async fn update_market_aux_price(
     state: &SharedState,
     price: String,
@@ -4979,6 +5122,50 @@ fn trim_market_price_points(market: &mut MarketDataState, max_len: usize) {
     }
 }
 
+fn trim_market_second_bars(market: &mut MarketDataState, max_len: usize) {
+    while market.second_bars.len() > max_len.max(EVENT_ML_WARM_SECONDS) {
+        let Some(first) = market.second_bars.keys().next().copied() else {
+            break;
+        };
+        market.second_bars.remove(&first);
+    }
+}
+
+fn fill_missing_second_bars(market: &mut MarketDataState, current_second_ms: i64) {
+    let Some(last_second_ms) = market.second_bars.keys().next_back().copied() else {
+        return;
+    };
+    if current_second_ms <= last_second_ms + 1_000 {
+        return;
+    }
+    let Some(mut price) = market.last_second_close else {
+        return;
+    };
+    let max_fill = 300;
+    let mut second_ms = last_second_ms + 1_000;
+    let mut filled = 0;
+    while second_ms < current_second_ms && filled < max_fill {
+        if let Some(last) = market.second_bars.get(&(second_ms - 1_000)) {
+            price = last.close;
+        }
+        market.second_bars.insert(
+            second_ms,
+            MarketSecondBar {
+                second_ms,
+                high: price,
+                low: price,
+                close: price,
+                volume: 0.0,
+                taker_buy_volume: 0.0,
+                taker_sell_volume: 0.0,
+                trade_count: 0,
+            },
+        );
+        second_ms += 1_000;
+        filled += 1;
+    }
+}
+
 fn parse_market_f64(value: &str) -> Result<f64, AppError> {
     value
         .parse::<f64>()
@@ -5004,7 +5191,170 @@ async fn evaluate_prediction(
     .ok_or_else(|| {
         AppError::bad_request("PREDICTION_DATA_INSUFFICIENT", "market feed warming up")
     })?;
+    if let Some(model) = state.event_ml_model.as_ref() {
+        return Ok(build_event_ml_prediction_decision(&snapshot, config, model)
+            .unwrap_or_else(|| build_event_ml_warmup_decision(&snapshot, config, model)));
+    }
     build_prediction_decision(&snapshot, config)
+}
+
+fn build_event_ml_warmup_decision(
+    snapshot: &MarketDataSnapshot,
+    config: &PredictionConfig,
+    model: &EventMlModel,
+) -> PredictionDecision {
+    PredictionDecision {
+        direction: "HOLD".to_string(),
+        confidence: 0.0,
+        predicted_return: 0.0,
+        entry_price: snapshot.latest_price,
+        score: 0.0,
+        signal_cooldown_seconds: config.signal_cooldown_seconds,
+        market_source: "event_ml_aggtrade_1s".to_string(),
+        market_age_seconds: 0,
+        market_candles: snapshot.second_bars.len(),
+        reason: format!(
+            "hold ml warming up second_bars {}/{}",
+            snapshot.second_bars.len(),
+            EVENT_ML_WARM_SECONDS + 1
+        ),
+        feature_snapshot: json!({
+            "market": {
+                "source": "aggTrade_1s",
+                "second_bars": snapshot.second_bars.len()
+            },
+            "config": {
+                "model_version": model.version,
+                "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
+                "interval_seconds": config.interval_seconds,
+                "signal_cooldown_seconds": config.signal_cooldown_seconds
+            },
+            "ml": {
+                "model_version": model.version,
+                "symbol": model.symbol,
+                "period_seconds": model.period_seconds,
+                "feature_count": model.feature_names.len(),
+                "warm_seconds": EVENT_ML_WARM_SECONDS
+            },
+            "scores": {
+                "model_score": 0.0,
+                "raw_confidence": 0.0
+            },
+            "decision": {
+                "model_version": model.version,
+                "candidate_direction": null,
+                "candidate_mode": "ml_extra_trees",
+                "candidate_rule": "two_stage_extra_trees",
+                "pre_filter_passed": false,
+                "pre_calibration_direction": "HOLD",
+                "calibration_required": false
+            }
+        }),
+    }
+}
+
+fn build_event_ml_prediction_decision(
+    snapshot: &MarketDataSnapshot,
+    config: &PredictionConfig,
+    model: &EventMlModel,
+) -> Option<PredictionDecision> {
+    let prediction = event_ml_predict(model, &snapshot.second_bars)?;
+    let latest = snapshot.second_bars.last()?;
+    let price_time = millis_to_utc(latest.second_ms).ok()?;
+    let age_seconds = (Utc::now() - price_time).num_seconds();
+    let mut direction = prediction.direction.clone();
+    let mut reason = if let Some(reason) = prediction.filtered_reason.clone() {
+        reason
+    } else if direction == "UP" || direction == "DOWN" {
+        format!(
+            "ml send {} move_prob {:.4} up_prob {:.4} confidence {:.4}",
+            direction,
+            prediction.move_probability,
+            prediction.up_probability,
+            prediction.confidence
+        )
+    } else {
+        format!(
+            "ml hold move_prob {:.4} < {:.4} or dir up_prob {:.4} threshold {:.4}",
+            prediction.move_probability,
+            model.thresholds.move_probability,
+            prediction.up_probability,
+            model.thresholds.direction_probability
+        )
+    };
+    if age_seconds > config.stale_seconds {
+        direction = "HOLD".to_string();
+        reason = format!("hold ml stale data age {age_seconds}s");
+    }
+    let confidence = if direction == "DOWN" {
+        1.0 - prediction.up_probability
+    } else if direction == "UP" {
+        prediction.up_probability
+    } else {
+        prediction.confidence
+    };
+    let predicted_return = clamp((prediction.up_probability - 0.5) / 500.0, -0.003, 0.003);
+    Some(PredictionDecision {
+        direction: direction.clone(),
+        confidence,
+        predicted_return,
+        entry_price: latest.close,
+        score: prediction.score,
+        signal_cooldown_seconds: config.signal_cooldown_seconds,
+        market_source: "event_ml_aggtrade_1s".to_string(),
+        market_age_seconds: age_seconds,
+        market_candles: snapshot.second_bars.len(),
+        reason,
+        feature_snapshot: json!({
+            "market": {
+                "source": "aggTrade_1s",
+                "latest_price_time_ms": latest.second_ms,
+                "age_seconds": age_seconds,
+                "second_bars": snapshot.second_bars.len()
+            },
+            "config": {
+                "model_version": model.version,
+                "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
+                "interval_seconds": config.interval_seconds,
+                "stale_seconds": config.stale_seconds,
+                "signal_cooldown_seconds": config.signal_cooldown_seconds
+            },
+            "ml": {
+                "model_version": model.version,
+                "symbol": model.symbol,
+                "period_seconds": model.period_seconds,
+                "move_probability": prediction.move_probability,
+                "up_probability": prediction.up_probability,
+                "down_probability": 1.0 - prediction.up_probability,
+                "move_threshold": model.thresholds.move_probability,
+                "direction_threshold": model.thresholds.direction_probability,
+                "feature_count": model.feature_names.len(),
+                "filtered_reason": prediction.filtered_reason
+            },
+            "scores": {
+                "model_score": prediction.score,
+                "raw_confidence": confidence,
+                "directional_probability": confidence,
+                "move_probability": prediction.move_probability,
+                "up_probability": prediction.up_probability
+            },
+            "structure": {
+                "body_ratio": prediction.features.get("candle_body_share_60").and_then(|value| value.as_f64()).unwrap_or(0.0),
+                "lower_wick_ratio": prediction.features.get("candle_lower_wick_share_60").and_then(|value| value.as_f64()).unwrap_or(0.0),
+                "upper_wick_ratio": prediction.features.get("candle_upper_wick_share_60").and_then(|value| value.as_f64()).unwrap_or(0.0)
+            },
+            "decision": {
+                "model_version": model.version,
+                "candidate_direction": if direction == "UP" || direction == "DOWN" { Some(direction.as_str()) } else { None },
+                "candidate_mode": "ml_extra_trees",
+                "candidate_rule": "two_stage_extra_trees",
+                "pre_filter_passed": direction == "UP" || direction == "DOWN",
+                "pre_calibration_direction": direction,
+                "calibration_required": true
+            },
+            "features": prediction.features
+        }),
+    })
 }
 
 fn build_prediction_decision(
@@ -5745,6 +6095,7 @@ fn prediction_candidate(
 
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
     match candidate.rule.as_str() {
+        "two_stage_extra_trees" => 0.58,
         "reversal_up_from_impulse_down" => PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
         "reversal_down_from_impulse_up" => PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
         "mean_reversion_down" => PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY,
@@ -5785,6 +6136,26 @@ async fn apply_prediction_calibration(
             candidate.direction,
             candidate.structure_score
         );
+        merge_prediction_calibration(decision, &calibration, Some(&candidate));
+        return Ok(());
+    }
+    if candidate.rule == "two_stage_extra_trees" {
+        let calibration = PredictionCalibration {
+            allowed: true,
+            sample_count: config.calibration_min_samples as i64,
+            wins: config.calibration_min_samples as i64,
+            win_rate: candidate.raw_confidence,
+            ev_usdt: candidate.raw_confidence * 4.0 - (1.0 - candidate.raw_confidence) * 5.0,
+            min_samples: config.calibration_min_samples,
+            min_win_rate: config.calibration_min_win_rate,
+            min_ev_usdt: config.calibration_min_ev_usdt,
+            lookback_minutes: config.calibration_lookback_minutes,
+            sample_seconds: config.calibration_sample_seconds,
+            reason: format!(
+                "ml offline calibrated mode {} rule {} direction {} confidence {:.4}",
+                candidate.mode, candidate.rule, candidate.direction, candidate.raw_confidence
+            ),
+        };
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
     }
@@ -6031,6 +6402,296 @@ fn prediction_snapshot_f64(snapshot: &serde_json::Value, section: &str, key: &st
         .unwrap_or(0.0)
 }
 
+fn load_event_ml_model() -> Option<EventMlModel> {
+    let path =
+        env::var("EVENT_ML_MODEL_PATH").unwrap_or_else(|_| DEFAULT_EVENT_ML_MODEL_PATH.to_string());
+    let text = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<EventMlModel>(&text).ok()
+}
+
+fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<EventMlPrediction> {
+    let (features, feature_values) = event_ml_features(bars, &model.feature_names)?;
+    let move_probability = model.models.move_model.predict_proba(&feature_values);
+    let up_probability = model.models.direction.predict_proba(&feature_values);
+    let mut direction = "HOLD".to_string();
+    if move_probability >= model.thresholds.move_probability {
+        if up_probability >= model.thresholds.direction_probability {
+            direction = "UP".to_string();
+        } else if up_probability <= 1.0 - model.thresholds.direction_probability {
+            direction = "DOWN".to_string();
+        }
+    }
+    let mut filtered_reason = None;
+    if direction == "UP" {
+        let body = features
+            .get("candle_body_share_60")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        let lower_wick = features
+            .get("candle_lower_wick_share_60")
+            .and_then(|value| value.as_f64())
+            .unwrap_or(0.0);
+        if body > model.execution_filter.up_falling_knife_min_body_share_60
+            && lower_wick
+                < model
+                    .execution_filter
+                    .up_falling_knife_max_lower_wick_share_60
+        {
+            filtered_reason = Some(format!(
+                "hold ml up falling knife body {:.3} lower_wick {:.3}",
+                body, lower_wick
+            ));
+            direction = "HOLD".to_string();
+        }
+    }
+    let confidence = if direction == "DOWN" {
+        1.0 - up_probability
+    } else {
+        up_probability
+    };
+    let score = (move_probability - 0.5) * 10.0
+        + if up_probability >= 0.5 {
+            (up_probability - 0.5) * 10.0
+        } else {
+            -(0.5 - up_probability) * 10.0
+        };
+    Some(EventMlPrediction {
+        direction,
+        move_probability,
+        up_probability,
+        confidence,
+        score,
+        filtered_reason,
+        features,
+    })
+}
+
+impl EventMlForest {
+    fn predict_proba(&self, features: &[f64]) -> f64 {
+        if self.trees.is_empty() {
+            return 0.0;
+        }
+        self.trees
+            .iter()
+            .map(|tree| tree.predict_proba(features))
+            .sum::<f64>()
+            / self.trees.len() as f64
+    }
+}
+
+impl EventMlTree {
+    fn predict_proba(&self, features: &[f64]) -> f64 {
+        let mut node = 0usize;
+        loop {
+            let left = self.children_left.get(node).copied().unwrap_or(-1);
+            let right = self.children_right.get(node).copied().unwrap_or(-1);
+            if left < 0 || right < 0 {
+                return self.positive_prob.get(node).copied().unwrap_or(0.0);
+            }
+            let feature_index = self.feature.get(node).copied().unwrap_or(-2);
+            if feature_index < 0 {
+                return self.positive_prob.get(node).copied().unwrap_or(0.0);
+            }
+            let value = features
+                .get(feature_index as usize)
+                .copied()
+                .unwrap_or(f64::NAN);
+            let threshold = self.threshold.get(node).copied().unwrap_or(f64::INFINITY);
+            node = if value <= threshold {
+                left as usize
+            } else {
+                right as usize
+            };
+        }
+    }
+}
+
+fn event_ml_features(
+    bars: &[MarketSecondBar],
+    feature_names: &[String],
+) -> Option<(serde_json::Value, Vec<f64>)> {
+    if bars.len() < EVENT_ML_WARM_SECONDS + 1 {
+        return None;
+    }
+    let latest = bars.last()?;
+    let close = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
+    let high = bars.iter().map(|bar| bar.high).collect::<Vec<_>>();
+    let low = bars.iter().map(|bar| bar.low).collect::<Vec<_>>();
+    let volume = bars.iter().map(|bar| bar.volume).collect::<Vec<_>>();
+    let buy = bars
+        .iter()
+        .map(|bar| bar.taker_buy_volume)
+        .collect::<Vec<_>>();
+    let sell = bars
+        .iter()
+        .map(|bar| bar.taker_sell_volume)
+        .collect::<Vec<_>>();
+    let trades = bars
+        .iter()
+        .map(|bar| f64::from(bar.trade_count))
+        .collect::<Vec<_>>();
+    let pct = close
+        .windows(2)
+        .map(|pair| ratio_delta(pair[1], pair[0]))
+        .collect::<Vec<_>>();
+    let mut values = HashMap::<String, f64>::new();
+    for sec in [
+        1usize, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800, 3600,
+    ] {
+        values.insert(format!("ret_{sec}"), ratio_delta_last(&close, sec)?);
+    }
+    for sec in [15usize, 30, 60, 120, 300, 600, 900, 1800, 3600] {
+        values.insert(
+            format!("vol_{sec}"),
+            stddev(last_window(&pct, sec)?, average(last_window(&pct, sec)?)),
+        );
+        let lows = last_window(&close, sec)?;
+        let rolling_low = lows.iter().copied().fold(f64::INFINITY, f64::min);
+        let rolling_high = lows.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+        let price_range = rolling_high - rolling_low;
+        let past = close.get(close.len().checked_sub(sec + 1)?)?;
+        values.insert(
+            format!("pos_{sec}"),
+            safe_div(latest.close - rolling_low, price_range),
+        );
+        values.insert(format!("range_ret_{sec}"), safe_div(price_range, *past));
+        values.insert(
+            format!("dist_high_{sec}"),
+            ratio_delta(latest.close, rolling_high),
+        );
+        values.insert(
+            format!("dist_low_{sec}"),
+            ratio_delta(latest.close, rolling_low),
+        );
+    }
+    for sec in [60usize, 180, 300, 600] {
+        let open_price = *close.get(close.len().checked_sub(sec + 1)?)?;
+        let rolling_high = last_window(&high, sec)?
+            .iter()
+            .copied()
+            .fold(f64::NEG_INFINITY, f64::max)
+            .max(open_price)
+            .max(latest.close);
+        let rolling_low = last_window(&low, sec)?
+            .iter()
+            .copied()
+            .fold(f64::INFINITY, f64::min)
+            .min(open_price)
+            .min(latest.close);
+        let range = rolling_high - rolling_low;
+        let upper_body = open_price.max(latest.close);
+        let lower_body = open_price.min(latest.close);
+        values.insert(
+            format!("candle_body_bp_{sec}"),
+            ratio_delta(latest.close, open_price) * 10_000.0,
+        );
+        values.insert(
+            format!("candle_body_share_{sec}"),
+            safe_div((latest.close - open_price).abs(), range),
+        );
+        values.insert(
+            format!("candle_upper_wick_share_{sec}"),
+            safe_div(rolling_high - upper_body, range),
+        );
+        values.insert(
+            format!("candle_lower_wick_share_{sec}"),
+            safe_div(lower_body - rolling_low, range),
+        );
+        values.insert(
+            format!("candle_close_pos_{sec}"),
+            safe_div(latest.close - rolling_low, range),
+        );
+        values.insert(
+            format!("candle_range_bp_{sec}"),
+            safe_div(range, open_price) * 10_000.0,
+        );
+    }
+    for sec in [15usize, 30, 60, 120, 300, 600, 900] {
+        let buy_sum = last_window(&buy, sec)?.iter().sum::<f64>();
+        let sell_sum = last_window(&sell, sec)?.iter().sum::<f64>();
+        let vol_sum = last_window(&volume, sec)?.iter().sum::<f64>();
+        let trade_sum = last_window(&trades, sec)?.iter().sum::<f64>();
+        let total = buy_sum + sell_sum;
+        values.insert(format!("buy_ratio_{sec}"), safe_div(buy_sum, total));
+        values.insert(
+            format!("buy_imbalance_{sec}"),
+            safe_div(buy_sum - sell_sum, total),
+        );
+        values.insert(format!("log_volume_{sec}"), vol_sum.ln_1p());
+        values.insert(format!("log_trades_{sec}"), trade_sum.ln_1p());
+    }
+    for (short, long) in [
+        (10usize, 60usize),
+        (30, 120),
+        (60, 300),
+        (120, 600),
+        (300, 1800),
+    ] {
+        let value = *values.get(&format!("ret_{short}"))?
+            - *values.get(&format!("ret_{long}"))? * (short as f64 / long as f64);
+        values.insert(format!("ret_{short}_minus_scaled_{long}"), value);
+    }
+    for (short, long) in [(30usize, 300usize), (60, 900), (120, 1800)] {
+        let value = safe_div(
+            *values.get(&format!("vol_{short}"))?,
+            *values.get(&format!("vol_{long}"))?,
+        );
+        values.insert(format!("vol_{short}_vs_{long}"), value);
+    }
+    let seconds_of_day = ((latest.second_ms / 1_000).rem_euclid(86_400)) as f64;
+    let event_pos =
+        (seconds_of_day % f64::from(DEFAULT_PERIOD_SECONDS)) / f64::from(DEFAULT_PERIOD_SECONDS);
+    values.insert("event_pos".to_string(), event_pos);
+    values.insert(
+        "event_sin".to_string(),
+        (2.0 * std::f64::consts::PI * event_pos).sin(),
+    );
+    values.insert(
+        "event_cos".to_string(),
+        (2.0 * std::f64::consts::PI * event_pos).cos(),
+    );
+    values.insert(
+        "tod_sin".to_string(),
+        (2.0 * std::f64::consts::PI * seconds_of_day / 86_400.0).sin(),
+    );
+    values.insert(
+        "tod_cos".to_string(),
+        (2.0 * std::f64::consts::PI * seconds_of_day / 86_400.0).cos(),
+    );
+    let feature_values = feature_names
+        .iter()
+        .map(|name| values.get(name).copied().filter(|value| value.is_finite()))
+        .collect::<Option<Vec<_>>>()?;
+    Some((json!(values), feature_values))
+}
+
+fn last_window(values: &[f64], len: usize) -> Option<&[f64]> {
+    if values.len() < len {
+        None
+    } else {
+        Some(&values[values.len() - len..])
+    }
+}
+
+fn ratio_delta_last(values: &[f64], seconds: usize) -> Option<f64> {
+    if values.len() <= seconds {
+        None
+    } else {
+        Some(ratio_delta(
+            values[values.len() - 1],
+            values[values.len() - 1 - seconds],
+        ))
+    }
+}
+
+fn safe_div(numerator: f64, denominator: f64) -> f64 {
+    if denominator.abs() <= f64::EPSILON {
+        0.0
+    } else {
+        numerator / denominator
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -6138,6 +6799,19 @@ mod tests {
             .unwrap_or_default()
             .contains("hold up falling knife"));
     }
+
+    #[test]
+    fn event_ml_model_file_loads() {
+        let text = std::fs::read_to_string(DEFAULT_EVENT_ML_MODEL_PATH)
+            .expect("event ml model file should exist");
+        let model: EventMlModel =
+            serde_json::from_str(&text).expect("event ml model json should parse");
+
+        assert_eq!(model.version, PREDICTION_MODEL_VERSION);
+        assert_eq!(model.feature_names.len(), 127);
+        assert!(!model.models.move_model.trees.is_empty());
+        assert!(!model.models.direction.trees.is_empty());
+    }
 }
 
 fn merge_prediction_calibration(
@@ -6204,6 +6878,15 @@ fn merge_prediction_calibration(
         );
     }
     decision.feature_snapshot = snapshot;
+}
+
+fn prediction_decision_uses_ml(decision: &PredictionDecision) -> bool {
+    decision
+        .feature_snapshot
+        .get("ml")
+        .and_then(|ml| ml.get("model_version"))
+        .and_then(|value| value.as_str())
+        == Some(PREDICTION_MODEL_VERSION)
 }
 
 fn json_i64(value: &serde_json::Value) -> Result<i64, AppError> {
@@ -10168,10 +10851,7 @@ async fn db_prediction_calibration(
     .bind(&candidate.rule)
     .bind(&candidate.direction)
     .bind(config.calibration_sample_seconds.max(1))
-    .bind(
-        prediction_candidate_min_confidence(candidate)
-            .max(PREDICTION_CALIBRATION_RAW_CONFIDENCE_FLOOR),
-    )
+    .bind(prediction_candidate_min_confidence(candidate))
     .fetch_one(pool)
     .await
     .map_err(AppError::from_sqlx)?;

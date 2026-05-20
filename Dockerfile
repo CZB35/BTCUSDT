@@ -35,6 +35,7 @@ WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
 COPY migrations ./migrations
+COPY models ./models
 RUN cargo build --release
 
 FROM debian:bookworm-slim AS runtime
@@ -44,6 +45,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=backend-builder /app/target/release/event-signal-prototype /usr/local/bin/event-signal-prototype
 COPY migrations ./migrations
+COPY models ./models
 COPY --from=dapp-builder /app/dapp/dist ./dapp
 COPY --from=admin-builder /app/admin/dist ./admin/dist
 EXPOSE 8787
