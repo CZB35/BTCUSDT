@@ -6513,6 +6513,13 @@ fn event_ml_features(
     if bars.len() < EVENT_ML_WARM_SECONDS + 1 {
         return None;
     }
+    let bars = &bars[bars.len() - (EVENT_ML_WARM_SECONDS + 1)..];
+    if !bars
+        .windows(2)
+        .all(|pair| pair[1].second_ms == pair[0].second_ms + 1_000)
+    {
+        return None;
+    }
     let latest = bars.last()?;
     let close = bars.iter().map(|bar| bar.close).collect::<Vec<_>>();
     let high = bars.iter().map(|bar| bar.high).collect::<Vec<_>>();
@@ -6541,9 +6548,10 @@ fn event_ml_features(
         values.insert(format!("ret_{sec}"), ratio_delta_last(&close, sec)?);
     }
     for sec in [15usize, 30, 60, 120, 300, 600, 900, 1800, 3600] {
+        let pct_window = last_window(&pct, sec)?;
         values.insert(
             format!("vol_{sec}"),
-            stddev(last_window(&pct, sec)?, average(last_window(&pct, sec)?)),
+            sample_stddev(pct_window, average(pct_window)),
         );
         let lows = last_window(&close, sec)?;
         let rolling_low = lows.iter().copied().fold(f64::INFINITY, f64::min);
@@ -6811,6 +6819,59 @@ mod tests {
         assert_eq!(model.feature_names.len(), 127);
         assert!(!model.models.move_model.trees.is_empty());
         assert!(!model.models.direction.trees.is_empty());
+    }
+
+    fn synthetic_second_bars(count: usize) -> Vec<MarketSecondBar> {
+        (0..count)
+            .map(|index| {
+                let second_ms = 1_700_000_000_000 + index as i64 * 1_000;
+                let wave = (index as f64 / 17.0).sin();
+                let drift = index as f64 * 0.002;
+                let close = 78_000.0 + drift + wave;
+                MarketSecondBar {
+                    second_ms,
+                    high: close + 0.45,
+                    low: close - 0.45,
+                    close,
+                    volume: 4.0 + wave.abs(),
+                    taker_buy_volume: 2.0 + wave.max(0.0),
+                    taker_sell_volume: 2.0 + (-wave).max(0.0),
+                    trade_count: 8,
+                }
+            })
+            .collect()
+    }
+
+    #[test]
+    fn event_ml_predicts_from_continuous_second_bars() {
+        let text = std::fs::read_to_string(DEFAULT_EVENT_ML_MODEL_PATH)
+            .expect("event ml model file should exist");
+        let model: EventMlModel =
+            serde_json::from_str(&text).expect("event ml model json should parse");
+        let bars = synthetic_second_bars(EVENT_ML_WARM_SECONDS + 1);
+        let prediction = event_ml_predict(&model, &bars).expect("continuous bars should predict");
+
+        assert!(prediction.move_probability.is_finite());
+        assert!(prediction.up_probability.is_finite());
+        assert!((0.0..=1.0).contains(&prediction.move_probability));
+        assert!((0.0..=1.0).contains(&prediction.up_probability));
+        assert!(prediction.features.is_object());
+        assert_eq!(
+            prediction.features.as_object().map(|object| object.len()),
+            Some(model.feature_names.len())
+        );
+    }
+
+    #[test]
+    fn event_ml_rejects_non_continuous_second_bars() {
+        let text = std::fs::read_to_string(DEFAULT_EVENT_ML_MODEL_PATH)
+            .expect("event ml model file should exist");
+        let model: EventMlModel =
+            serde_json::from_str(&text).expect("event ml model json should parse");
+        let mut bars = synthetic_second_bars(EVENT_ML_WARM_SECONDS + 1);
+        bars[EVENT_ML_WARM_SECONDS / 2].second_ms += 1_000;
+
+        assert!(event_ml_predict(&model, &bars).is_none());
     }
 }
 
@@ -7158,6 +7219,21 @@ fn stddev(values: &[f64], mean: f64) -> f64 {
         })
         .sum::<f64>()
         / values.len() as f64;
+    variance.sqrt()
+}
+
+fn sample_stddev(values: &[f64], mean: f64) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
+    }
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / (values.len() - 1) as f64;
     variance.sqrt()
 }
 
