@@ -9,6 +9,8 @@ services:
         VITE_BSC_SETTLEMENT_WALLET: ${BSC_SETTLEMENT_WALLET:-}
     image: event-signal-api:production
     restart: unless-stopped
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env.production
     environment:
@@ -25,6 +27,8 @@ services:
   migrate:
     image: event-signal-api:production
     profiles: ["tools"]
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     env_file:
       - .env.production
     environment:

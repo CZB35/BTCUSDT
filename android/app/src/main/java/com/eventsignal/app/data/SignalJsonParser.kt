@@ -21,6 +21,7 @@ object SignalJsonParser {
             id = obj["id"].asTextOrNull(),
             deliveryId = root.jsonObject["delivery_id"].asTextOrNull() ?: obj["delivery_id"].asTextOrNull(),
             symbol = obj["symbol"].asTextOrNull() ?: "BTCUSDT",
+            periodSeconds = obj["period_seconds"].asIntOrDefault(1800),
             direction = obj["direction"].asTextOrNull() ?: "HOLD",
             confidence = obj["confidence"].asTextOrNull() ?: "-",
             suggestedStake = obj["suggested_stake"].asTextOrNull(),
@@ -48,4 +49,7 @@ object SignalJsonParser {
         (this as? JsonPrimitive)?.let { primitive ->
             primitive.content.equals("true", ignoreCase = true)
         } ?: false
+
+    private fun JsonElement?.asIntOrDefault(defaultValue: Int): Int =
+        (this as? JsonPrimitive)?.content?.toIntOrNull() ?: defaultValue
 }

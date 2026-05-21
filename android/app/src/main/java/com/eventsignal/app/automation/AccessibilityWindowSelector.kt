@@ -24,7 +24,8 @@ private fun automationRootScore(root: AccessibilityNodeInfo, profile: Automation
 
     if (text.contains("BTCUSDT", ignoreCase = true)) score += 35
     if (text.contains("事件合约") || text.contains("EVENTCONTRACT", ignoreCase = true)) score += 25
-    if (text.contains("10分钟") || text.contains("10M", ignoreCase = true)) score += 18
+    if (text.contains("30分钟") || text.contains("30M", ignoreCase = true)) score += 20
+    if (text.contains("10分钟") || text.contains("10M", ignoreCase = true)) score += 10
     if (text.contains("数量") || text.contains("数量USDT") || text.contains("AMOUNT", ignoreCase = true)) score += 16
     if (text.contains("可用") || text.contains("U本位合约") || text.contains("USDT", ignoreCase = true)) score += 12
     if (text.contains("支付率") || text.contains("支付金额") || text.contains("PAYOUT", ignoreCase = true)) score += 12

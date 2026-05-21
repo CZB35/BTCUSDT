@@ -48,7 +48,8 @@ use uuid::Uuid;
 type HmacSha256 = Hmac<sha2::Sha256>;
 
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
-const DEFAULT_PERIOD_SECONDS: i32 = 600;
+const DEFAULT_PERIOD_SECONDS: i32 = 1800;
+const EVENT_ML_FEATURE_PERIOD_SECONDS: i32 = 600;
 const DEFAULT_PAYOUT_RATIO: Decimal = dec!(0.80);
 const PROFIT_SHARE_RATE: Decimal = dec!(0.30);
 const DEPOSIT_FEE_RATE: Decimal = dec!(0.25);
@@ -5241,6 +5242,7 @@ fn build_event_ml_warmup_decision(
                 "model_version": model.version,
                 "symbol": model.symbol,
                 "period_seconds": model.period_seconds,
+                "signal_period_seconds": DEFAULT_PERIOD_SECONDS,
                 "feature_count": model.feature_names.len(),
                 "warm_seconds": EVENT_ML_WARM_SECONDS
             },
@@ -5332,6 +5334,7 @@ fn build_event_ml_prediction_decision(
                 "model_version": model.version,
                 "symbol": model.symbol,
                 "period_seconds": model.period_seconds,
+                "signal_period_seconds": DEFAULT_PERIOD_SECONDS,
                 "move_probability": prediction.move_probability,
                 "up_probability": prediction.up_probability,
                 "down_probability": 1.0 - prediction.up_probability,
@@ -6743,8 +6746,8 @@ fn event_ml_features(
         values.insert(format!("vol_{short}_vs_{long}"), value);
     }
     let seconds_of_day = ((latest.second_ms / 1_000).rem_euclid(86_400)) as f64;
-    let event_pos =
-        (seconds_of_day % f64::from(DEFAULT_PERIOD_SECONDS)) / f64::from(DEFAULT_PERIOD_SECONDS);
+    let event_pos = (seconds_of_day % f64::from(EVENT_ML_FEATURE_PERIOD_SECONDS))
+        / f64::from(EVENT_ML_FEATURE_PERIOD_SECONDS);
     values.insert("event_pos".to_string(), event_pos);
     values.insert(
         "event_sin".to_string(),
@@ -10927,18 +10930,16 @@ async fn db_settle_due_signal_outcomes(pool: &PgPool, limit: i64) -> Result<u64,
             select o.entry_price
             from prediction_observations o
             where o.symbol = due.symbol
-              and o.period_seconds = due.period_seconds
               and o.created_at >= due.created_at
-            order by o.created_at asc
+            order by (o.period_seconds = due.period_seconds) desc, o.created_at asc
             limit 1
           ) entry on true
           join lateral (
             select o.entry_price
             from prediction_observations o
             where o.symbol = due.symbol
-              and o.period_seconds = due.period_seconds
               and o.created_at >= due.cycle_end
-            order by o.created_at asc
+            order by (o.period_seconds = due.period_seconds) desc, o.created_at asc
             limit 1
           ) expiry on true
         )

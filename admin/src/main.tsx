@@ -739,7 +739,7 @@ function App() {
           <div className="brand-mark">ES</div>
           <div>
             <strong>事件信号后台</strong>
-            <span>BTCUSDT 10m</span>
+            <span>BTCUSDT 30m</span>
           </div>
         </div>
         <nav>

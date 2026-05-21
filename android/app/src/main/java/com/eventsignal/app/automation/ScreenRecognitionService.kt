@@ -107,7 +107,7 @@ class ScreenRecognitionService {
             allText.contains("EVENTCONTRACT", ignoreCase = true)
         val hasSymbol = allText.contains("BTCUSDT", ignoreCase = true)
         val hasTimeUnit = allText.contains("时间单位") ||
-            listOf("1分", "5分", "10分钟", "10分", "15分", "30分", "1小时", "10M", "10MIN").any { token ->
+            listOf("1分", "5分", "10分钟", "10分", "15分", "30分钟", "30分", "1小时", "10M", "10MIN", "30M", "30MIN").any { token ->
                 allText.contains(token, ignoreCase = true)
             }
         val hasAmountArea = amountFieldFound ||

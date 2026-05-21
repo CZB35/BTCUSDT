@@ -97,7 +97,7 @@ class FloatingSignalService : Service() {
         }
         val title = TextView(this).apply {
             tag = "title"
-            text = "BTCUSDT 10m"
+            text = "BTCUSDT 30m"
             setTextColor(0xFFEAECEF.toInt())
             textSize = 14f
             typeface = Typeface.DEFAULT_BOLD

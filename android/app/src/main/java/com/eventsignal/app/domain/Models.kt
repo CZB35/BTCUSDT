@@ -117,6 +117,8 @@ data class SignalSnapshot(
     @SerialName("delivery_id")
     val deliveryId: String? = null,
     val symbol: String = "BTCUSDT",
+    @SerialName("period_seconds")
+    val periodSeconds: Int = 1800,
     val direction: String = "HOLD",
     val confidence: String = "-",
     @SerialName("suggested_stake")

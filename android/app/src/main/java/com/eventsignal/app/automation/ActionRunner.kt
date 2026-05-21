@@ -51,9 +51,19 @@ class ActionRunner(
             return
         }
 
-        val root = service.findAutomationRoot(profile) ?: run {
+        var root = service.findAutomationRoot(profile) ?: run {
             stateStore.saveLastStatus("missing_root_window")
             releaseReservation(signal, "missing_root_window")
+            return
+        }
+        if (!ensurePeriodSelected(root, profile, signal.periodSeconds)) {
+            stateStore.saveLastStatus("period_select_failed:${signal.periodSeconds}")
+            releaseReservation(signal, "period_select_failed")
+            return
+        }
+        root = service.findAutomationRoot(profile) ?: run {
+            stateStore.saveLastStatus("missing_root_window_after_period_select")
+            releaseReservation(signal, "missing_root_window_after_period_select")
             return
         }
         val nodes = flatten(root)
@@ -182,7 +192,7 @@ class ActionRunner(
             reservationId = signal.reservationId,
             signalId = signalId,
             symbol = signal.symbol,
-            periodSeconds = 600,
+            periodSeconds = signal.periodSeconds,
             direction = direction,
             stakeUsdt = amount,
             payoutRatio = null,
@@ -206,6 +216,100 @@ class ActionRunner(
             createdAtMs = System.currentTimeMillis(),
         )
     }
+
+    private fun ensurePeriodSelected(
+        root: AccessibilityNodeInfo,
+        profile: AutomationProfile,
+        periodSeconds: Int,
+    ): Boolean {
+        val targetLabels = periodLabels(periodSeconds) ?: return true
+        val nodes = flatten(root)
+        val timeUnitIndex = nodes.indexOfFirst { node ->
+            node.nodeText().matchesAnyCompact(listOf("时间单位", "Time Unit", "Duration"))
+        }
+        if (timeUnitIndex < 0) return false
+        val selectorSearchNodes = if (timeUnitIndex >= 0) {
+            nodes.drop(timeUnitIndex).take(12)
+        } else {
+            nodes
+        }
+        if (selectorSearchNodes.any { node ->
+                node.isVisibleToUser && node.nodeText().matchesAnyCompact(targetLabels)
+            }) {
+            return true
+        }
+        val selector = selectorSearchNodes
+            .filter { node ->
+                val label = node.nodeText()
+                node.isEnabled &&
+                    node.isVisibleToUser &&
+                    (node.isClickable || node.parent?.isClickable == true) &&
+                    label.matchesAnyCompact(periodSelectorLabels)
+            }
+            .minByOrNull { node -> node.boundsInScreen().centerY() }
+            ?: return false
+
+        if (!click(selector)) return false
+        repeat(8) {
+            SystemClock.sleep(250)
+            val optionRoot = service.findAutomationRoot(profile) ?: return@repeat
+            val option = flatten(optionRoot).firstOrNull { node ->
+                val label = node.nodeText()
+                node.isEnabled &&
+                    node.isVisibleToUser &&
+                    (node.isClickable || node.parent?.isClickable == true) &&
+                    label.matchesAnyCompact(targetLabels)
+            }
+            if (option != null && click(option)) {
+                SystemClock.sleep(300)
+                return true
+            }
+        }
+        return false
+    }
+
+    private fun periodLabels(periodSeconds: Int): List<String>? =
+        when (periodSeconds) {
+            60 -> listOf("1分钟", "1分", "1m", "1min")
+            300 -> listOf("5分钟", "5分", "5m", "5min")
+            600 -> listOf("10分钟", "10分", "10m", "10min")
+            900 -> listOf("15分钟", "15分", "15m", "15min")
+            1800 -> listOf("30分钟", "30分", "30m", "30min")
+            3600 -> listOf("1小时", "1h", "60分钟", "60min")
+            else -> null
+        }
+
+    private val periodSelectorLabels = listOf(
+        "1分钟",
+        "5分钟",
+        "10分钟",
+        "15分钟",
+        "30分钟",
+        "1小时",
+        "1分",
+        "5分",
+        "10分",
+        "15分",
+        "30分",
+        "1m",
+        "5m",
+        "10m",
+        "15m",
+        "30m",
+        "1min",
+        "5min",
+        "10min",
+        "15min",
+        "30min",
+    )
+
+    private fun String.matchesAnyCompact(options: List<String>): Boolean {
+        val value = compactPeriodText()
+        return options.any { option -> value.contains(option.compactPeriodText()) }
+    }
+
+    private fun String.compactPeriodText(): String =
+        replace("\\s+".toRegex(), "").uppercase()
 
     private fun submitPendingOrder(pending: PendingOrderReport) {
         repository.submitEventContractOrder(pending.order)
