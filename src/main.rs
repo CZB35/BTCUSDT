@@ -129,6 +129,13 @@ const PREDICTION_CONFIRMATION_SECONDS: i64 = 5;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
 const EVENT_ML_WARM_SECONDS: usize = 3600;
+const EVENT_ML_SLOW_TREND_MIN_CONFIDENCE: f64 = 0.60;
+const EVENT_ML_SLOW_TREND_MIN_MOVE_PROBABILITY: f64 = 0.45;
+const EVENT_ML_SLOW_TREND_MIN_RET_1M: f64 = 0.00055;
+const EVENT_ML_SLOW_TREND_MIN_RET_3M: f64 = 0.00110;
+const EVENT_ML_SLOW_TREND_MIN_RET_5M: f64 = 0.00170;
+const EVENT_ML_SLOW_TREND_MIN_RET_7M: f64 = 0.00210;
+const EVENT_ML_SLOW_TREND_EXTREME_POS: f64 = 0.15;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -1320,6 +1327,7 @@ struct EventMlTree {
 #[derive(Clone, Debug)]
 struct EventMlPrediction {
     direction: String,
+    rule: String,
     move_probability: f64,
     up_probability: f64,
     confidence: f64,
@@ -5275,7 +5283,8 @@ fn build_event_ml_prediction_decision(
         )
     } else {
         format!(
-            "ml hold move_prob {:.4} < {:.4} or dir up_prob {:.4} threshold {:.4}",
+            "ml hold rule {} move_prob {:.4} < {:.4} or dir up_prob {:.4} threshold {:.4}",
+            prediction.rule,
             prediction.move_probability,
             model.thresholds.move_probability,
             prediction.up_probability,
@@ -5347,7 +5356,7 @@ fn build_event_ml_prediction_decision(
                 "model_version": model.version,
                 "candidate_direction": if direction == "UP" || direction == "DOWN" { Some(direction.as_str()) } else { None },
                 "candidate_mode": "ml_extra_trees",
-                "candidate_rule": "two_stage_extra_trees",
+                "candidate_rule": prediction.rule,
                 "pre_filter_passed": direction == "UP" || direction == "DOWN",
                 "pre_calibration_direction": direction,
                 "calibration_required": true
@@ -6096,6 +6105,7 @@ fn prediction_candidate(
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
     match candidate.rule.as_str() {
         "two_stage_extra_trees" => 0.58,
+        "slow_trend_1_3_5_7" => EVENT_ML_SLOW_TREND_MIN_CONFIDENCE,
         "reversal_up_from_impulse_down" => PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
         "reversal_down_from_impulse_up" => PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
         "mean_reversion_down" => PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY,
@@ -6139,7 +6149,10 @@ async fn apply_prediction_calibration(
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
     }
-    if candidate.rule == "two_stage_extra_trees" {
+    if matches!(
+        candidate.rule.as_str(),
+        "two_stage_extra_trees" | "slow_trend_1_3_5_7"
+    ) {
         let calibration = PredictionCalibration {
             allowed: true,
             sample_count: config.calibration_min_samples as i64,
@@ -6414,11 +6427,35 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
     let move_probability = model.models.move_model.predict_proba(&feature_values);
     let up_probability = model.models.direction.predict_proba(&feature_values);
     let mut direction = "HOLD".to_string();
+    let mut rule = "two_stage_extra_trees".to_string();
     if move_probability >= model.thresholds.move_probability {
         if up_probability >= model.thresholds.direction_probability {
             direction = "UP".to_string();
         } else if up_probability <= 1.0 - model.thresholds.direction_probability {
             direction = "DOWN".to_string();
+        }
+    }
+    if direction == "HOLD" {
+        if let Some((slow_direction, slow_confidence)) =
+            event_ml_slow_trend_candidate(&features, move_probability)
+        {
+            direction = slow_direction;
+            rule = "slow_trend_1_3_5_7".to_string();
+            let adjusted_up_probability = if direction == "UP" {
+                slow_confidence.max(up_probability)
+            } else {
+                (1.0 - slow_confidence).min(up_probability)
+            };
+            return Some(EventMlPrediction {
+                direction,
+                rule,
+                move_probability,
+                up_probability: adjusted_up_probability,
+                confidence: slow_confidence,
+                score: event_ml_score(move_probability, adjusted_up_probability),
+                filtered_reason: None,
+                features,
+            });
         }
     }
     let mut filtered_reason = None;
@@ -6449,14 +6486,10 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
     } else {
         up_probability
     };
-    let score = (move_probability - 0.5) * 10.0
-        + if up_probability >= 0.5 {
-            (up_probability - 0.5) * 10.0
-        } else {
-            -(0.5 - up_probability) * 10.0
-        };
+    let score = event_ml_score(move_probability, up_probability);
     Some(EventMlPrediction {
         direction,
+        rule,
         move_probability,
         up_probability,
         confidence,
@@ -6464,6 +6497,69 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
         filtered_reason,
         features,
     })
+}
+
+fn event_ml_score(move_probability: f64, up_probability: f64) -> f64 {
+    (move_probability - 0.5) * 10.0
+        + if up_probability >= 0.5 {
+            (up_probability - 0.5) * 10.0
+        } else {
+            -(0.5 - up_probability) * 10.0
+        }
+}
+
+fn event_ml_slow_trend_candidate(
+    features: &serde_json::Value,
+    move_probability: f64,
+) -> Option<(String, f64)> {
+    if move_probability < EVENT_ML_SLOW_TREND_MIN_MOVE_PROBABILITY {
+        return None;
+    }
+    let ret_60 = feature_f64(features, "ret_60");
+    let ret_180 = feature_f64(features, "ret_180");
+    let ret_300 = feature_f64(features, "ret_300");
+    let ret_420 = feature_f64(features, "ret_420");
+    let pos_420 = feature_f64(features, "pos_420");
+    let down_trend = ret_60 <= -EVENT_ML_SLOW_TREND_MIN_RET_1M
+        && ret_180 <= -EVENT_ML_SLOW_TREND_MIN_RET_3M
+        && ret_300 <= -EVENT_ML_SLOW_TREND_MIN_RET_5M
+        && ret_420 <= -EVENT_ML_SLOW_TREND_MIN_RET_7M
+        && pos_420 <= EVENT_ML_SLOW_TREND_EXTREME_POS;
+    if down_trend {
+        let confidence = (0.60
+            + ((-ret_420 - EVENT_ML_SLOW_TREND_MIN_RET_7M) * 35.0)
+            + ((EVENT_ML_SLOW_TREND_EXTREME_POS - pos_420).max(0.0) * 0.08)
+            + ((move_probability - EVENT_ML_SLOW_TREND_MIN_MOVE_PROBABILITY).max(0.0) * 0.20))
+            .min(0.74);
+        return Some((
+            "DOWN".to_string(),
+            confidence.max(EVENT_ML_SLOW_TREND_MIN_CONFIDENCE),
+        ));
+    }
+    let up_trend = ret_60 >= EVENT_ML_SLOW_TREND_MIN_RET_1M
+        && ret_180 >= EVENT_ML_SLOW_TREND_MIN_RET_3M
+        && ret_300 >= EVENT_ML_SLOW_TREND_MIN_RET_5M
+        && ret_420 >= EVENT_ML_SLOW_TREND_MIN_RET_7M
+        && pos_420 >= 1.0 - EVENT_ML_SLOW_TREND_EXTREME_POS;
+    if up_trend {
+        let confidence = (0.60
+            + ((ret_420 - EVENT_ML_SLOW_TREND_MIN_RET_7M) * 35.0)
+            + ((pos_420 - (1.0 - EVENT_ML_SLOW_TREND_EXTREME_POS)).max(0.0) * 0.08)
+            + ((move_probability - EVENT_ML_SLOW_TREND_MIN_MOVE_PROBABILITY).max(0.0) * 0.20))
+            .min(0.74);
+        return Some((
+            "UP".to_string(),
+            confidence.max(EVENT_ML_SLOW_TREND_MIN_CONFIDENCE),
+        ));
+    }
+    None
+}
+
+fn feature_f64(features: &serde_json::Value, key: &str) -> f64 {
+    features
+        .get(key)
+        .and_then(|value| value.as_f64())
+        .unwrap_or(0.0)
 }
 
 impl EventMlForest {
@@ -6543,11 +6639,11 @@ fn event_ml_features(
         .collect::<Vec<_>>();
     let mut values = HashMap::<String, f64>::new();
     for sec in [
-        1usize, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800, 3600,
+        1usize, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 420, 600, 900, 1800, 3600,
     ] {
         values.insert(format!("ret_{sec}"), ratio_delta_last(&close, sec)?);
     }
-    for sec in [15usize, 30, 60, 120, 300, 600, 900, 1800, 3600] {
+    for sec in [15usize, 30, 60, 120, 300, 420, 600, 900, 1800, 3600] {
         let pct_window = last_window(&pct, sec)?;
         values.insert(
             format!("vol_{sec}"),
