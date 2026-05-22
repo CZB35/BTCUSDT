@@ -70,6 +70,7 @@ class ActionRunner(
         val amountField = findAmountField(nodes, profile)
         val upButton = findDirectionButton(nodes, profile, "UP")
         val downButton = findDirectionButton(nodes, profile, "DOWN")
+        val observedIndexPrice = extractObservedIndexPrice(nodes) ?: screen.observedIndexPrice
         stateStore.saveDebugState(
             AutomationDebugState(
                 accessibilityConnected = true,
@@ -128,6 +129,10 @@ class ActionRunner(
         if (click(button)) {
             saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "已点击执行按钮:$buttonLabel")
             if (clickConfirm(profile)) {
+                val confirmedIndexPrice = service.findAutomationRoot(profile)
+                    ?.let(::flatten)
+                    ?.let(::extractObservedIndexPrice)
+                    ?: observedIndexPrice
                 saveActionState(screen, amountFieldFound = true, refreshedUpButton != null, refreshedDownButton != null, "已确认下单")
                 val pending = buildOrderReport(
                     signal = signal,
@@ -136,6 +141,7 @@ class ActionRunner(
                     amount = amount,
                     profile = profile,
                     screen = screen,
+                    observedIndexPrice = confirmedIndexPrice,
                 )
                 stateStore.savePendingOrder(pending)
                 submitPendingOrder(pending)
@@ -184,6 +190,7 @@ class ActionRunner(
         amount: String,
         profile: AutomationProfile,
         screen: RecognizedScreen,
+        observedIndexPrice: String?,
     ): PendingOrderReport {
         val traceId = "android-${System.currentTimeMillis()}-$signalId"
         val order = EventContractOrderRequest(
@@ -195,6 +202,7 @@ class ActionRunner(
             periodSeconds = signal.periodSeconds,
             direction = direction,
             stakeUsdt = amount,
+            entryPrice = observedIndexPrice,
             payoutRatio = null,
             expectedPayoutUsdt = null,
             expectedProfitUsdt = null,
@@ -206,6 +214,7 @@ class ActionRunner(
                 "amount_field_found" to screen.amountFieldFound.toString(),
                 "up_button_found" to screen.upButtonFound.toString(),
                 "down_button_found" to screen.downButtonFound.toString(),
+                "observed_index_price" to (observedIndexPrice ?: ""),
             ),
             reportedAt = Instant.now().toString(),
         )
@@ -390,6 +399,14 @@ class ActionRunner(
         return nodes
             .filter { node -> isDirectionButtonCandidate(node, keywords) }
             .maxByOrNull { node -> directionButtonScore(node) }
+    }
+
+    private fun extractObservedIndexPrice(nodes: List<AccessibilityNodeInfo>): String? {
+        val btcPrice = Regex("""\b([5-9][0-9]{4}(?:\.[0-9]+)?)\b""")
+        return nodes
+            .asSequence()
+            .flatMap { node -> btcPrice.findAll(node.nodeText().replace(",", "")).map { it.groupValues[1] } }
+            .firstOrNull()
     }
 
     private fun isDirectionButtonCandidate(

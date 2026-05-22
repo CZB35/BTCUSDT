@@ -27,7 +27,7 @@ use axum::{
     Json, Router,
 };
 use base64::{engine::general_purpose, Engine as _};
-use chrono::{DateTime, Duration, TimeZone, Utc};
+use chrono::{DateTime, Duration, TimeZone, Timelike, Utc};
 use clap::Parser;
 use ethers_core::types::{Address, Signature, U256};
 use futures_util::{SinkExt, StreamExt};
@@ -82,6 +82,10 @@ const DEFAULT_RESERVATION_NO_ACK_RELEASE_SECONDS: i64 = 30;
 const DEFAULT_RESERVATION_ORDER_TIMEOUT_SECONDS: i64 = 90;
 const DEFAULT_RESERVATION_RELEASE_LIMIT: i64 = 100;
 const DEFAULT_MAX_ACTIVE_EVENT_ORDERS_PER_USER: usize = 3;
+const NIGHT_PROTECTION_START_MINUTE: u32 = 30;
+const NIGHT_PROTECTION_END_MINUTE: u32 = 180;
+const NIGHT_CLUSTER_GAP_SECONDS: i64 = 180;
+const NIGHT_CLUSTER_SKIP_FIRST: usize = 2;
 const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUERY_LIMIT: i64 = 50;
 const MAX_QUERY_LIMIT: i64 = 500;
@@ -651,7 +655,7 @@ async fn emit_prediction_signal(
 ) -> Result<(), AppError> {
     let signal_created_at = Utc::now();
     {
-        let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
+        let last_emitted_at = state.prediction_last_emitted_at.read().await;
         if let Some(last) = *last_emitted_at {
             let age = (signal_created_at - last).num_seconds();
             if age >= 0 && age < decision.signal_cooldown_seconds {
@@ -666,6 +670,18 @@ async fn emit_prediction_signal(
                 return Ok(());
             }
         }
+    }
+    if let Some(message) = guard_prediction_signal_emit(state, decision, signal_created_at).await {
+        let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
+        *last_emitted_at = Some(signal_created_at);
+        drop(last_emitted_at);
+        let mut runtime = state.prediction_runtime.write().await;
+        runtime.status = "night_guard".to_string();
+        runtime.message = message;
+        return Ok(());
+    }
+    {
+        let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
         *last_emitted_at = Some(signal_created_at);
     }
     let signal = SignalCore::from_prediction_at(decision, signal_created_at);
@@ -685,6 +701,42 @@ async fn emit_prediction_signal(
         signal.direction, decision.score, decision.confidence
     );
     Ok(())
+}
+
+async fn guard_prediction_signal_emit(
+    state: &SharedState,
+    decision: &PredictionDecision,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    let mut guard = state.prediction_emit_guard.write().await;
+    let same_cluster = guard
+        .last_at
+        .map(|last| {
+            guard.last_direction.as_deref() == Some(decision.direction.as_str())
+                && (now - last).num_seconds() <= NIGHT_CLUSTER_GAP_SECONDS
+        })
+        .unwrap_or(false);
+    guard.cluster_position = if same_cluster {
+        guard.cluster_position.saturating_add(1)
+    } else {
+        1
+    };
+    guard.last_direction = Some(decision.direction.clone());
+    guard.last_at = Some(now);
+
+    if is_china_night_protection_window(now) && guard.cluster_position <= NIGHT_CLUSTER_SKIP_FIRST {
+        return Some(format!(
+            "night guard skipped {} cluster position {} score {:.4} confidence {:.4}",
+            decision.direction, guard.cluster_position, decision.score, decision.confidence
+        ));
+    }
+    None
+}
+
+fn is_china_night_protection_window(now: DateTime<Utc>) -> bool {
+    let china_hour = (now.hour() + 8) % 24;
+    let minute_of_day = china_hour * 60 + now.minute();
+    (NIGHT_PROTECTION_START_MINUTE..NIGHT_PROTECTION_END_MINUTE).contains(&minute_of_day)
 }
 
 async fn sync_exchange_worker_runtime(
@@ -775,6 +827,7 @@ struct AppState {
     prediction_runtime: RwLock<PredictionRuntimeStatus>,
     prediction_last_emitted_at: RwLock<Option<DateTime<Utc>>>,
     prediction_pending_candidate: RwLock<Option<PendingPredictionCandidate>>,
+    prediction_emit_guard: RwLock<PredictionEmitGuard>,
     active_ws_connections: RwLock<HashMap<Uuid, Uuid>>,
     signal_tx: broadcast::Sender<SignalCore>,
     started_at: DateTime<Utc>,
@@ -814,6 +867,7 @@ impl AppState {
             prediction_runtime: RwLock::new(PredictionRuntimeStatus::default()),
             prediction_last_emitted_at: RwLock::new(None),
             prediction_pending_candidate: RwLock::new(None),
+            prediction_emit_guard: RwLock::new(PredictionEmitGuard::default()),
             active_ws_connections: RwLock::new(HashMap::new()),
             signal_tx,
             started_at: Utc::now(),
@@ -1279,6 +1333,13 @@ struct PredictionDecision {
     market_candles: usize,
     reason: String,
     feature_snapshot: serde_json::Value,
+}
+
+#[derive(Default)]
+struct PredictionEmitGuard {
+    last_direction: Option<String>,
+    last_at: Option<DateTime<Utc>>,
+    cluster_position: usize,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -2219,6 +2280,7 @@ struct EventContractOrderRequest {
     period_seconds: i32,
     direction: String,
     stake_usdt: String,
+    entry_price: Option<String>,
     automation_profile: Option<String>,
     automation_confidence: Option<String>,
     action_trace_id: Option<String>,
@@ -7457,7 +7519,7 @@ async fn submit_order(
         period_seconds: req.period_seconds,
         direction,
         stake_usdt,
-        entry_price: None,
+        entry_price: parse_optional_decimal(req.entry_price.as_deref(), "entry_price")?,
         automation_profile: req.automation_profile,
         automation_confidence: parse_optional_decimal(
             req.automation_confidence.as_deref(),
@@ -9435,6 +9497,8 @@ async fn settle_order_from_binance_income(
     } else {
         "LOSS"
     };
+    let (outcome_entry_price, outcome_expiry_price) =
+        db_signal_outcome_prices(pool, &order.signal_id).await?;
     let now = Utc::now();
     let report = ExecutionReportRecord {
         id: Uuid::now_v7(),
@@ -9446,8 +9510,8 @@ async fn settle_order_from_binance_income(
         period_seconds: order.period_seconds,
         direction: order.direction.clone(),
         stake_usdt: order.stake_usdt,
-        entry_price: order.entry_price,
-        expiry_price: None,
+        entry_price: order.entry_price.or(outcome_entry_price),
+        expiry_price: outcome_expiry_price,
         payout_ratio: Some(DEFAULT_PAYOUT_RATIO),
         gross_profit: Some(gross_profit),
         result: result.to_string(),
@@ -9459,6 +9523,30 @@ async fn settle_order_from_binance_income(
         created_at: now,
     };
     db_insert_exchange_execution_report_and_settle(pool, &report, payout_event.as_ref()).await
+}
+
+async fn db_signal_outcome_prices(
+    pool: &PgPool,
+    signal_ref: &str,
+) -> Result<(Option<Decimal>, Option<Decimal>), AppError> {
+    let Ok(signal_id) = Uuid::parse_str(signal_ref) else {
+        return Ok((None, None));
+    };
+    sqlx::query(
+        r#"
+        select entry_price, expiry_price
+        from signal_outcomes
+        where signal_id = $1
+        "#,
+    )
+    .bind(signal_id)
+    .fetch_optional(pool)
+    .await
+    .map(|row| {
+        row.map(|row| (row.get("entry_price"), row.get("expiry_price")))
+            .unwrap_or((None, None))
+    })
+    .map_err(AppError::from_sqlx)
 }
 
 fn calculated_stake(
@@ -12628,10 +12716,11 @@ async fn db_insert_order_with_reservation_validation(
           (id, user_id, reservation_id, signal_ref, client_order_id, source, symbol,
            period_seconds, direction, stake_usdt, payout_ratio, expected_payout_usdt,
            expected_profit_usdt, automation_profile, automation_confidence, action_trace_id,
-           raw_audit, order_status, reported_at, created_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20)
+           raw_audit, order_status, reported_at, created_at, entry_price)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
         on conflict (user_id, client_order_id) do update
-        set reported_at = coalesce(event_contract_orders.reported_at, excluded.reported_at)
+        set reported_at = coalesce(event_contract_orders.reported_at, excluded.reported_at),
+            entry_price = coalesce(event_contract_orders.entry_price, excluded.entry_price)
         returning id
         "#,
     )
@@ -12655,6 +12744,7 @@ async fn db_insert_order_with_reservation_validation(
     .bind(&order.order_status)
     .bind(order.reported_at)
     .bind(order.created_at)
+    .bind(order.entry_price)
     .fetch_one(&mut *tx)
     .await
     .map(|row| row.get("id"))
@@ -12992,7 +13082,8 @@ async fn db_pending_exchange_orders(
     sqlx::query(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
-               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt,
+               coalesce(o.entry_price, s.entry_price) as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
@@ -13021,25 +13112,28 @@ async fn db_confirmed_exchange_orders_due_for_settlement(
     sqlx::query(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
-               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt,
+               coalesce(o.entry_price, s.entry_price) as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
         left join signals s on s.id::text = o.signal_ref
         where o.exchange_verification_status = 'confirmed'
           and o.exchange_ref is not null
-          and o.created_at <= $1
-          and mod(abs(hashtext(o.user_id::text)), $2) = $3
+          and coalesce(o.reported_at, o.created_at)
+                + make_interval(secs => (o.period_seconds + $1)::double precision) <= $2
+          and mod(abs(hashtext(o.user_id::text)), $3) = $4
           and not exists (
             select 1 from execution_reports r
             where r.user_id = o.user_id
               and r.signal_id::text = o.signal_ref
           )
         order by o.created_at asc
-        limit $4
+        limit $5
         "#,
     )
-    .bind(now - Duration::seconds(BINANCE_SETTLEMENT_GRACE_SECONDS))
+    .bind(BINANCE_SETTLEMENT_GRACE_SECONDS)
+    .bind(now)
     .bind(config.shard_total)
     .bind(config.shard_index)
     .bind(limit)
@@ -13170,8 +13264,8 @@ async fn db_insert_exchange_execution_report_and_settle(
            direction, stake_usdt, entry_price, expiry_price, payout_ratio, gross_profit,
            result, automation_profile, automation_confidence, action_trace_id,
            report_status, reported_at, created_at, exchange_ref, exchange_payout_income_id, exchange_verified_at)
-        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, null, null, $10, $11,
-                $12, $13, $14, $15, 'pending_review', $16, $17, $18, $19, $20)
+        values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                $14, $15, $16, $17, 'pending_review', $18, $19, $20, $21, $22)
         on conflict (user_id, client_report_id) do nothing
         returning id
         "#,
@@ -13185,6 +13279,8 @@ async fn db_insert_exchange_execution_report_and_settle(
     .bind(report.period_seconds)
     .bind(&report.direction)
     .bind(report.stake_usdt)
+    .bind(report.entry_price)
+    .bind(report.expiry_price)
     .bind(report.payout_ratio)
     .bind(report.gross_profit)
     .bind(&report.result)
@@ -13799,7 +13895,8 @@ async fn db_admin_orders(
     sqlx::query(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
-               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt,
+               coalesce(o.entry_price, s.entry_price) as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
@@ -13839,7 +13936,8 @@ async fn db_orders_for_user(
     sqlx::query(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
-               o.symbol, o.period_seconds, o.direction, o.stake_usdt, s.entry_price,
+               o.symbol, o.period_seconds, o.direction, o.stake_usdt,
+               coalesce(o.entry_price, s.entry_price) as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o

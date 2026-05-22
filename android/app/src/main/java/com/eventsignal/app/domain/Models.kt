@@ -192,6 +192,8 @@ data class EventContractOrderRequest(
     val direction: String,
     @SerialName("stake_usdt")
     val stakeUsdt: String,
+    @SerialName("entry_price")
+    val entryPrice: String? = null,
     @SerialName("payout_ratio")
     val payoutRatio: String? = null,
     @SerialName("expected_payout_usdt")

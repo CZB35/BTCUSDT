@@ -21,6 +21,7 @@ class ScreenRecognitionService {
         val upButtonFound = findDirectionButton(nodes, profile.upButtonKeywords) != null
         val downButtonFound = findDirectionButton(nodes, profile.downButtonKeywords) != null
         val observedBalanceUsdt = extractObservedBalanceUsdt(texts)
+        val observedIndexPrice = extractObservedIndexPrice(texts)
         val structure = detectEventContractStructure(texts, amountFieldFound, upButtonFound, downButtonFound)
         val confidence = pageConfidence(packageName, structure, profile)
         val isTargetPackage = isTargetPackage(packageName, profile)
@@ -48,6 +49,7 @@ class ScreenRecognitionService {
             upButtonFound = upButtonFound,
             downButtonFound = downButtonFound,
             observedBalanceUsdt = observedBalanceUsdt,
+            observedIndexPrice = observedIndexPrice,
             visibleText = texts.take(40),
         )
     }
@@ -215,6 +217,17 @@ class ScreenRecognitionService {
         return null
     }
 
+    private fun extractObservedIndexPrice(texts: List<String>): String? {
+        val normalizedTexts = texts.map {
+            it.replace(",", "").replace("\\s+".toRegex(), " ").trim()
+        }
+        val btcPrice = Regex("""\b([5-9][0-9]{4}(?:\.[0-9]+)?)\b""")
+        return normalizedTexts
+            .asSequence()
+            .flatMap { text -> btcPrice.findAll(text).map { match -> match.groupValues[1] } }
+            .firstOrNull()
+    }
+
     private fun AccessibilityNodeInfo.toSnapshot(): NodeSnapshot =
         NodeSnapshot(
             textForMatching = listOfNotNull(
@@ -267,6 +280,7 @@ data class RecognizedScreen(
     val upButtonFound: Boolean,
     val downButtonFound: Boolean,
     val observedBalanceUsdt: String?,
+    val observedIndexPrice: String?,
     val visibleText: List<String>,
 ) {
     companion object {
@@ -280,6 +294,7 @@ data class RecognizedScreen(
             upButtonFound = false,
             downButtonFound = false,
             observedBalanceUsdt = null,
+            observedIndexPrice = null,
             visibleText = emptyList(),
         )
     }

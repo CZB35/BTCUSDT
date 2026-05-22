@@ -54,6 +54,18 @@ class ApiClient(context: Context) {
             editor.apply()
         }
 
+    private var accessTokenExpiresAtMs: Long
+        get() = prefs.getLong("access_token_expires_at_ms", 0L)
+        set(value) {
+            val editor = prefs.edit()
+            if (value <= 0L) {
+                editor.remove("access_token_expires_at_ms")
+            } else {
+                editor.putLong("access_token_expires_at_ms", value)
+            }
+            editor.apply()
+        }
+
     var appSessionKey: String?
         get() = prefs.getString("app_session_key", null)
         private set(value) {
@@ -82,6 +94,7 @@ class ApiClient(context: Context) {
         accessToken = null
         refreshToken = null
         appSessionKey = null
+        accessTokenExpiresAtMs = 0L
     }
 
     fun register(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
@@ -119,6 +132,7 @@ class ApiClient(context: Context) {
     }
 
     fun websocketRequest(): Result<Request> = runCatching {
+        ensureFreshSessionForRequest()
         val token = accessToken?.trim().orEmpty()
         val key = appSessionKey?.trim().orEmpty()
         if (token.isBlank()) error("access token is required")
@@ -237,9 +251,7 @@ class ApiClient(context: Context) {
     }
 
     private fun signedRequest(path: String): Request.Builder {
-        if ((accessToken.isNullOrBlank() || appSessionKey.isNullOrBlank()) && !refreshToken.isNullOrBlank()) {
-            refreshSessionForRetry()
-        }
+        ensureFreshSessionForRequest()
         val key = appSessionKey?.trim().orEmpty()
         if (key.isBlank()) error("app session key is required")
         val timestamp = System.currentTimeMillis().toString()
@@ -282,6 +294,20 @@ class ApiClient(context: Context) {
     private fun refreshSessionForRetry(): Boolean =
         refreshSession().isSuccess
 
+    private fun ensureFreshSessionForRequest() {
+        if (sessionNeedsRefresh() && !refreshToken.isNullOrBlank()) {
+            refreshSessionForRetry()
+        }
+    }
+
+    private fun sessionNeedsRefresh(): Boolean {
+        if (accessToken.isNullOrBlank() || appSessionKey.isNullOrBlank()) {
+            return true
+        }
+        val expiresAt = accessTokenExpiresAtMs
+        return expiresAt <= 0L || System.currentTimeMillis() >= expiresAt - TOKEN_REFRESH_MARGIN_MS
+    }
+
     private fun auth(path: String, walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
         runCatching {
             if (walletAddress.isBlank()) error("请输入钱包地址")
@@ -308,6 +334,8 @@ class ApiClient(context: Context) {
         accessToken = response.accessToken
         refreshToken = response.refreshToken
         appSessionKey = response.appSessionKey
+        val ttlMs = response.expiresIn.coerceIn(0L, MAX_AUTH_TTL_SECONDS) * 1000L
+        accessTokenExpiresAtMs = if (ttlMs > 0L) System.currentTimeMillis() + ttlMs else 0L
     }
 
     private fun httpError(prefix: String, response: okhttp3.Response): String {
@@ -341,3 +369,6 @@ private fun appSignature(key: String, timestamp: String, nonce: String): String 
     val payload = listOf("android", timestamp, nonce).joinToString(":")
     return mac.doFinal(payload.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }
 }
+
+private const val TOKEN_REFRESH_MARGIN_MS = 60_000L
+private const val MAX_AUTH_TTL_SECONDS = 30L * 24L * 60L * 60L
