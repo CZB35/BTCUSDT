@@ -2,7 +2,7 @@
 """Two-stage research model for seconds-accurate BTCUSDT event contracts.
 
 Offline only. The event result is measured as:
-close(entry_second + 600s) > close(entry_second).
+close(entry_second + settle_seconds) > close(entry_second).
 """
 
 from __future__ import annotations
@@ -30,10 +30,17 @@ except ImportError:  # pragma: no cover - optional research dependency
     CatBoostClassifier = None
 
 
-SETTLE_SECONDS = 600
+SETTLE_SECONDS = 1800
 WIN_USDT = 4.0
 LOSS_USDT = -5.0
 BREAKEVEN = 5.0 / 9.0
+
+
+def set_settle_seconds(seconds: int) -> None:
+    if seconds <= 0:
+        raise ValueError("settle seconds must be positive")
+    global SETTLE_SECONDS
+    SETTLE_SECONDS = seconds
 
 
 def load_prices(args: argparse.Namespace) -> pd.DataFrame:
@@ -190,7 +197,7 @@ def apply_label_delay(df: pd.DataFrame, delay_seconds: int) -> None:
     """Set the supervised label to match the intended execution delay.
 
     Features are still observed at signal time t. With delay_seconds=5 the
-    label becomes close(t + 5s + 600s) / close(t + 5s) - 1.
+    label becomes close(t + delay + settle_seconds) / close(t + delay) - 1.
     """
     if delay_seconds < 0:
         raise ValueError("label delay must be >= 0")
@@ -804,6 +811,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-max-features", default="sqrt")
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--move-label-bp", type=float, default=4.0)
+    parser.add_argument("--settle-seconds", type=int, default=SETTLE_SECONDS)
     parser.add_argument("--move-thresholds", default="0.52,0.56,0.60,0.64,0.68,0.72")
     parser.add_argument("--direction-thresholds", default="0.54,0.56,0.58,0.60,0.62,0.64,0.66")
     parser.add_argument("--up-direction-thresholds", default="")
@@ -856,6 +864,7 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     warnings.simplefilter("ignore", PerformanceWarning)
     args = parse_args()
+    set_settle_seconds(args.settle_seconds)
     df = load_prices(args)
     df, features = add_features(df)
     apply_label_delay(df, args.label_delay_seconds)

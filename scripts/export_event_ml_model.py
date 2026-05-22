@@ -66,6 +66,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--extra-max-features", default="sqrt")
     parser.add_argument("--jobs", type=int, default=8)
     parser.add_argument("--move-label-bp", type=float, default=4.0)
+    parser.add_argument("--settle-seconds", type=int, default=research.SETTLE_SECONDS)
     parser.add_argument("--move-threshold", type=float, default=0.68)
     parser.add_argument("--direction-threshold", type=float, default=0.58)
     parser.add_argument("--output", default="models/event_edge_ml_v1.json")
@@ -74,6 +75,7 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
+    research.set_settle_seconds(args.settle_seconds)
     model_args = SimpleNamespace(
         symbol=args.symbol,
         db=args.db,

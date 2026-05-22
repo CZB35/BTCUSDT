@@ -49,7 +49,6 @@ type HmacSha256 = Hmac<sha2::Sha256>;
 
 const DEFAULT_SYMBOL: &str = "BTCUSDT";
 const DEFAULT_PERIOD_SECONDS: i32 = 1800;
-const EVENT_ML_FEATURE_PERIOD_SECONDS: i32 = 600;
 const DEFAULT_PAYOUT_RATIO: Decimal = dec!(0.80);
 const PROFIT_SHARE_RATE: Decimal = dec!(0.30);
 const DEPOSIT_FEE_RATE: Decimal = dec!(0.25);
@@ -5330,6 +5329,60 @@ fn build_event_ml_prediction_decision(
     config: &PredictionConfig,
     model: &EventMlModel,
 ) -> Option<PredictionDecision> {
+    if model.period_seconds != DEFAULT_PERIOD_SECONDS {
+        let latest = snapshot.second_bars.last()?;
+        let price_time = millis_to_utc(latest.second_ms).ok()?;
+        let age_seconds = (Utc::now() - price_time).num_seconds();
+        return Some(PredictionDecision {
+            direction: "HOLD".to_string(),
+            confidence: 0.0,
+            predicted_return: 0.0,
+            entry_price: latest.close,
+            score: 0.0,
+            signal_cooldown_seconds: config.signal_cooldown_seconds,
+            market_source: "event_ml_aggtrade_1s".to_string(),
+            market_age_seconds: age_seconds,
+            market_candles: snapshot.second_bars.len(),
+            reason: format!(
+                "hold ml period mismatch model {}s signal {}s",
+                model.period_seconds, DEFAULT_PERIOD_SECONDS
+            ),
+            feature_snapshot: json!({
+                "market": {
+                    "source": "aggTrade_1s",
+                    "latest_price_time_ms": latest.second_ms,
+                    "age_seconds": age_seconds,
+                    "second_bars": snapshot.second_bars.len()
+                },
+                "config": {
+                    "model_version": model.version,
+                    "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
+                    "interval_seconds": config.interval_seconds,
+                    "signal_cooldown_seconds": config.signal_cooldown_seconds
+                },
+                "ml": {
+                    "model_version": model.version,
+                    "symbol": model.symbol,
+                    "period_seconds": model.period_seconds,
+                    "signal_period_seconds": DEFAULT_PERIOD_SECONDS,
+                    "feature_count": model.feature_names.len()
+                },
+                "scores": {
+                    "model_score": 0.0,
+                    "raw_confidence": 0.0
+                },
+                "decision": {
+                    "model_version": model.version,
+                    "candidate_direction": null,
+                    "candidate_mode": "ml_extra_trees",
+                    "candidate_rule": "period_mismatch",
+                    "pre_filter_passed": false,
+                    "pre_calibration_direction": "HOLD",
+                    "calibration_required": false
+                }
+            }),
+        });
+    }
     let prediction = event_ml_predict(model, &snapshot.second_bars)?;
     let latest = snapshot.second_bars.last()?;
     let price_time = millis_to_utc(latest.second_ms).ok()?;
@@ -6808,8 +6861,8 @@ fn event_ml_features(
         values.insert(format!("vol_{short}_vs_{long}"), value);
     }
     let seconds_of_day = ((latest.second_ms / 1_000).rem_euclid(86_400)) as f64;
-    let event_pos = (seconds_of_day % f64::from(EVENT_ML_FEATURE_PERIOD_SECONDS))
-        / f64::from(EVENT_ML_FEATURE_PERIOD_SECONDS);
+    let event_period_seconds = f64::from(DEFAULT_PERIOD_SECONDS);
+    let event_pos = (seconds_of_day % event_period_seconds) / event_period_seconds;
     values.insert("event_pos".to_string(), event_pos);
     values.insert(
         "event_sin".to_string(),
@@ -6977,6 +7030,7 @@ mod tests {
             serde_json::from_str(&text).expect("event ml model json should parse");
 
         assert_eq!(model.version, PREDICTION_MODEL_VERSION);
+        assert_eq!(model.period_seconds, DEFAULT_PERIOD_SECONDS);
         assert_eq!(model.feature_names.len(), 127);
         assert!(!model.models.move_model.trees.is_empty());
         assert!(!model.models.direction.trees.is_empty());
@@ -7017,10 +7071,13 @@ mod tests {
         assert!((0.0..=1.0).contains(&prediction.move_probability));
         assert!((0.0..=1.0).contains(&prediction.up_probability));
         assert!(prediction.features.is_object());
-        assert_eq!(
-            prediction.features.as_object().map(|object| object.len()),
-            Some(model.feature_names.len())
-        );
+        let features = prediction
+            .features
+            .as_object()
+            .expect("feature snapshot should be an object");
+        for name in &model.feature_names {
+            assert!(features.contains_key(name), "missing feature {name}");
+        }
     }
 
     #[test]
@@ -11078,13 +11135,13 @@ async fn db_prediction_calibration(
           join lateral (
             select entry_price
             from prediction_observations p
-            where p.created_at >= o.created_at + interval '10 minutes'
+            where p.created_at >= o.created_at + make_interval(secs => $8::double precision)
             order by p.created_at asc
             limit 1
           ) f on true
           where o.model_version = $1
             and o.created_at >= now() - ($2::text || ' minutes')::interval
-            and o.created_at <= now() - interval '10 minutes'
+            and o.created_at <= now() - make_interval(secs => $8::double precision)
             and o.feature_snapshot->'decision'->>'candidate_mode' = $3
             and o.feature_snapshot->'decision'->>'candidate_rule' = $4
             and o.feature_snapshot->'decision'->>'candidate_direction' = $5
@@ -11112,6 +11169,7 @@ async fn db_prediction_calibration(
     .bind(&candidate.direction)
     .bind(config.calibration_sample_seconds.max(1))
     .bind(prediction_candidate_min_confidence(candidate))
+    .bind(DEFAULT_PERIOD_SECONDS)
     .fetch_one(pool)
     .await
     .map_err(AppError::from_sqlx)?;
