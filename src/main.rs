@@ -140,6 +140,7 @@ const EVENT_ML_SLOW_REVERSAL_MIN_RET_3M: f64 = 0.00110;
 const EVENT_ML_SLOW_REVERSAL_MIN_RET_5M: f64 = 0.00170;
 const EVENT_ML_SLOW_REVERSAL_MIN_RET_7M: f64 = 0.00210;
 const EVENT_ML_SLOW_REVERSAL_EXTREME_POS: f64 = 0.15;
+const EVENT_ML_SLOW_REVERSAL_RULE: &str = "slow_trend_reversal_1_3_5_7_live";
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -580,12 +581,6 @@ fn start_prediction_loop(state: &SharedState) {
                         }
                     }
                     if decision.direction == "UP" || decision.direction == "DOWN" {
-                        if prediction_decision_uses_ml(&decision) {
-                            if let Err(err) = emit_prediction_signal(&state, &decision).await {
-                                mark_prediction_error(&state, err.message).await;
-                            }
-                            continue;
-                        }
                         match confirm_prediction_candidate(&state, &decision).await {
                             PredictionConfirmation::Waiting(message) => {
                                 let mut runtime = state.prediction_runtime.write().await;
@@ -679,6 +674,16 @@ async fn emit_prediction_signal(
         runtime.message = message;
         return Ok(());
     }
+    let platform_settings = load_platform_settings(state).await;
+    let active_signal_limit = max_active_event_orders_per_user(&platform_settings);
+    if let Some(message) =
+        guard_active_strategy_signal_limit(state, signal_created_at, active_signal_limit).await?
+    {
+        let mut runtime = state.prediction_runtime.write().await;
+        runtime.status = "active_limit_skipped".to_string();
+        runtime.message = message;
+        return Ok(());
+    }
     {
         let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
         *last_emitted_at = Some(signal_created_at);
@@ -730,6 +735,40 @@ async fn guard_prediction_signal_emit(
         ));
     }
     None
+}
+
+async fn guard_active_strategy_signal_limit(
+    state: &SharedState,
+    cycle_start: DateTime<Utc>,
+    active_signal_limit: usize,
+) -> Result<Option<String>, AppError> {
+    let active_count = active_strategy_signal_count(state, cycle_start).await?;
+    if active_count >= active_signal_limit {
+        return Ok(Some(format!(
+            "skip active signal limit {active_count}/{active_signal_limit} for overlapping {}m window",
+            DEFAULT_PERIOD_SECONDS / 60
+        )));
+    }
+    Ok(None)
+}
+
+async fn active_strategy_signal_count(
+    state: &SharedState,
+    cycle_start: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        return db_active_strategy_signal_count(pool, cycle_start).await;
+    }
+    let signals = state.signals.read().await;
+    Ok(signals
+        .iter()
+        .filter(|signal| {
+            signal.symbol == DEFAULT_SYMBOL
+                && signal.period_seconds == DEFAULT_PERIOD_SECONDS
+                && signal.cycle_start <= cycle_start
+                && signal.cycle_end > cycle_start
+        })
+        .count())
 }
 
 fn is_china_night_protection_window(now: DateTime<Utc>) -> bool {
@@ -6223,7 +6262,7 @@ fn prediction_candidate(
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
     match candidate.rule.as_str() {
         "two_stage_extra_trees" => 0.58,
-        "slow_trend_reversal_1_3_5_7" => EVENT_ML_SLOW_REVERSAL_MIN_CONFIDENCE,
+        EVENT_ML_SLOW_REVERSAL_RULE => EVENT_ML_SLOW_REVERSAL_MIN_CONFIDENCE,
         "reversal_up_from_impulse_down" => PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
         "reversal_down_from_impulse_up" => PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
         "mean_reversion_down" => PREDICTION_MEAN_REVERSION_DOWN_MIN_PROBABILITY,
@@ -6267,10 +6306,7 @@ async fn apply_prediction_calibration(
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
     }
-    if matches!(
-        candidate.rule.as_str(),
-        "two_stage_extra_trees" | "slow_trend_reversal_1_3_5_7"
-    ) {
+    if candidate.rule == "two_stage_extra_trees" {
         let calibration = PredictionCalibration {
             allowed: true,
             sample_count: config.calibration_min_samples as i64,
@@ -6355,11 +6391,13 @@ async fn confirm_prediction_candidate(
             candidate.raw_confidence, min_raw_confidence
         ));
     }
-    if let Some(reason) =
-        prediction_candidate_hard_filter_reason(&decision.feature_snapshot, &candidate)
-    {
-        clear_pending_prediction_candidate(state).await;
-        return PredictionConfirmation::Rejected(reason);
+    if !prediction_decision_uses_ml(decision) {
+        if let Some(reason) =
+            prediction_candidate_hard_filter_reason(&decision.feature_snapshot, &candidate)
+        {
+            clear_pending_prediction_candidate(state).await;
+            return PredictionConfirmation::Rejected(reason);
+        }
     }
 
     let now = Utc::now();
@@ -6558,7 +6596,7 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
             event_ml_slow_reversal_candidate(&features, move_probability)
         {
             direction = reversal_direction;
-            rule = "slow_trend_reversal_1_3_5_7".to_string();
+            rule = EVENT_ML_SLOW_REVERSAL_RULE.to_string();
             let adjusted_up_probability = if direction == "UP" {
                 reversal_confidence.max(up_probability)
             } else {
@@ -10984,6 +11022,32 @@ async fn db_insert_signal(pool: &PgPool, signal: &SignalCore) -> Result<bool, Ap
     .await
     .map(|result| result.rows_affected() > 0)
     .map_err(AppError::from_sqlx)
+}
+
+async fn db_active_strategy_signal_count(
+    pool: &PgPool,
+    cycle_start: DateTime<Utc>,
+) -> Result<usize, AppError> {
+    let count: i64 = sqlx::query(
+        r#"
+        select count(*) as count
+        from signals
+        where symbol = $1
+          and period_seconds = $2
+          and cycle_start <= $3
+          and cycle_end > $3
+          and model_version = $4
+        "#,
+    )
+    .bind(DEFAULT_SYMBOL)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .bind(cycle_start)
+    .bind(PREDICTION_MODEL_VERSION)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?
+    .get("count");
+    Ok(usize::try_from(count).unwrap_or(usize::MAX))
 }
 
 async fn db_insert_prediction_audit(
