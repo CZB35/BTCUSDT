@@ -5312,6 +5312,9 @@ fn build_event_ml_warmup_decision(
     config: &PredictionConfig,
     model: &EventMlModel,
 ) -> PredictionDecision {
+    let entry_age_seconds = millis_to_utc(snapshot.latest_price_time_ms)
+        .map(|price_time| (Utc::now() - price_time).num_seconds())
+        .unwrap_or(0);
     PredictionDecision {
         direction: "HOLD".to_string(),
         confidence: 0.0,
@@ -5319,8 +5322,8 @@ fn build_event_ml_warmup_decision(
         entry_price: snapshot.latest_price,
         score: 0.0,
         signal_cooldown_seconds: config.signal_cooldown_seconds,
-        market_source: "event_ml_aggtrade_1s".to_string(),
-        market_age_seconds: 0,
+        market_source: snapshot.latest_source.clone(),
+        market_age_seconds: entry_age_seconds,
         market_candles: snapshot.second_bars.len(),
         reason: format!(
             "hold ml warming up second_bars {}/{}",
@@ -5329,7 +5332,10 @@ fn build_event_ml_warmup_decision(
         ),
         feature_snapshot: json!({
             "market": {
-                "source": "aggTrade_1s",
+                "source": snapshot.latest_source.clone(),
+                "feature_source": "aggTrade_1s",
+                "latest_price_time_ms": snapshot.latest_price_time_ms,
+                "age_seconds": entry_age_seconds,
                 "second_bars": snapshot.second_bars.len()
             },
             "config": {
@@ -5370,17 +5376,19 @@ fn build_event_ml_prediction_decision(
 ) -> Option<PredictionDecision> {
     if model.period_seconds != DEFAULT_PERIOD_SECONDS {
         let latest = snapshot.second_bars.last()?;
-        let price_time = millis_to_utc(latest.second_ms).ok()?;
-        let age_seconds = (Utc::now() - price_time).num_seconds();
+        let entry_price_time = millis_to_utc(snapshot.latest_price_time_ms).ok()?;
+        let feature_price_time = millis_to_utc(latest.second_ms).ok()?;
+        let entry_age_seconds = (Utc::now() - entry_price_time).num_seconds();
+        let feature_age_seconds = (Utc::now() - feature_price_time).num_seconds();
         return Some(PredictionDecision {
             direction: "HOLD".to_string(),
             confidence: 0.0,
             predicted_return: 0.0,
-            entry_price: latest.close,
+            entry_price: snapshot.latest_price,
             score: 0.0,
             signal_cooldown_seconds: config.signal_cooldown_seconds,
-            market_source: "event_ml_aggtrade_1s".to_string(),
-            market_age_seconds: age_seconds,
+            market_source: snapshot.latest_source.clone(),
+            market_age_seconds: entry_age_seconds,
             market_candles: snapshot.second_bars.len(),
             reason: format!(
                 "hold ml period mismatch model {}s signal {}s",
@@ -5388,9 +5396,14 @@ fn build_event_ml_prediction_decision(
             ),
             feature_snapshot: json!({
                 "market": {
-                    "source": "aggTrade_1s",
-                    "latest_price_time_ms": latest.second_ms,
-                    "age_seconds": age_seconds,
+                    "source": snapshot.latest_source.clone(),
+                    "feature_source": "aggTrade_1s",
+                    "latest_price_time_ms": snapshot.latest_price_time_ms,
+                    "feature_price_time_ms": latest.second_ms,
+                    "age_seconds": entry_age_seconds,
+                    "feature_age_seconds": feature_age_seconds,
+                    "entry_price": snapshot.latest_price,
+                    "feature_price": latest.close,
                     "second_bars": snapshot.second_bars.len()
                 },
                 "config": {
@@ -5424,8 +5437,10 @@ fn build_event_ml_prediction_decision(
     }
     let prediction = event_ml_predict(model, &snapshot.second_bars)?;
     let latest = snapshot.second_bars.last()?;
-    let price_time = millis_to_utc(latest.second_ms).ok()?;
-    let age_seconds = (Utc::now() - price_time).num_seconds();
+    let entry_price_time = millis_to_utc(snapshot.latest_price_time_ms).ok()?;
+    let feature_price_time = millis_to_utc(latest.second_ms).ok()?;
+    let entry_age_seconds = (Utc::now() - entry_price_time).num_seconds();
+    let feature_age_seconds = (Utc::now() - feature_price_time).num_seconds();
     let mut direction = prediction.direction.clone();
     let mut reason = if let Some(reason) = prediction.filtered_reason.clone() {
         reason
@@ -5447,9 +5462,12 @@ fn build_event_ml_prediction_decision(
             model.thresholds.direction_probability
         )
     };
-    if age_seconds > config.stale_seconds {
+    if feature_age_seconds > config.stale_seconds {
         direction = "HOLD".to_string();
-        reason = format!("hold ml stale data age {age_seconds}s");
+        reason = format!("hold ml stale feature data age {feature_age_seconds}s");
+    } else if entry_age_seconds > config.stale_seconds {
+        direction = "HOLD".to_string();
+        reason = format!("hold ml stale index data age {entry_age_seconds}s");
     }
     let confidence = if direction == "DOWN" {
         1.0 - prediction.up_probability
@@ -5463,18 +5481,23 @@ fn build_event_ml_prediction_decision(
         direction: direction.clone(),
         confidence,
         predicted_return,
-        entry_price: latest.close,
+        entry_price: snapshot.latest_price,
         score: prediction.score,
         signal_cooldown_seconds: config.signal_cooldown_seconds,
-        market_source: "event_ml_aggtrade_1s".to_string(),
-        market_age_seconds: age_seconds,
+        market_source: snapshot.latest_source.clone(),
+        market_age_seconds: entry_age_seconds,
         market_candles: snapshot.second_bars.len(),
         reason,
         feature_snapshot: json!({
             "market": {
-                "source": "aggTrade_1s",
-                "latest_price_time_ms": latest.second_ms,
-                "age_seconds": age_seconds,
+                "source": snapshot.latest_source.clone(),
+                "feature_source": "aggTrade_1s",
+                "latest_price_time_ms": snapshot.latest_price_time_ms,
+                "feature_price_time_ms": latest.second_ms,
+                "age_seconds": entry_age_seconds,
+                "feature_age_seconds": feature_age_seconds,
+                "entry_price": snapshot.latest_price,
+                "feature_price": latest.close,
                 "second_bars": snapshot.second_bars.len()
             },
             "config": {
