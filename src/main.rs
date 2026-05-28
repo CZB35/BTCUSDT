@@ -101,7 +101,7 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v1";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v2";
 const FALLBACK_PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
 const DEFAULT_EVENT_ML_MODEL_PATH: &str = "models/event_edge_ml_v1.json";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 720;
@@ -688,6 +688,17 @@ async fn emit_prediction_signal(
         return Ok(());
     }
     if let Some(pool) = state.db.as_ref() {
+        if let Some(message) =
+            guard_open_strategy_candidate(pool, decision, signal_created_at).await?
+        {
+            let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
+            *last_emitted_at = Some(signal_created_at);
+            drop(last_emitted_at);
+            let mut runtime = state.prediction_runtime.write().await;
+            runtime.status = "open_candidate_skipped".to_string();
+            runtime.message = message;
+            return Ok(());
+        }
         if let Some(message) = guard_recent_strategy_losses(pool, decision).await? {
             let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
             *last_emitted_at = Some(signal_created_at);
@@ -719,6 +730,48 @@ async fn emit_prediction_signal(
         signal.direction, decision.score, decision.confidence
     );
     Ok(())
+}
+
+async fn guard_open_strategy_candidate(
+    pool: &PgPool,
+    decision: &PredictionDecision,
+    now: DateTime<Utc>,
+) -> Result<Option<String>, AppError> {
+    let Some(candidate) = prediction_candidate_from_snapshot(&decision.feature_snapshot) else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        r#"
+        select count(*)::bigint as count
+        from signals s
+        join prediction_audit_logs a on a.signal_id = s.id
+        where s.symbol = $1
+          and s.period_seconds = $2
+          and s.model_version = $3
+          and s.direction = $4
+          and s.cycle_end > $5
+          and a.feature_snapshot->'decision'->>'candidate_mode' = $6
+          and a.feature_snapshot->'decision'->>'candidate_rule' = $7
+        "#,
+    )
+    .bind(DEFAULT_SYMBOL)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(&candidate.direction)
+    .bind(now)
+    .bind(&candidate.mode)
+    .bind(&candidate.rule)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    let open_count: i64 = row.get("count");
+    if open_count > 0 {
+        return Ok(Some(format!(
+            "skip open candidate {} mode {} rule {} active {} waiting settlement",
+            candidate.direction, candidate.mode, candidate.rule, open_count
+        )));
+    }
+    Ok(None)
 }
 
 async fn guard_recent_strategy_losses(
