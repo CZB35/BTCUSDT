@@ -1561,6 +1561,7 @@ struct MarketDataState {
     price_points: BTreeMap<i64, f64>,
     second_bars: BTreeMap<i64, MarketSecondBar>,
     last_second_close: Option<f64>,
+    last_second_close_from_index: bool,
     latest_price: Option<f64>,
     latest_price_time_ms: Option<i64>,
     latest_source: Option<String>,
@@ -1583,6 +1584,7 @@ struct MarketSecondBar {
     taker_buy_volume: f64,
     taker_sell_volume: f64,
     trade_count: i32,
+    price_from_index: bool,
 }
 
 #[derive(Clone)]
@@ -5186,12 +5188,41 @@ async fn update_market_index_price(
     event_time_ms: i64,
 ) -> Result<(), AppError> {
     let price = parse_market_f64(&index_price)?;
+    let second_ms = event_time_ms - event_time_ms.rem_euclid(1_000);
     let mut market = state.market_data.write().await;
     market.latest_price = Some(price);
     market.latest_price_time_ms = Some(event_time_ms);
     market.latest_source = Some("indexPrice".to_string());
     market.price_points.insert(event_time_ms, price);
     trim_market_price_points(&mut market, DEFAULT_PREDICTION_CANDLE_LIMIT * 60 * 2);
+    fill_missing_second_bars(&mut market, second_ms);
+    let bar = market
+        .second_bars
+        .entry(second_ms)
+        .or_insert_with(|| MarketSecondBar {
+            second_ms,
+            high: price,
+            low: price,
+            close: price,
+            volume: 0.0,
+            taker_buy_volume: 0.0,
+            taker_sell_volume: 0.0,
+            trade_count: 0,
+            price_from_index: true,
+        });
+    if bar.price_from_index {
+        bar.high = bar.high.max(price);
+        bar.low = bar.low.min(price);
+        bar.close = price;
+    } else {
+        bar.high = price;
+        bar.low = price;
+        bar.close = price;
+        bar.price_from_index = true;
+    }
+    market.last_second_close = Some(price);
+    market.last_second_close_from_index = true;
+    trim_market_second_bars(&mut market, EVENT_ML_WARM_SECONDS + 1200);
     if let Some(mark_price) = mark_price {
         market.latest_mark_price = Some(parse_market_f64(&mark_price)?);
     }
@@ -5210,6 +5241,7 @@ async fn update_market_agg_trade(
     let trade_count = (trade.last_trade_id - trade.first_trade_id + 1).max(1) as i32;
     let mut market = state.market_data.write().await;
     fill_missing_second_bars(&mut market, second_ms);
+    let mut trade_updated_bar_price = false;
     let bar = market
         .second_bars
         .entry(second_ms)
@@ -5222,10 +5254,14 @@ async fn update_market_agg_trade(
             taker_buy_volume: 0.0,
             taker_sell_volume: 0.0,
             trade_count: 0,
+            price_from_index: false,
         });
-    bar.high = bar.high.max(price);
-    bar.low = bar.low.min(price);
-    bar.close = price;
+    if !bar.price_from_index {
+        bar.high = bar.high.max(price);
+        bar.low = bar.low.min(price);
+        bar.close = price;
+        trade_updated_bar_price = true;
+    }
     bar.volume += quantity;
     if trade.is_buyer_maker {
         bar.taker_sell_volume += quantity;
@@ -5233,7 +5269,10 @@ async fn update_market_agg_trade(
         bar.taker_buy_volume += quantity;
     }
     bar.trade_count += trade_count;
-    market.last_second_close = Some(price);
+    if trade_updated_bar_price {
+        market.last_second_close = Some(price);
+        market.last_second_close_from_index = false;
+    }
     market.latest_trade_price = Some(price);
     if market.latest_price.is_none() {
         market.latest_price = Some(price);
@@ -5314,9 +5353,11 @@ fn fill_missing_second_bars(market: &mut MarketDataState, current_second_ms: i64
     let max_fill = 300;
     let mut second_ms = last_second_ms + 1_000;
     let mut filled = 0;
+    let mut price_from_index = market.last_second_close_from_index;
     while second_ms < current_second_ms && filled < max_fill {
         if let Some(last) = market.second_bars.get(&(second_ms - 1_000)) {
             price = last.close;
+            price_from_index = last.price_from_index;
         }
         market.second_bars.insert(
             second_ms,
@@ -5329,6 +5370,7 @@ fn fill_missing_second_bars(market: &mut MarketDataState, current_second_ms: i64
                 taker_buy_volume: 0.0,
                 taker_sell_volume: 0.0,
                 trade_count: 0,
+                price_from_index,
             },
         );
         second_ms += 1_000;
@@ -5394,7 +5436,7 @@ fn build_event_ml_warmup_decision(
         feature_snapshot: json!({
             "market": {
                 "source": snapshot.latest_source.clone(),
-                "feature_source": "aggTrade_1s",
+                "feature_source": "indexPrice_1s",
                 "latest_price_time_ms": snapshot.latest_price_time_ms,
                 "age_seconds": entry_age_seconds,
                 "second_bars": snapshot.second_bars.len()
@@ -5458,13 +5500,14 @@ fn build_event_ml_prediction_decision(
             feature_snapshot: json!({
                 "market": {
                     "source": snapshot.latest_source.clone(),
-                    "feature_source": "aggTrade_1s",
+                    "feature_source": "indexPrice_1s",
                     "latest_price_time_ms": snapshot.latest_price_time_ms,
                     "feature_price_time_ms": latest.second_ms,
                     "age_seconds": entry_age_seconds,
                     "feature_age_seconds": feature_age_seconds,
                     "entry_price": snapshot.latest_price,
                     "feature_price": latest.close,
+                    "feature_price_from_index": latest.price_from_index,
                     "second_bars": snapshot.second_bars.len()
                 },
                 "config": {
@@ -5552,13 +5595,14 @@ fn build_event_ml_prediction_decision(
         feature_snapshot: json!({
             "market": {
                 "source": snapshot.latest_source.clone(),
-                "feature_source": "aggTrade_1s",
+                "feature_source": "indexPrice_1s",
                 "latest_price_time_ms": snapshot.latest_price_time_ms,
                 "feature_price_time_ms": latest.second_ms,
                 "age_seconds": entry_age_seconds,
                 "feature_age_seconds": feature_age_seconds,
                 "entry_price": snapshot.latest_price,
                 "feature_price": latest.close,
+                "feature_price_from_index": latest.price_from_index,
                 "second_bars": snapshot.second_bars.len()
             },
             "config": {
@@ -7154,6 +7198,7 @@ mod tests {
                     taker_buy_volume: 2.0 + wave.max(0.0),
                     taker_sell_volume: 2.0 + (-wave).max(0.0),
                     trade_count: 8,
+                    price_from_index: true,
                 }
             })
             .collect()
