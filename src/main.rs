@@ -85,6 +85,9 @@ const NIGHT_PROTECTION_START_MINUTE: u32 = 30;
 const NIGHT_PROTECTION_END_MINUTE: u32 = 180;
 const NIGHT_CLUSTER_GAP_SECONDS: i64 = 180;
 const NIGHT_CLUSTER_SKIP_FIRST: usize = 2;
+const PREDICTION_LOSS_GUARD_LOOKBACK_HOURS: i64 = 12;
+const PREDICTION_LOSS_GUARD_MIN_RECENT: i64 = 3;
+const PREDICTION_LOSS_GUARD_MAX_WIN_RATE: f64 = 0.34;
 const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
 const DEFAULT_QUERY_LIMIT: i64 = 50;
 const MAX_QUERY_LIMIT: i64 = 500;
@@ -684,6 +687,17 @@ async fn emit_prediction_signal(
         runtime.message = message;
         return Ok(());
     }
+    if let Some(pool) = state.db.as_ref() {
+        if let Some(message) = guard_recent_strategy_losses(pool, decision).await? {
+            let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
+            *last_emitted_at = Some(signal_created_at);
+            drop(last_emitted_at);
+            let mut runtime = state.prediction_runtime.write().await;
+            runtime.status = "loss_guard".to_string();
+            runtime.message = message;
+            return Ok(());
+        }
+    }
     {
         let mut last_emitted_at = state.prediction_last_emitted_at.write().await;
         *last_emitted_at = Some(signal_created_at);
@@ -705,6 +719,53 @@ async fn emit_prediction_signal(
         signal.direction, decision.score, decision.confidence
     );
     Ok(())
+}
+
+async fn guard_recent_strategy_losses(
+    pool: &PgPool,
+    decision: &PredictionDecision,
+) -> Result<Option<String>, AppError> {
+    let Some(candidate) = prediction_candidate_from_snapshot(&decision.feature_snapshot) else {
+        return Ok(None);
+    };
+    let row = sqlx::query(
+        r#"
+        select count(*)::bigint as total,
+               coalesce(count(*) filter (where o.result = 'win'), 0)::bigint as wins,
+               coalesce(count(*) filter (where o.result = 'loss'), 0)::bigint as losses
+        from signal_outcomes o
+        join prediction_audit_logs a on a.signal_id = o.signal_id
+        where o.model_version = $1
+          and o.direction = $2
+          and o.created_at >= now() - ($3::text || ' hours')::interval
+          and a.feature_snapshot->'decision'->>'candidate_mode' = $4
+          and a.feature_snapshot->'decision'->>'candidate_rule' = $5
+        "#,
+    )
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(&candidate.direction)
+    .bind(PREDICTION_LOSS_GUARD_LOOKBACK_HOURS)
+    .bind(&candidate.mode)
+    .bind(&candidate.rule)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    let total: i64 = row.get("total");
+    let wins: i64 = row.get("wins");
+    let losses: i64 = row.get("losses");
+    if total < PREDICTION_LOSS_GUARD_MIN_RECENT {
+        return Ok(None);
+    }
+    let win_rate = wins as f64 / total as f64;
+    if losses >= PREDICTION_LOSS_GUARD_MIN_RECENT && win_rate <= PREDICTION_LOSS_GUARD_MAX_WIN_RATE
+    {
+        return Ok(Some(format!(
+            "loss guard skipped {} mode {} rule {} recent {}/{} win_rate {:.4}",
+            candidate.direction, candidate.mode, candidate.rule, wins, total, win_rate
+        )));
+    }
+    Ok(None)
 }
 
 async fn guard_prediction_signal_emit(
@@ -6326,26 +6387,6 @@ async fn apply_prediction_calibration(
             candidate.direction,
             candidate.structure_score
         );
-        merge_prediction_calibration(decision, &calibration, Some(&candidate));
-        return Ok(());
-    }
-    if candidate.rule == "two_stage_extra_trees" {
-        let calibration = PredictionCalibration {
-            allowed: true,
-            sample_count: config.calibration_min_samples as i64,
-            wins: config.calibration_min_samples as i64,
-            win_rate: candidate.raw_confidence,
-            ev_usdt: candidate.raw_confidence * 4.0 - (1.0 - candidate.raw_confidence) * 5.0,
-            min_samples: config.calibration_min_samples,
-            min_win_rate: config.calibration_min_win_rate,
-            min_ev_usdt: config.calibration_min_ev_usdt,
-            lookback_minutes: config.calibration_lookback_minutes,
-            sample_seconds: config.calibration_sample_seconds,
-            reason: format!(
-                "ml offline calibrated mode {} rule {} direction {} confidence {:.4}",
-                candidate.mode, candidate.rule, candidate.direction, candidate.raw_confidence
-            ),
-        };
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
     }
