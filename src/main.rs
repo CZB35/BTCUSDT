@@ -136,6 +136,11 @@ const PREDICTION_CONFIRMATION_SECONDS: i64 = 5;
 const PREDICTION_CONFIRMATION_MAX_ADVERSE_RET: f64 = 0.00018;
 const PREDICTION_MIN_RAW_CONFIDENCE: f64 = DEFAULT_PREDICTION_MIN_CONFIDENCE;
 const EVENT_ML_WARM_SECONDS: usize = 3600;
+const MARKET_SECOND_BARS_RESTORE_EXTRA_SECONDS: usize = 900;
+const MARKET_SECOND_BARS_RETENTION_SECONDS: i64 = 24 * 60 * 60;
+const MARKET_SECOND_BARS_CLEANUP_INTERVAL_SECONDS: u64 = 5 * 60;
+const MARKET_SECOND_BARS_BACKFILL_EXTRA_SECONDS: i64 = 180;
+const MARKET_SECOND_BARS_BACKFILL_MAX_PAGES: usize = 160;
 const EVENT_ML_SLOW_REVERSAL_MIN_CONFIDENCE: f64 = 0.60;
 const EVENT_ML_SLOW_REVERSAL_MIN_MOVE_PROBABILITY: f64 = 0.45;
 const EVENT_ML_SLOW_REVERSAL_MIN_RET_1M: f64 = 0.00055;
@@ -246,6 +251,7 @@ async fn main() -> anyhow::Result<()> {
     start_bsc_deposit_sync_worker(&state);
     start_reservation_release_worker(&state);
     start_market_data_feed(&state);
+    start_market_second_bar_retention_worker(&state);
     start_prediction_loop(&state);
     let app = router(state);
     let listener = tokio::net::TcpListener::bind(cli.listen).await?;
@@ -1716,6 +1722,20 @@ struct BinanceAggTradeStream {
     first_trade_id: i64,
     #[serde(rename = "l")]
     last_trade_id: i64,
+    #[serde(rename = "T")]
+    trade_time_ms: i64,
+    #[serde(rename = "m")]
+    is_buyer_maker: bool,
+}
+
+#[derive(Deserialize)]
+struct BinanceAggTradeRest {
+    #[serde(rename = "a")]
+    aggregate_trade_id: i64,
+    #[serde(rename = "p")]
+    price: String,
+    #[serde(rename = "q")]
+    quantity: String,
     #[serde(rename = "T")]
     trade_time_ms: i64,
     #[serde(rename = "m")]
@@ -5059,6 +5079,25 @@ fn start_market_data_feed(state: &SharedState) {
     });
 }
 
+fn start_market_second_bar_retention_worker(state: &SharedState) {
+    let Some(pool) = state.db.clone() else {
+        return;
+    };
+    tokio::spawn(async move {
+        loop {
+            if let Err(err) =
+                db_delete_old_market_second_bars(&pool, MARKET_SECOND_BARS_RETENTION_SECONDS).await
+            {
+                eprintln!("market second bar retention failed: {}", err.message);
+            }
+            tokio::time::sleep(StdDuration::from_secs(
+                MARKET_SECOND_BARS_CLEANUP_INTERVAL_SECONDS,
+            ))
+            .await;
+        }
+    });
+}
+
 async fn preheat_market_data(
     state: &SharedState,
     client: &reqwest::Client,
@@ -5066,6 +5105,26 @@ async fn preheat_market_data(
 ) -> Result<(), AppError> {
     let candles = fetch_prediction_candles(client, config).await?;
     let latest = candles.last().cloned();
+    let restore_limit = EVENT_ML_WARM_SECONDS + MARKET_SECOND_BARS_RESTORE_EXTRA_SECONDS;
+    let mut restored_second_bars = if let Some(pool) = state.db.as_ref() {
+        db_load_market_second_bars(pool, DEFAULT_SYMBOL, restore_limit).await?
+    } else {
+        Vec::new()
+    };
+    let target_now_ms = Utc::now().timestamp_millis();
+    let backfilled_second_bars =
+        match fetch_recent_agg_trade_second_bars(client, config, DEFAULT_SYMBOL, target_now_ms)
+            .await
+        {
+            Ok(bars) => bars,
+            Err(err) if restored_second_bars.len() >= EVENT_ML_WARM_SECONDS => {
+                eprintln!("market second bar REST backfill skipped: {}", err.message);
+                Vec::new()
+            }
+            Err(err) => return Err(err),
+        };
+    restored_second_bars.extend(backfilled_second_bars);
+    restored_second_bars = merge_market_second_bars(restored_second_bars);
     let mut market = state.market_data.write().await;
     for candle in candles {
         market.candles.insert(candle.open_time_ms, candle);
@@ -5084,6 +5143,27 @@ async fn preheat_market_data(
             market.price_points.insert(time_ms, price);
         }
         trim_market_price_points(&mut market, config.candle_limit * 60 * 2);
+    }
+    for bar in restored_second_bars {
+        fill_missing_second_bars(&mut market, bar.second_ms);
+        market.last_second_close = Some(bar.close);
+        market.last_second_close_from_index = bar.price_from_index;
+        market.price_points.insert(bar.second_ms, bar.close);
+        market.second_bars.insert(bar.second_ms, bar);
+    }
+    keep_contiguous_second_bar_tail(&mut market);
+    trim_market_second_bars(&mut market, EVENT_ML_WARM_SECONDS + 1200);
+    trim_market_price_points(&mut market, config.candle_limit * 60 * 2);
+    if let Some(latest_bar) = market.second_bars.values().next_back().cloned() {
+        market.latest_price = Some(latest_bar.close);
+        market.latest_price_time_ms = Some(latest_bar.second_ms);
+        market.latest_source = Some(if latest_bar.price_from_index {
+            "preheat_persisted_indexPrice_1s".to_string()
+        } else {
+            "preheat_aggTrade_1s".to_string()
+        });
+        market.last_second_close = Some(latest_bar.close);
+        market.last_second_close_from_index = latest_bar.price_from_index;
     }
     market.preheated_at = Some(Utc::now());
     market.last_error = None;
@@ -5148,6 +5228,91 @@ async fn fetch_prediction_candles(
         ));
     }
     Ok(candles)
+}
+
+async fn fetch_recent_agg_trade_second_bars(
+    client: &reqwest::Client,
+    config: &PredictionConfig,
+    symbol: &str,
+    now_ms: i64,
+) -> Result<Vec<MarketSecondBar>, AppError> {
+    let start_ms = now_ms
+        - ((EVENT_ML_WARM_SECONDS as i64 + MARKET_SECOND_BARS_BACKFILL_EXTRA_SECONDS) * 1_000);
+    let mut from_id: Option<i64> = None;
+    let mut page_start_ms = start_ms;
+    let mut bars = BTreeMap::<i64, MarketSecondBar>::new();
+    for _ in 0..MARKET_SECOND_BARS_BACKFILL_MAX_PAGES {
+        let url = if let Some(from_id) = from_id {
+            format!(
+                "{}/fapi/v1/aggTrades?symbol={symbol}&fromId={from_id}&limit=1000",
+                config.market_data_base_url
+            )
+        } else {
+            format!(
+                "{}/fapi/v1/aggTrades?symbol={symbol}&startTime={page_start_ms}&endTime={now_ms}&limit=1000",
+                config.market_data_base_url
+            )
+        };
+        let response = client
+            .get(url)
+            .send()
+            .await
+            .map_err(|err| AppError::bad_request("PREDICTION_DATA_FAILED", err.to_string()))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let text = response.text().await.unwrap_or_default();
+            return Err(AppError::bad_request(
+                "PREDICTION_DATA_FAILED",
+                format!("aggTrade backfill failed: {status} {text}"),
+            ));
+        }
+        let raw = response
+            .json::<Vec<BinanceAggTradeRest>>()
+            .await
+            .map_err(|err| AppError::bad_request("PREDICTION_DATA_INVALID", err.to_string()))?;
+        if raw.is_empty() {
+            break;
+        }
+        let mut latest_trade_ms = page_start_ms;
+        let mut latest_trade_id = from_id.unwrap_or(0);
+        for trade in raw {
+            latest_trade_ms = latest_trade_ms.max(trade.trade_time_ms);
+            latest_trade_id = latest_trade_id.max(trade.aggregate_trade_id);
+            if trade.trade_time_ms < start_ms || trade.trade_time_ms > now_ms - 500 {
+                continue;
+            }
+            let price = parse_market_f64(&trade.price)?;
+            let quantity = parse_market_f64(&trade.quantity)?;
+            let second_ms = trade.trade_time_ms - trade.trade_time_ms.rem_euclid(1_000);
+            let bar = bars.entry(second_ms).or_insert_with(|| MarketSecondBar {
+                second_ms,
+                high: price,
+                low: price,
+                close: price,
+                volume: 0.0,
+                taker_buy_volume: 0.0,
+                taker_sell_volume: 0.0,
+                trade_count: 0,
+                price_from_index: false,
+            });
+            bar.high = bar.high.max(price);
+            bar.low = bar.low.min(price);
+            bar.close = price;
+            bar.volume += quantity;
+            if trade.is_buyer_maker {
+                bar.taker_sell_volume += quantity;
+            } else {
+                bar.taker_buy_volume += quantity;
+            }
+            bar.trade_count += 1;
+        }
+        if latest_trade_ms >= now_ms - 1_000 {
+            break;
+        }
+        page_start_ms = latest_trade_ms + 1;
+        from_id = latest_trade_id.checked_add(1);
+    }
+    Ok(bars.into_values().collect())
 }
 
 async fn run_market_ws(state: &SharedState, config: &PredictionConfig) -> Result<(), AppError> {
@@ -5241,46 +5406,66 @@ async fn update_market_index_price(
     event_time_ms: i64,
 ) -> Result<(), AppError> {
     let price = parse_market_f64(&index_price)?;
+    let mark_price = mark_price.as_deref().map(parse_market_f64).transpose()?;
     let second_ms = event_time_ms - event_time_ms.rem_euclid(1_000);
-    let mut market = state.market_data.write().await;
-    market.latest_price = Some(price);
-    market.latest_price_time_ms = Some(event_time_ms);
-    market.latest_source = Some("indexPrice".to_string());
-    market.price_points.insert(event_time_ms, price);
-    trim_market_price_points(&mut market, DEFAULT_PREDICTION_CANDLE_LIMIT * 60 * 2);
-    fill_missing_second_bars(&mut market, second_ms);
-    let bar = market
-        .second_bars
-        .entry(second_ms)
-        .or_insert_with(|| MarketSecondBar {
-            second_ms,
-            high: price,
-            low: price,
-            close: price,
-            volume: 0.0,
-            taker_buy_volume: 0.0,
-            taker_sell_volume: 0.0,
-            trade_count: 0,
-            price_from_index: true,
-        });
-    if bar.price_from_index {
-        bar.high = bar.high.max(price);
-        bar.low = bar.low.min(price);
-        bar.close = price;
-    } else {
-        bar.high = price;
-        bar.low = price;
-        bar.close = price;
-        bar.price_from_index = true;
+    let bars_to_store = {
+        let mut market = state.market_data.write().await;
+        market.latest_price = Some(price);
+        market.latest_price_time_ms = Some(event_time_ms);
+        market.latest_source = Some("indexPrice".to_string());
+        market.price_points.insert(event_time_ms, price);
+        trim_market_price_points(&mut market, DEFAULT_PREDICTION_CANDLE_LIMIT * 60 * 2);
+        let mut bars_to_store = fill_missing_second_bars(&mut market, second_ms);
+        if let Some(previous_bar) = market
+            .second_bars
+            .get(&(second_ms - 1_000))
+            .filter(|bar| bar.price_from_index)
+            .cloned()
+        {
+            bars_to_store.push(previous_bar);
+        }
+        let updated_bar = {
+            let bar = market
+                .second_bars
+                .entry(second_ms)
+                .or_insert_with(|| MarketSecondBar {
+                    second_ms,
+                    high: price,
+                    low: price,
+                    close: price,
+                    volume: 0.0,
+                    taker_buy_volume: 0.0,
+                    taker_sell_volume: 0.0,
+                    trade_count: 0,
+                    price_from_index: true,
+                });
+            if bar.price_from_index {
+                bar.high = bar.high.max(price);
+                bar.low = bar.low.min(price);
+                bar.close = price;
+            } else {
+                bar.high = price;
+                bar.low = price;
+                bar.close = price;
+                bar.price_from_index = true;
+            }
+            bar.clone()
+        };
+        bars_to_store.push(updated_bar);
+        market.last_second_close = Some(price);
+        market.last_second_close_from_index = true;
+        keep_contiguous_second_bar_tail(&mut market);
+        trim_market_second_bars(&mut market, EVENT_ML_WARM_SECONDS + 1200);
+        if let Some(mark_price) = mark_price {
+            market.latest_mark_price = Some(mark_price);
+        }
+        market.last_message_at = Some(Utc::now());
+        market.last_error = None;
+        bars_to_store
+    };
+    if let Some(pool) = state.db.as_ref() {
+        db_upsert_market_second_bars(pool, DEFAULT_SYMBOL, &bars_to_store).await?;
     }
-    market.last_second_close = Some(price);
-    market.last_second_close_from_index = true;
-    trim_market_second_bars(&mut market, EVENT_ML_WARM_SECONDS + 1200);
-    if let Some(mark_price) = mark_price {
-        market.latest_mark_price = Some(parse_market_f64(&mark_price)?);
-    }
-    market.last_message_at = Some(Utc::now());
-    market.last_error = None;
     Ok(())
 }
 
@@ -5393,42 +5578,92 @@ fn trim_market_second_bars(market: &mut MarketDataState, max_len: usize) {
     }
 }
 
-fn fill_missing_second_bars(market: &mut MarketDataState, current_second_ms: i64) {
+fn fill_missing_second_bars(
+    market: &mut MarketDataState,
+    current_second_ms: i64,
+) -> Vec<MarketSecondBar> {
     let Some(last_second_ms) = market.second_bars.keys().next_back().copied() else {
-        return;
+        return Vec::new();
     };
     if current_second_ms <= last_second_ms + 1_000 {
-        return;
+        return Vec::new();
     }
     let Some(mut price) = market.last_second_close else {
-        return;
+        return Vec::new();
     };
     let max_fill = 300;
     let mut second_ms = last_second_ms + 1_000;
     let mut filled = 0;
     let mut price_from_index = market.last_second_close_from_index;
+    let mut inserted = Vec::new();
     while second_ms < current_second_ms && filled < max_fill {
         if let Some(last) = market.second_bars.get(&(second_ms - 1_000)) {
             price = last.close;
             price_from_index = last.price_from_index;
         }
-        market.second_bars.insert(
+        let bar = MarketSecondBar {
             second_ms,
-            MarketSecondBar {
-                second_ms,
-                high: price,
-                low: price,
-                close: price,
-                volume: 0.0,
-                taker_buy_volume: 0.0,
-                taker_sell_volume: 0.0,
-                trade_count: 0,
-                price_from_index,
-            },
-        );
+            high: price,
+            low: price,
+            close: price,
+            volume: 0.0,
+            taker_buy_volume: 0.0,
+            taker_sell_volume: 0.0,
+            trade_count: 0,
+            price_from_index,
+        };
+        market.second_bars.insert(second_ms, bar.clone());
+        inserted.push(bar);
         second_ms += 1_000;
         filled += 1;
     }
+    if second_ms < current_second_ms {
+        market.second_bars.retain(|key, _| *key >= second_ms);
+    }
+    inserted
+}
+
+fn keep_contiguous_second_bar_tail(market: &mut MarketDataState) {
+    let keys = market.second_bars.keys().copied().collect::<Vec<_>>();
+    let Some(mut start_ms) = keys.last().copied() else {
+        return;
+    };
+    for pair in keys.windows(2).rev() {
+        if pair[1] == pair[0] + 1_000 {
+            start_ms = pair[0];
+        } else {
+            break;
+        }
+    }
+    market.second_bars.retain(|key, _| *key >= start_ms);
+}
+
+fn merge_market_second_bars(bars: Vec<MarketSecondBar>) -> Vec<MarketSecondBar> {
+    let mut merged = BTreeMap::<i64, MarketSecondBar>::new();
+    for bar in bars {
+        merged
+            .entry(bar.second_ms)
+            .and_modify(|existing| merge_market_second_bar(existing, &bar))
+            .or_insert(bar);
+    }
+    merged.into_values().collect()
+}
+
+fn merge_market_second_bar(existing: &mut MarketSecondBar, incoming: &MarketSecondBar) {
+    if incoming.price_from_index && !existing.price_from_index {
+        existing.high = incoming.high;
+        existing.low = incoming.low;
+        existing.close = incoming.close;
+        existing.price_from_index = true;
+    } else if existing.price_from_index == incoming.price_from_index {
+        existing.high = existing.high.max(incoming.high);
+        existing.low = existing.low.min(incoming.low);
+        existing.close = incoming.close;
+    }
+    existing.volume = existing.volume.max(incoming.volume);
+    existing.taker_buy_volume = existing.taker_buy_volume.max(incoming.taker_buy_volume);
+    existing.taker_sell_volume = existing.taker_sell_volume.max(incoming.taker_sell_volume);
+    existing.trade_count = existing.trade_count.max(incoming.trade_count);
 }
 
 fn parse_market_f64(value: &str) -> Result<f64, AppError> {
@@ -5625,6 +5860,9 @@ fn build_event_ml_prediction_decision(
     } else if entry_age_seconds > config.stale_seconds {
         direction = "HOLD".to_string();
         reason = format!("hold ml stale index data age {entry_age_seconds}s");
+    } else if !latest.price_from_index {
+        direction = "HOLD".to_string();
+        reason = "hold ml waiting for live indexPrice_1s after REST backfill".to_string();
     }
     let confidence = if direction == "DOWN" {
         1.0 - prediction.up_probability
@@ -7290,6 +7528,28 @@ mod tests {
         bars[EVENT_ML_WARM_SECONDS / 2].second_ms += 1_000;
 
         assert!(event_ml_predict(&model, &bars).is_none());
+    }
+
+    #[test]
+    fn market_second_bar_tail_keeps_only_latest_contiguous_window() {
+        let mut market = MarketDataState::default();
+        for bar in synthetic_second_bars(5) {
+            market.second_bars.insert(bar.second_ms, bar);
+        }
+        let mut tail = synthetic_second_bars(4);
+        for bar in &mut tail {
+            bar.second_ms += 60_000;
+        }
+        for bar in tail {
+            market.second_bars.insert(bar.second_ms, bar);
+        }
+
+        keep_contiguous_second_bar_tail(&mut market);
+
+        assert_eq!(market.second_bars.len(), 4);
+        let keys = market.second_bars.keys().copied().collect::<Vec<_>>();
+        assert!(keys.windows(2).all(|pair| pair[1] == pair[0] + 1_000));
+        assert!(keys[0] > 1_700_000_000_000 + 5_000);
     }
 }
 
@@ -11275,6 +11535,105 @@ async fn db_insert_prediction_observation(
     .execute(pool)
     .await
     .map(|_| ())
+    .map_err(AppError::from_sqlx)
+}
+
+async fn db_load_market_second_bars(
+    pool: &PgPool,
+    symbol: &str,
+    limit: usize,
+) -> Result<Vec<MarketSecondBar>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        select second_ms, high, low, close, volume, taker_buy_volume,
+               taker_sell_volume, trade_count, price_from_index
+        from (
+          select second_ms, high, low, close, volume, taker_buy_volume,
+                 taker_sell_volume, trade_count, price_from_index
+          from market_second_bars
+          where symbol = $1
+          order by second_ms desc
+          limit $2
+        ) recent
+        order by second_ms asc
+        "#,
+    )
+    .bind(symbol)
+    .bind(limit as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+    Ok(rows
+        .into_iter()
+        .map(|row| MarketSecondBar {
+            second_ms: row.get("second_ms"),
+            high: decimal_to_f64(row.get::<Decimal, _>("high")),
+            low: decimal_to_f64(row.get::<Decimal, _>("low")),
+            close: decimal_to_f64(row.get::<Decimal, _>("close")),
+            volume: decimal_to_f64(row.get::<Decimal, _>("volume")),
+            taker_buy_volume: decimal_to_f64(row.get::<Decimal, _>("taker_buy_volume")),
+            taker_sell_volume: decimal_to_f64(row.get::<Decimal, _>("taker_sell_volume")),
+            trade_count: row.get("trade_count"),
+            price_from_index: row.get("price_from_index"),
+        })
+        .collect())
+}
+
+async fn db_upsert_market_second_bars(
+    pool: &PgPool,
+    symbol: &str,
+    bars: &[MarketSecondBar],
+) -> Result<(), AppError> {
+    for bar in merge_market_second_bars(bars.to_vec()) {
+        sqlx::query(
+            r#"
+            insert into market_second_bars
+              (symbol, second_ms, high, low, close, volume, taker_buy_volume,
+               taker_sell_volume, trade_count, price_from_index, updated_at)
+            values ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, now())
+            on conflict (symbol, second_ms) do update set
+              high = greatest(market_second_bars.high, excluded.high),
+              low = least(market_second_bars.low, excluded.low),
+              close = excluded.close,
+              volume = greatest(market_second_bars.volume, excluded.volume),
+              taker_buy_volume = greatest(market_second_bars.taker_buy_volume, excluded.taker_buy_volume),
+              taker_sell_volume = greatest(market_second_bars.taker_sell_volume, excluded.taker_sell_volume),
+              trade_count = greatest(market_second_bars.trade_count, excluded.trade_count),
+              price_from_index = market_second_bars.price_from_index or excluded.price_from_index,
+              updated_at = now()
+            "#,
+        )
+        .bind(symbol)
+        .bind(bar.second_ms)
+        .bind(decimal_from_f64(bar.high, 18))
+        .bind(decimal_from_f64(bar.low, 18))
+        .bind(decimal_from_f64(bar.close, 18))
+        .bind(decimal_from_f64(bar.volume, 18))
+        .bind(decimal_from_f64(bar.taker_buy_volume, 18))
+        .bind(decimal_from_f64(bar.taker_sell_volume, 18))
+        .bind(bar.trade_count)
+        .bind(bar.price_from_index)
+        .execute(pool)
+        .await
+        .map_err(AppError::from_sqlx)?;
+    }
+    Ok(())
+}
+
+async fn db_delete_old_market_second_bars(
+    pool: &PgPool,
+    retention_seconds: i64,
+) -> Result<u64, AppError> {
+    sqlx::query(
+        r#"
+        delete from market_second_bars
+        where second_ms < ((extract(epoch from now()) * 1000)::bigint - ($1 * 1000))
+        "#,
+    )
+    .bind(retention_seconds)
+    .execute(pool)
+    .await
+    .map(|result| result.rows_affected())
     .map_err(AppError::from_sqlx)
 }
 
