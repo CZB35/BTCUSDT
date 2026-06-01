@@ -131,8 +131,6 @@ class AutomationForegroundService : Service() {
         scope.launch {
             val repository = EventSignalRepository(applicationContext)
             while (isActive) {
-                repository.refreshSession()
-                    .onFailure { reportSessionRefreshFailure(it, "session_refresh_before_ws_failed") }
                 repository.loadAutomationSettings()
                 val requestResult = repository.websocketRequest()
                 val request = requestResult.getOrNull()

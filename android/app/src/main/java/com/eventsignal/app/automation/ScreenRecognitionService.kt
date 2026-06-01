@@ -1,5 +1,6 @@
 package com.eventsignal.app.automation
 
+import android.graphics.Rect
 import android.view.accessibility.AccessibilityEvent
 import android.view.accessibility.AccessibilityNodeInfo
 
@@ -17,9 +18,11 @@ class ScreenRecognitionService {
         val nodes = collectNodes(root)
         val texts = nodes.map { it.textForMatching }.filter { it.isNotBlank() }.distinct()
         val pageKeywordHits = matchedKeywords(texts, profile.pageKeywords)
-        val amountFieldFound = findAmountField(nodes, profile) != null
-        val upButtonFound = findDirectionButton(nodes, profile.upButtonKeywords) != null
-        val downButtonFound = findDirectionButton(nodes, profile.downButtonKeywords) != null
+        val amountField = findAmountField(nodes, profile)
+        val pageBottom = nodes.maxOfOrNull { node -> node.bounds.bottom } ?: 0
+        val amountFieldFound = amountField != null
+        val upButtonFound = findDirectionButton(nodes, profile.upButtonKeywords, amountField?.bounds, pageBottom) != null
+        val downButtonFound = findDirectionButton(nodes, profile.downButtonKeywords, amountField?.bounds, pageBottom) != null
         val observedBalanceUsdt = extractObservedBalanceUsdt(texts)
         val observedIndexPrice = extractObservedIndexPrice(texts)
         val structure = detectEventContractStructure(texts, amountFieldFound, upButtonFound, downButtonFound)
@@ -185,12 +188,41 @@ class ScreenRecognitionService {
             text.contains(keyword, ignoreCase = true)
         }
 
-    private fun findDirectionButton(nodes: List<NodeSnapshot>, keywords: List<String>): NodeSnapshot? =
+    private fun findDirectionButton(
+        nodes: List<NodeSnapshot>,
+        keywords: List<String>,
+        amountBounds: Rect?,
+        pageBottom: Int,
+    ): NodeSnapshot? =
         nodes.firstOrNull { node ->
             node.isEnabled &&
                 (node.isClickable || node.parentClickable) &&
+                isInsideDirectionButtonZone(node.clickTargetBounds, amountBounds, pageBottom) &&
+                !looksLikePayoutLabel(node.textForMatching) &&
                 keywords.any { keyword -> node.textForMatching.contains(keyword, ignoreCase = true) }
         }
+
+    private fun looksLikePayoutLabel(label: String): Boolean =
+        label.contains("%") ||
+            label.contains("支付率") ||
+            label.contains("支付金额") ||
+            label.contains("Payout", ignoreCase = true)
+
+    private fun isInsideDirectionButtonZone(
+        bounds: Rect,
+        amountBounds: Rect?,
+        pageBottom: Int,
+    ): Boolean {
+        if (bounds.isEmpty) return false
+        if (bounds.width() < 120 || bounds.height() < 40) return false
+        if (pageBottom > 0 && bounds.centerY() < (pageBottom * 0.30f).toInt()) return false
+        if (amountBounds != null) {
+            if (bounds.centerY() <= amountBounds.bottom + 24) return false
+            if (bounds.centerY() > amountBounds.bottom + 520) return false
+        }
+        if (pageBottom > 0 && bounds.centerY() > pageBottom - 64) return false
+        return true
+    }
 
     private fun extractObservedBalanceUsdt(texts: List<String>): String? {
         val normalizedTexts = texts.map { it.replace(",", "").replace("\\s+".toRegex(), " ").trim() }
@@ -242,10 +274,25 @@ class ScreenRecognitionService {
             isClickable = isClickable,
             isFocusable = isFocusable,
             parentClickable = parent?.isClickable == true,
+            bounds = boundsInScreen(),
+            clickTargetBounds = clickTargetBounds(),
         )
 
     private fun String.normalized(): String =
         replace("\\s+".toRegex(), "")
+
+    private fun AccessibilityNodeInfo.boundsInScreen(): Rect =
+        Rect().also { getBoundsInScreen(it) }
+
+    private fun AccessibilityNodeInfo.clickTargetBounds(): Rect {
+        if (isClickable) return boundsInScreen()
+        var parentNode = parent
+        while (parentNode != null) {
+            if (parentNode.isClickable) return parentNode.boundsInScreen()
+            parentNode = parentNode.parent
+        }
+        return boundsInScreen()
+    }
 }
 
 private data class EventContractStructure(
@@ -268,6 +315,8 @@ private data class NodeSnapshot(
     val isClickable: Boolean,
     val isFocusable: Boolean,
     val parentClickable: Boolean,
+    val bounds: Rect,
+    val clickTargetBounds: Rect,
 )
 
 data class RecognizedScreen(

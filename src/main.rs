@@ -8252,7 +8252,25 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: Sess
             .to_string(),
         ))
         .await;
-    while let Ok(signal) = rx.recv().await {
+    loop {
+        tokio::select! {
+            socket_message = socket.recv() => {
+                match socket_message {
+                    Some(Ok(Message::Close(_))) | None => break,
+                    Some(Ok(Message::Ping(payload))) => {
+                        if socket.send(Message::Pong(payload)).await.is_err() {
+                            break;
+                        }
+                    }
+                    Some(Ok(_)) => {}
+                    Some(Err(_)) => break,
+                }
+                continue;
+            }
+            signal_result = rx.recv() => {
+                let Ok(signal) = signal_result else {
+                    break;
+                };
         let is_current_connection = state
             .active_ws_connections
             .read()
@@ -8355,6 +8373,8 @@ async fn websocket_loop(mut socket: WebSocket, state: SharedState, session: Sess
                 }
             }
             break;
+        }
+            }
         }
     }
     let mut active = state.active_ws_connections.write().await;
@@ -10014,8 +10034,7 @@ async fn settle_order_from_binance_income(
     } else {
         "LOSS"
     };
-    let (outcome_entry_price, outcome_expiry_price) =
-        db_signal_outcome_prices(pool, &order.signal_id).await?;
+    let outcome_expiry_price = db_signal_outcome_expiry_price(pool, &order.signal_id).await?;
     let now = Utc::now();
     let report = ExecutionReportRecord {
         id: Uuid::now_v7(),
@@ -10027,7 +10046,7 @@ async fn settle_order_from_binance_income(
         period_seconds: order.period_seconds,
         direction: order.direction.clone(),
         stake_usdt: order.stake_usdt,
-        entry_price: order.entry_price.or(outcome_entry_price),
+        entry_price: order.entry_price,
         expiry_price: outcome_expiry_price,
         payout_ratio: Some(DEFAULT_PAYOUT_RATIO),
         gross_profit: Some(gross_profit),
@@ -10042,16 +10061,16 @@ async fn settle_order_from_binance_income(
     db_insert_exchange_execution_report_and_settle(pool, &report, payout_event.as_ref()).await
 }
 
-async fn db_signal_outcome_prices(
+async fn db_signal_outcome_expiry_price(
     pool: &PgPool,
     signal_ref: &str,
-) -> Result<(Option<Decimal>, Option<Decimal>), AppError> {
+) -> Result<Option<Decimal>, AppError> {
     let Ok(signal_id) = Uuid::parse_str(signal_ref) else {
-        return Ok((None, None));
+        return Ok(None);
     };
     sqlx::query(
         r#"
-        select entry_price, expiry_price
+        select expiry_price
         from signal_outcomes
         where signal_id = $1
         "#,
@@ -10059,10 +10078,7 @@ async fn db_signal_outcome_prices(
     .bind(signal_id)
     .fetch_optional(pool)
     .await
-    .map(|row| {
-        row.map(|row| (row.get("entry_price"), row.get("expiry_price")))
-            .unwrap_or((None, None))
-    })
+    .map(|row| row.and_then(|row| row.get("expiry_price")))
     .map_err(AppError::from_sqlx)
 }
 
@@ -13726,11 +13742,10 @@ async fn db_pending_exchange_orders(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
                o.symbol, o.period_seconds, o.direction, o.stake_usdt,
-               coalesce(o.entry_price, s.entry_price) as entry_price,
+               o.entry_price as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
-        left join signals s on s.id::text = o.signal_ref
         where o.exchange_verification_status in ('unverified', 'pending')
           and mod(abs(hashtext(o.user_id::text)), $1) = $2
         order by o.created_at asc
@@ -13756,11 +13771,10 @@ async fn db_confirmed_exchange_orders_due_for_settlement(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
                o.symbol, o.period_seconds, o.direction, o.stake_usdt,
-               coalesce(o.entry_price, s.entry_price) as entry_price,
+               o.entry_price as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
-        left join signals s on s.id::text = o.signal_ref
         where o.exchange_verification_status = 'confirmed'
           and o.exchange_ref is not null
           and coalesce(o.reported_at, o.created_at)
@@ -14539,11 +14553,10 @@ async fn db_admin_orders(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
                o.symbol, o.period_seconds, o.direction, o.stake_usdt,
-               coalesce(o.entry_price, s.entry_price) as entry_price,
+               o.entry_price as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
-        left join signals s on s.id::text = o.signal_ref
         where ($1::text is null or o.order_status = $1)
           and (
             $2::text is null
@@ -14580,11 +14593,10 @@ async fn db_orders_for_user(
         r#"
         select o.id, o.user_id, o.reservation_id, o.signal_ref, o.client_order_id, o.source,
                o.symbol, o.period_seconds, o.direction, o.stake_usdt,
-               coalesce(o.entry_price, s.entry_price) as entry_price,
+               o.entry_price as entry_price,
                o.automation_profile, o.automation_confidence, o.action_trace_id, o.raw_audit,
                o.order_status, o.reported_at, o.created_at
         from event_contract_orders o
-        left join signals s on s.id::text = o.signal_ref
         where o.user_id = $1
           and ($2::text is null or o.order_status = $2)
           and (

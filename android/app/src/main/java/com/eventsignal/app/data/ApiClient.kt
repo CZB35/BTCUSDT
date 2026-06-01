@@ -28,6 +28,10 @@ import java.util.UUID
 import java.util.concurrent.TimeUnit
 
 class ApiClient(context: Context) {
+    companion object {
+        private val authRefreshLock = Any()
+    }
+
     private val prefs = context.getSharedPreferences("event_signal_api", Context.MODE_PRIVATE)
     private val http = OkHttpClient.Builder()
         .connectTimeout(3, TimeUnit.SECONDS)
@@ -91,10 +95,9 @@ class ApiClient(context: Context) {
         }
 
     fun clearAuth() {
-        accessToken = null
-        refreshToken = null
-        appSessionKey = null
-        accessTokenExpiresAtMs = 0L
+        synchronized(authRefreshLock) {
+            clearAuthLocked()
+        }
     }
 
     fun register(walletAddress: String, password: String, deviceFingerprint: String): Result<AuthResponse> =
@@ -104,22 +107,24 @@ class ApiClient(context: Context) {
         auth("/v1/auth/login", walletAddress, password, deviceFingerprint)
 
     fun refreshSession(): Result<AuthResponse> = runCatching {
-        val token = refreshToken?.trim().orEmpty()
-        if (token.isBlank()) error("refresh token is required")
-        val body = json.encodeToString(RefreshRequest(token)).toRequestBody(mediaType)
-        val request = Request.Builder()
-            .url("${baseUrl.trimEnd('/')}/v1/auth/refresh")
-            .post(body)
-            .build()
-        http.newCall(request).execute().use { response ->
-            val responseBody = response.body?.string().orEmpty()
-            if (!response.isSuccessful) {
-                if (isAuthInvalid(responseBody)) {
-                    clearAuth()
+        synchronized(authRefreshLock) {
+            val token = refreshToken?.trim().orEmpty()
+            if (token.isBlank()) error("refresh token is required")
+            val body = json.encodeToString(RefreshRequest(token)).toRequestBody(mediaType)
+            val request = Request.Builder()
+                .url("${baseUrl.trimEnd('/')}/v1/auth/refresh")
+                .post(body)
+                .build()
+            http.newCall(request).execute().use { response ->
+                val responseBody = response.body?.string().orEmpty()
+                if (!response.isSuccessful) {
+                    if (isAuthInvalid(responseBody) && refreshToken == token) {
+                        clearAuthLocked()
+                    }
+                    error(friendlyError(responseBody) ?: "刷新登录失败：HTTP ${response.code}")
                 }
-                error(friendlyError(responseBody) ?: "刷新登录失败：HTTP ${response.code}")
+                json.decodeFromString<AuthResponse>(responseBody).also(::saveAuthLocked)
             }
-            json.decodeFromString<AuthResponse>(responseBody).also(::saveAuth)
         }
     }
 
@@ -331,11 +336,32 @@ class ApiClient(context: Context) {
         }
 
     private fun saveAuth(response: AuthResponse) {
-        accessToken = response.accessToken
-        refreshToken = response.refreshToken
-        appSessionKey = response.appSessionKey
+        synchronized(authRefreshLock) {
+            saveAuthLocked(response)
+        }
+    }
+
+    private fun saveAuthLocked(response: AuthResponse) {
         val ttlMs = response.expiresIn.coerceIn(0L, MAX_AUTH_TTL_SECONDS) * 1000L
-        accessTokenExpiresAtMs = if (ttlMs > 0L) System.currentTimeMillis() + ttlMs else 0L
+        val editor = prefs.edit()
+            .putString("access_token", response.accessToken)
+            .putString("refresh_token", response.refreshToken)
+            .putString("app_session_key", response.appSessionKey)
+        if (ttlMs > 0L) {
+            editor.putLong("access_token_expires_at_ms", System.currentTimeMillis() + ttlMs)
+        } else {
+            editor.remove("access_token_expires_at_ms")
+        }
+        editor.apply()
+    }
+
+    private fun clearAuthLocked() {
+        prefs.edit()
+            .remove("access_token")
+            .remove("refresh_token")
+            .remove("app_session_key")
+            .remove("access_token_expires_at_ms")
+            .apply()
     }
 
     private fun httpError(prefix: String, response: okhttp3.Response): String {

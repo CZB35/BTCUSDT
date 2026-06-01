@@ -68,8 +68,9 @@ class ActionRunner(
         }
         val nodes = flatten(root)
         val amountField = findAmountField(nodes, profile)
-        val upButton = findDirectionButton(nodes, profile, "UP")
-        val downButton = findDirectionButton(nodes, profile, "DOWN")
+        val amountBounds = amountField?.boundsInScreen()
+        val upButton = findDirectionButton(nodes, profile, "UP", amountBounds)
+        val downButton = findDirectionButton(nodes, profile, "DOWN", amountBounds)
         val observedIndexPrice = extractObservedIndexPrice(nodes) ?: screen.observedIndexPrice
         stateStore.saveDebugState(
             AutomationDebugState(
@@ -108,8 +109,10 @@ class ActionRunner(
             return
         }
         val refreshedNodes = flatten(refreshedRoot)
-        val refreshedUpButton = findDirectionButton(refreshedNodes, profile, "UP")
-        val refreshedDownButton = findDirectionButton(refreshedNodes, profile, "DOWN")
+        val refreshedAmountBounds = findAmountField(refreshedNodes, profile)?.boundsInScreen()
+            ?: amountBounds
+        val refreshedUpButton = findDirectionButton(refreshedNodes, profile, "UP", refreshedAmountBounds)
+        val refreshedDownButton = findDirectionButton(refreshedNodes, profile, "DOWN", refreshedAmountBounds)
         saveActionState(
             screen,
             amountFieldFound = true,
@@ -202,7 +205,7 @@ class ActionRunner(
             periodSeconds = signal.periodSeconds,
             direction = direction,
             stakeUsdt = amount,
-            entryPrice = observedIndexPrice,
+            entryPrice = null,
             payoutRatio = null,
             expectedPayoutUsdt = null,
             expectedProfitUsdt = null,
@@ -394,11 +397,13 @@ class ActionRunner(
         nodes: List<AccessibilityNodeInfo>,
         profile: AutomationProfile,
         direction: String,
+        amountBounds: Rect?,
     ): AccessibilityNodeInfo? {
         val keywords = if (direction == "UP") profile.upButtonKeywords else profile.downButtonKeywords
+        val pageBottom = nodes.maxOfOrNull { node -> node.boundsInScreen().bottom } ?: 0
         return nodes
-            .filter { node -> isDirectionButtonCandidate(node, keywords) }
-            .maxByOrNull { node -> directionButtonScore(node) }
+            .filter { node -> isDirectionButtonCandidate(node, keywords, amountBounds, pageBottom) }
+            .maxByOrNull { node -> directionButtonScore(node, amountBounds, pageBottom) }
     }
 
     private fun extractObservedIndexPrice(nodes: List<AccessibilityNodeInfo>): String? {
@@ -412,9 +417,13 @@ class ActionRunner(
     private fun isDirectionButtonCandidate(
         node: AccessibilityNodeInfo,
         keywords: List<String>,
+        amountBounds: Rect?,
+        pageBottom: Int,
     ): Boolean {
         val label = node.nodeText()
+        val targetBounds = node.clickTargetBounds()
         if (looksLikePayoutLabel(label)) return false
+        if (!isInsideDirectionButtonZone(targetBounds, amountBounds, pageBottom)) return false
         return node.isEnabled &&
             (node.isClickable || node.parent?.isClickable == true) &&
             keywords.any { keyword -> label.contains(keyword, ignoreCase = true) }
@@ -425,9 +434,13 @@ class ActionRunner(
             !label.contains("↗") &&
             !label.contains("↘")
 
-    private fun directionButtonScore(node: AccessibilityNodeInfo): Int {
+    private fun directionButtonScore(
+        node: AccessibilityNodeInfo,
+        amountBounds: Rect?,
+        pageBottom: Int,
+    ): Int {
         val label = node.nodeText()
-        val bounds = node.boundsInScreen()
+        val bounds = node.clickTargetBounds()
         var score = 0
         if (node.isClickable) score += 4
         if (label.contains("%")) score -= 35
@@ -440,8 +453,28 @@ class ActionRunner(
         if (bounds.width() >= 160) score += 8
         if (bounds.height() >= 48) score += 8
         if (bounds.width() >= 240 && bounds.height() >= 60) score += 8
+        if (amountBounds != null && bounds.centerY() in (amountBounds.bottom + 80)..(amountBounds.bottom + 430)) {
+            score += 16
+        }
+        if (pageBottom > 0 && bounds.centerY() > pageBottom - 220) score -= 12
         score += (bounds.centerY() / 80).coerceIn(0, 40)
         return score
+    }
+
+    private fun isInsideDirectionButtonZone(
+        bounds: Rect,
+        amountBounds: Rect?,
+        pageBottom: Int,
+    ): Boolean {
+        if (bounds.isEmpty) return false
+        if (bounds.width() < 120 || bounds.height() < 40) return false
+        if (pageBottom > 0 && bounds.centerY() < (pageBottom * 0.30f).toInt()) return false
+        if (amountBounds != null) {
+            if (bounds.centerY() <= amountBounds.bottom + 24) return false
+            if (bounds.centerY() > amountBounds.bottom + 520) return false
+        }
+        if (pageBottom > 0 && bounds.centerY() > pageBottom - 64) return false
+        return true
     }
 
     private fun setText(node: AccessibilityNodeInfo, value: String): Boolean {
@@ -509,4 +542,14 @@ class ActionRunner(
 
     private fun AccessibilityNodeInfo.boundsInScreen(): Rect =
         Rect().also { getBoundsInScreen(it) }
+
+    private fun AccessibilityNodeInfo.clickTargetBounds(): Rect {
+        if (isClickable) return boundsInScreen()
+        var parentNode = parent
+        while (parentNode != null) {
+            if (parentNode.isClickable) return parentNode.boundsInScreen()
+            parentNode = parentNode.parent
+        }
+        return boundsInScreen()
+    }
 }
