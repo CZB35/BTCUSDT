@@ -149,6 +149,9 @@ const EVENT_ML_SLOW_REVERSAL_MIN_RET_5M: f64 = 0.00170;
 const EVENT_ML_SLOW_REVERSAL_MIN_RET_7M: f64 = 0.00210;
 const EVENT_ML_SLOW_REVERSAL_EXTREME_POS: f64 = 0.15;
 const EVENT_ML_SLOW_REVERSAL_RULE: &str = "slow_trend_reversal_1_3_5_7_live";
+const EVENT_ML_SLOW_REVERSAL_EXTREME_POS_300: f64 = 0.02;
+const EVENT_ML_SLOW_REVERSAL_MAX_BODY_SHARE_60: f64 = 0.95;
+const EVENT_ML_SLOW_REVERSAL_MIN_WICK_SHARE_60: f64 = 0.05;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -2835,23 +2838,7 @@ async fn login(
             ));
         }
         if client_type == ClientType::Android {
-            if let Some(active) = &user.active_device_fingerprint {
-                if active != &req.device_fingerprint {
-                    return Err(AppError::conflict(
-                        "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
-                        "this account already has an active device session",
-                    ));
-                }
-            }
-            sqlx::query(
-                "update users set active_device_fingerprint = $2, updated_at = $3 where id = $1",
-            )
-            .bind(user.id)
-            .bind(&req.device_fingerprint)
-            .bind(Utc::now())
-            .execute(pool)
-            .await
-            .map_err(AppError::from_sqlx)?;
+            replace_android_device_session(&state, user.id, &req.device_fingerprint).await?;
         }
         user.id
     } else {
@@ -2876,16 +2863,14 @@ async fn login(
             ));
         }
         if client_type == ClientType::Android {
-            if let Some(active) = &user.active_device_fingerprint {
-                if active != &req.device_fingerprint {
-                    return Err(AppError::conflict(
-                        "ACCOUNT_ALREADY_LOGGED_IN_ON_ANOTHER_DEVICE",
-                        "this account already has an active device session",
-                    ));
-                }
-            }
+            user.session_version += 1;
             user.active_device_fingerprint = Some(req.device_fingerprint.clone());
             user.updated_at = Utc::now();
+            state
+                .sessions
+                .write()
+                .await
+                .retain(|_, session| session.user_id != user_id);
         }
         user_id
     };
@@ -6893,6 +6878,11 @@ fn prediction_candidate_hard_filter_reason(
     let ret_3 = prediction_snapshot_f64(snapshot, "returns", "ret_3");
     let cycle_ret = prediction_snapshot_f64(snapshot, "cycle", "return_from_open");
     let noisy_wick = upper_wick_ratio >= 0.20 || lower_wick_ratio >= 0.20;
+    if candidate.rule == EVENT_ML_SLOW_REVERSAL_RULE {
+        if let Some(reason) = slow_reversal_soft_filter_reason(snapshot, candidate) {
+            return Some(reason);
+        }
+    }
 
     match candidate.direction.as_str() {
         "UP" => {
@@ -6962,12 +6952,57 @@ fn prediction_candidate_hard_filter_reason(
     None
 }
 
+fn slow_reversal_soft_filter_reason(
+    snapshot: &serde_json::Value,
+    candidate: &PredictionCandidate,
+) -> Option<String> {
+    let pos_300 = prediction_snapshot_optional_f64(snapshot, "features", "pos_300")?;
+    let body_share =
+        prediction_snapshot_optional_f64(snapshot, "features", "candle_body_share_60")?;
+    let upper_wick =
+        prediction_snapshot_optional_f64(snapshot, "features", "candle_upper_wick_share_60")
+            .unwrap_or(0.0);
+    let lower_wick =
+        prediction_snapshot_optional_f64(snapshot, "features", "candle_lower_wick_share_60")
+            .unwrap_or(0.0);
+    let wick_share = upper_wick + lower_wick;
+
+    let solid_unfinished_move = body_share >= EVENT_ML_SLOW_REVERSAL_MAX_BODY_SHARE_60
+        || wick_share <= EVENT_ML_SLOW_REVERSAL_MIN_WICK_SHARE_60;
+
+    let extreme_against_direction = match candidate.direction.as_str() {
+        "UP" => pos_300 <= EVENT_ML_SLOW_REVERSAL_EXTREME_POS_300,
+        "DOWN" => pos_300 >= 1.0 - EVENT_ML_SLOW_REVERSAL_EXTREME_POS_300,
+        _ => false,
+    };
+
+    if extreme_against_direction && solid_unfinished_move {
+        return Some(format!(
+            "hold slow reversal unfinished extreme pos300 {:.4} body60 {:.3} wick60 {:.3} direction {}",
+            pos_300, body_share, wick_share, candidate.direction
+        ));
+    }
+
+    None
+}
+
 fn prediction_snapshot_f64(snapshot: &serde_json::Value, section: &str, key: &str) -> f64 {
     snapshot
         .get(section)
         .and_then(|section| section.get(key))
         .and_then(|value| value.as_f64())
         .unwrap_or(0.0)
+}
+
+fn prediction_snapshot_optional_f64(
+    snapshot: &serde_json::Value,
+    section: &str,
+    key: &str,
+) -> Option<f64> {
+    snapshot
+        .get(section)
+        .and_then(|section| section.get(key))
+        .and_then(|value| value.as_f64())
 }
 
 fn load_event_ml_model() -> Option<EventMlModel> {
@@ -7359,6 +7394,16 @@ mod tests {
         make_prediction_candidate(direction, "structure_edge", "test_rule", 0.70, 1.0)
     }
 
+    fn test_slow_reversal_candidate(direction: &str) -> PredictionCandidate {
+        make_prediction_candidate(
+            direction,
+            "ml_extra_trees",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            0.70,
+            1.0,
+        )
+    }
+
     #[test]
     fn up_falling_knife_filter_rejects_solid_drop_without_lower_wick() {
         let snapshot = json!({
@@ -7457,6 +7502,101 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("hold up falling knife"));
+    }
+
+    #[test]
+    fn slow_reversal_filter_rejects_unfinished_extreme_bottom() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.40,
+                "upper_wick_ratio": 0.02,
+                "lower_wick_ratio": 0.02
+            },
+            "returns": {
+                "live_ret_1": -0.00001,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 },
+            "features": {
+                "pos_300": 0.010,
+                "candle_body_share_60": 0.970,
+                "candle_upper_wick_share_60": 0.015,
+                "candle_lower_wick_share_60": 0.015
+            }
+        });
+
+        let reason =
+            prediction_candidate_hard_filter_reason(&snapshot, &test_slow_reversal_candidate("UP"));
+
+        assert!(reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold slow reversal unfinished extreme"));
+    }
+
+    #[test]
+    fn slow_reversal_filter_allows_extreme_with_rejection_wick() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.05 },
+            "structure": {
+                "body_ratio": 0.40,
+                "upper_wick_ratio": 0.08,
+                "lower_wick_ratio": 0.25
+            },
+            "returns": {
+                "live_ret_1": -0.00001,
+                "live_ret_3": -0.00020,
+                "ret_3": -0.00110
+            },
+            "cycle": { "return_from_open": -0.00130 },
+            "features": {
+                "pos_300": 0.010,
+                "candle_body_share_60": 0.820,
+                "candle_upper_wick_share_60": 0.040,
+                "candle_lower_wick_share_60": 0.140
+            }
+        });
+
+        let reason =
+            prediction_candidate_hard_filter_reason(&snapshot, &test_slow_reversal_candidate("UP"));
+
+        assert!(reason.is_none());
+    }
+
+    #[test]
+    fn slow_reversal_filter_rejects_unfinished_extreme_top() {
+        let snapshot = json!({
+            "shape": { "boll_pos": 0.95 },
+            "structure": {
+                "body_ratio": 0.40,
+                "upper_wick_ratio": 0.02,
+                "lower_wick_ratio": 0.02
+            },
+            "returns": {
+                "live_ret_1": 0.00001,
+                "live_ret_3": 0.00020,
+                "ret_3": 0.00110
+            },
+            "cycle": { "return_from_open": 0.00130 },
+            "features": {
+                "pos_300": 0.990,
+                "candle_body_share_60": 0.970,
+                "candle_upper_wick_share_60": 0.015,
+                "candle_lower_wick_share_60": 0.015
+            }
+        });
+
+        let reason = prediction_candidate_hard_filter_reason(
+            &snapshot,
+            &test_slow_reversal_candidate("DOWN"),
+        );
+
+        assert!(reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("hold slow reversal unfinished extreme"));
     }
 
     #[test]
@@ -10484,6 +10624,50 @@ async fn db_user_session_version(pool: &PgPool, user_id: Uuid) -> Result<i32, Ap
         .map_err(AppError::from_sqlx)?
         .map(|row| row.get("session_version"))
         .ok_or_else(|| AppError::unauthorized("AUTH_INVALID_USER", "user account not found"))
+}
+
+async fn replace_android_device_session(
+    state: &SharedState,
+    user_id: Uuid,
+    device_fingerprint: &str,
+) -> Result<(), AppError> {
+    if let Some(pool) = state.db.as_ref() {
+        let now = Utc::now();
+        let mut tx = pool.begin().await.map_err(AppError::from_sqlx)?;
+        sqlx::query(
+            r#"
+            update users
+            set active_device_fingerprint = $2,
+                session_version = session_version + 1,
+                updated_at = $3
+            where id = $1
+            "#,
+        )
+        .bind(user_id)
+        .bind(device_fingerprint)
+        .bind(now)
+        .execute(&mut *tx)
+        .await
+        .map_err(AppError::from_sqlx)?;
+        sqlx::query("delete from auth_sessions where user_id = $1")
+            .bind(user_id)
+            .execute(&mut *tx)
+            .await
+            .map_err(AppError::from_sqlx)?;
+        tx.commit().await.map_err(AppError::from_sqlx)?;
+    } else if let Some(user) = state.users.write().await.get_mut(&user_id) {
+        user.session_version += 1;
+        user.active_device_fingerprint = Some(device_fingerprint.to_string());
+        user.updated_at = Utc::now();
+    }
+
+    state
+        .sessions
+        .write()
+        .await
+        .retain(|_, session| session.user_id != user_id);
+
+    Ok(())
 }
 
 async fn db_change_user_password(
