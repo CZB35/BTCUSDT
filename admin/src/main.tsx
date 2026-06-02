@@ -293,6 +293,7 @@ type TableRow = {
 const TOKEN_KEY = "event_signal_admin_token";
 const ADMIN_USER_KEY = "event_signal_admin_user";
 const API_BASE = (import.meta.env.VITE_API_BASE_URL || "").trim().replace(/\/$/, "");
+const PAGE_GATE_TTL_SECONDS = 6;
 const REOWN_PROJECT_ID = import.meta.env.VITE_REOWN_PROJECT_ID || "00000000000000000000000000000000";
 const BSC_USDT = "0x55d398326f99059fF775485246999027B3197955";
 const BSC_VAULT = (import.meta.env.VITE_BSC_VAULT_CONTRACT || "").trim();
@@ -441,10 +442,12 @@ function App() {
     if (nextSettlements) setSettlements(nextSettlements);
     if (nextPageStates) {
       setPageStates(
-        Object.entries(nextPageStates).map(([userId, state]) => ({
-          user_id: userId,
-          ...state
-        }))
+        Object.entries(nextPageStates)
+          .map(([userId, state]) => ({
+            user_id: userId,
+            ...state
+          }))
+          .sort(comparePageStates)
       );
     }
     setStatus("已连接");
@@ -1511,15 +1514,17 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
           rows={pageStates.map((state) => {
             const liveReady = pageStateLiveReady(state);
             const fresh = pageStateFresh(state);
+            const recognitionReady = fresh && state.page_ready;
+            const accountMatched = fresh && state.account_match_status === "matched";
             return {
               id: `${state.user_id}-${state.updated_at}`,
               cells: [
                 shortId(state.user_id, 8),
                 state.screen_name,
                 <StatusPill active={liveReady}>{liveReady ? "可执行" : fresh ? "不可执行" : "已过期"}</StatusPill>,
-                <StatusPill active={state.page_ready}>{state.page_ready ? "就绪" : "未就绪"}</StatusPill>,
-                <StatusPill active={state.account_match_status === "matched"}>
-                  {accountMatchText(state.account_match_status)}
+                <StatusPill active={recognitionReady}>{fresh ? (state.page_ready ? "就绪" : "未就绪") : "已过期"}</StatusPill>,
+                <StatusPill active={accountMatched}>
+                  {fresh ? accountMatchText(state.account_match_status) : "已过期"}
                 </StatusPill>,
                 state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
                 ageLabel(state.updated_at),
@@ -1530,8 +1535,8 @@ function UsersPage({ users, pageStates }: { users: UserRecord[]; pageStates: Pag
                 页面: state.screen_name,
                 实时可执行: yesNo(liveReady),
                 状态时效: fresh ? "有效" : `已过期，${ageLabel(state.updated_at)}`,
-                识别通过: yesNo(state.page_ready),
-                账号一致性: accountMatchText(state.account_match_status),
+                识别通过: fresh ? yesNo(state.page_ready) : "已过期",
+                账号一致性: fresh ? accountMatchText(state.account_match_status) : "已过期",
                 页面余额: state.observed_balance_usdt ? `${formatNumber(state.observed_balance_usdt)} USDT` : "-",
                 余额差值: state.account_balance_delta_usdt ? `${formatNumber(state.account_balance_delta_usdt)} USDT` : "-",
                 置信度: percent(state.confidence),
@@ -2101,7 +2106,7 @@ function ageLabel(value?: string | null) {
 }
 
 function pageStateFresh(state: PageStateRecord) {
-  return secondsSince(state.updated_at) <= 10;
+  return secondsSince(state.updated_at) <= PAGE_GATE_TTL_SECONDS;
 }
 
 function pageStateLiveReady(state: PageStateRecord) {
@@ -2113,6 +2118,16 @@ function pageStateLiveReady(state: PageStateRecord) {
     state.up_button_found &&
     state.down_button_found
   );
+}
+
+function comparePageStates(a: PageStateRecord, b: PageStateRecord) {
+  const liveDiff = Number(pageStateLiveReady(b)) - Number(pageStateLiveReady(a));
+  if (liveDiff !== 0) return liveDiff;
+  const freshDiff = Number(pageStateFresh(b)) - Number(pageStateFresh(a));
+  if (freshDiff !== 0) return freshDiff;
+  const timeDiff = new Date(b.updated_at).getTime() - new Date(a.updated_at).getTime();
+  if (timeDiff !== 0) return timeDiff;
+  return a.user_id.localeCompare(b.user_id);
 }
 
 function shortId(value?: string | null, size = 10) {
