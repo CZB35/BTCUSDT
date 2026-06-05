@@ -629,7 +629,7 @@ fn start_prediction_loop(state: &SharedState) {
                         }
                     }
                     if decision.direction == "UP" || decision.direction == "DOWN" {
-                        match confirm_prediction_candidate(&state, &decision).await {
+                        match confirm_prediction_candidate(&state, &config, &decision).await {
                             PredictionConfirmation::Waiting(message) => {
                                 let mut runtime = state.prediction_runtime.write().await;
                                 runtime.status = "confirming".to_string();
@@ -1763,22 +1763,6 @@ impl PredictionCalibration {
             lookback_minutes: config.calibration_lookback_minutes,
             sample_seconds: config.calibration_sample_seconds,
             reason: "calibration unavailable".to_string(),
-        }
-    }
-
-    fn forced_allowed(config: &PredictionConfig, reason: String, win_rate: f64) -> Self {
-        Self {
-            allowed: true,
-            sample_count: 0,
-            wins: 0,
-            win_rate,
-            ev_usdt: 0.0,
-            min_samples: config.calibration_min_samples,
-            min_win_rate: config.calibration_min_win_rate,
-            min_ev_usdt: config.calibration_min_ev_usdt,
-            lookback_minutes: config.calibration_lookback_minutes,
-            sample_seconds: config.calibration_sample_seconds,
-            reason,
         }
     }
 }
@@ -6842,6 +6826,13 @@ fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
     }
 }
 
+fn effective_prediction_candidate_min_confidence(
+    config: &PredictionConfig,
+    candidate: &PredictionCandidate,
+) -> f64 {
+    prediction_candidate_min_confidence(candidate).max(config.min_confidence)
+}
+
 async fn apply_prediction_calibration(
     pool: &PgPool,
     config: &PredictionConfig,
@@ -6858,7 +6849,7 @@ async fn apply_prediction_calibration(
         merge_prediction_calibration(decision, &calibration, None);
         return Ok(());
     };
-    let min_raw_confidence = prediction_candidate_min_confidence(&candidate);
+    let min_raw_confidence = effective_prediction_candidate_min_confidence(config, &candidate);
     if candidate.raw_confidence < min_raw_confidence {
         let mut calibration = PredictionCalibration::disabled(config);
         calibration.reason = format!(
@@ -6869,18 +6860,6 @@ async fn apply_prediction_calibration(
             candidate.rule,
             candidate.direction,
             candidate.structure_score
-        );
-        merge_prediction_calibration(decision, &calibration, Some(&candidate));
-        return Ok(());
-    }
-    if prediction_decision_uses_ml(decision) {
-        let calibration = PredictionCalibration::forced_allowed(
-            config,
-            format!(
-                "forced event-ml-v3 meta policy mode {} rule {} direction {} raw {:.4}",
-                candidate.mode, candidate.rule, candidate.direction, candidate.raw_confidence
-            ),
-            candidate.raw_confidence,
         );
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
@@ -6929,6 +6908,7 @@ async fn clear_pending_prediction_candidate(state: &SharedState) {
 
 async fn confirm_prediction_candidate(
     state: &SharedState,
+    config: &PredictionConfig,
     decision: &PredictionDecision,
 ) -> PredictionConfirmation {
     let Some(candidate) = prediction_candidate_from_snapshot(&decision.feature_snapshot) else {
@@ -6942,7 +6922,7 @@ async fn confirm_prediction_candidate(
             candidate.direction, decision.direction
         ));
     }
-    let min_raw_confidence = prediction_candidate_min_confidence(&candidate);
+    let min_raw_confidence = effective_prediction_candidate_min_confidence(config, &candidate);
     if candidate.raw_confidence < min_raw_confidence {
         clear_pending_prediction_candidate(state).await;
         return PredictionConfirmation::Rejected(format!(
@@ -8337,6 +8317,19 @@ mod tests {
         bars[EVENT_ML_WARM_SECONDS / 2].second_ms += 1_000;
 
         assert!(event_ml_predict(&model, &bars).is_none());
+    }
+
+    #[test]
+    fn effective_candidate_min_confidence_respects_admin_threshold() {
+        let mut config = PredictionConfig::from_env();
+        config.min_confidence = 0.70;
+        let candidate =
+            make_prediction_candidate("UP", "ml_extra_trees", EVENT_ML_TWO_STAGE_RULE, 0.69, 0.0);
+
+        assert_eq!(
+            effective_prediction_candidate_min_confidence(&config, &candidate),
+            0.70
+        );
     }
 
     #[test]
@@ -12651,7 +12644,9 @@ async fn db_prediction_calibration(
     .bind(&candidate.rule)
     .bind(&candidate.direction)
     .bind(config.calibration_sample_seconds.max(1))
-    .bind(prediction_candidate_min_confidence(candidate))
+    .bind(effective_prediction_candidate_min_confidence(
+        config, candidate,
+    ))
     .bind(DEFAULT_PERIOD_SECONDS)
     .fetch_one(pool)
     .await
