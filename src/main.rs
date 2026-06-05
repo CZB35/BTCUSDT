@@ -105,9 +105,11 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v2";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v3-meta-guards";
 const FALLBACK_PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
 const DEFAULT_EVENT_ML_MODEL_PATH: &str = "models/event_edge_ml_v1.json";
+#[cfg(test)]
+const DEFAULT_EVENT_ML_MODEL_ARTIFACT_VERSION: &str = "event-edge-ml-v2";
 const DEFAULT_PREDICTION_CALIBRATION_LOOKBACK_MINUTES: i64 = 720;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_SAMPLES: i32 = 10;
 const DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE: f64 = 0.60;
@@ -5879,7 +5881,7 @@ fn build_event_ml_warmup_decision(
                 "second_bars": snapshot.second_bars.len()
             },
             "config": {
-                "model_version": model.version,
+                "model_version": PREDICTION_MODEL_VERSION,
                 "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
                 "interval_seconds": config.interval_seconds,
                 "signal_cooldown_seconds": config.signal_cooldown_seconds
@@ -5897,7 +5899,7 @@ fn build_event_ml_warmup_decision(
                 "raw_confidence": 0.0
             },
             "decision": {
-                "model_version": model.version,
+                "model_version": PREDICTION_MODEL_VERSION,
                 "candidate_direction": null,
                 "candidate_mode": "ml_extra_trees",
                 "candidate_rule": EVENT_ML_TWO_STAGE_RULE,
@@ -5948,7 +5950,7 @@ fn build_event_ml_prediction_decision(
                     "second_bars": snapshot.second_bars.len()
                 },
                 "config": {
-                    "model_version": model.version,
+                    "model_version": PREDICTION_MODEL_VERSION,
                     "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
                     "interval_seconds": config.interval_seconds,
                     "signal_cooldown_seconds": config.signal_cooldown_seconds
@@ -5965,7 +5967,7 @@ fn build_event_ml_prediction_decision(
                     "raw_confidence": 0.0
                 },
                 "decision": {
-                    "model_version": model.version,
+                    "model_version": PREDICTION_MODEL_VERSION,
                     "candidate_direction": null,
                     "candidate_mode": "ml_extra_trees",
                     "candidate_rule": "period_mismatch",
@@ -6041,7 +6043,7 @@ fn build_event_ml_prediction_decision(
                 "second_bars": snapshot.second_bars.len()
             },
             "config": {
-                "model_version": model.version,
+                "model_version": PREDICTION_MODEL_VERSION,
                 "fallback_model_version": FALLBACK_PREDICTION_MODEL_VERSION,
                 "interval_seconds": config.interval_seconds,
                 "stale_seconds": config.stale_seconds,
@@ -6073,7 +6075,7 @@ fn build_event_ml_prediction_decision(
                 "upper_wick_ratio": prediction.features.get("candle_upper_wick_share_60").and_then(|value| value.as_f64()).unwrap_or(0.0)
             },
             "decision": {
-                "model_version": model.version,
+                "model_version": PREDICTION_MODEL_VERSION,
                 "candidate_direction": if direction == "UP" || direction == "DOWN" { Some(direction.as_str()) } else { None },
                 "candidate_mode": "ml_extra_trees",
                 "candidate_rule": prediction.rule,
@@ -6871,13 +6873,11 @@ async fn apply_prediction_calibration(
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
     }
-    if candidate.rule == EVENT_ML_TWO_STAGE_REVERSE_RULE
-        || candidate.rule == EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE
-    {
+    if prediction_decision_uses_ml(decision) {
         let calibration = PredictionCalibration::forced_allowed(
             config,
             format!(
-                "forced current-regime two_stage meta mode {} rule {} direction {} raw {:.4}",
+                "forced event-ml-v3 meta policy mode {} rule {} direction {} raw {:.4}",
                 candidate.mode, candidate.rule, candidate.direction, candidate.raw_confidence
             ),
             candidate.raw_confidence,
@@ -8275,7 +8275,7 @@ mod tests {
         let model: EventMlModel =
             serde_json::from_str(&text).expect("event ml model json should parse");
 
-        assert_eq!(model.version, PREDICTION_MODEL_VERSION);
+        assert_eq!(model.version, DEFAULT_EVENT_ML_MODEL_ARTIFACT_VERSION);
         assert_eq!(model.period_seconds, DEFAULT_PERIOD_SECONDS);
         assert_eq!(model.feature_names.len(), 127);
         assert!(!model.models.move_model.trees.is_empty());
@@ -8337,6 +8337,35 @@ mod tests {
         bars[EVENT_ML_WARM_SECONDS / 2].second_ms += 1_000;
 
         assert!(event_ml_predict(&model, &bars).is_none());
+    }
+
+    #[test]
+    fn prediction_decision_uses_ml_candidate_mode_not_artifact_version() {
+        let decision = PredictionDecision {
+            direction: "UP".to_string(),
+            confidence: 0.70,
+            predicted_return: 0.0,
+            entry_price: 78_000.0,
+            score: 0.0,
+            signal_cooldown_seconds: DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS,
+            market_source: "test".to_string(),
+            market_age_seconds: 0,
+            market_candles: 0,
+            reason: "test".to_string(),
+            feature_snapshot: json!({
+                "ml": {
+                    "model_version": DEFAULT_EVENT_ML_MODEL_ARTIFACT_VERSION
+                },
+                "decision": {
+                    "model_version": PREDICTION_MODEL_VERSION,
+                    "candidate_mode": "ml_extra_trees",
+                    "candidate_direction": "UP",
+                    "candidate_rule": EVENT_ML_TWO_STAGE_RULE
+                }
+            }),
+        };
+
+        assert!(prediction_decision_uses_ml(&decision));
     }
 
     #[test]
@@ -8430,10 +8459,10 @@ fn merge_prediction_calibration(
 fn prediction_decision_uses_ml(decision: &PredictionDecision) -> bool {
     decision
         .feature_snapshot
-        .get("ml")
-        .and_then(|ml| ml.get("model_version"))
+        .get("decision")
+        .and_then(|decision| decision.get("candidate_mode"))
         .and_then(|value| value.as_str())
-        == Some(PREDICTION_MODEL_VERSION)
+        == Some("ml_extra_trees")
 }
 
 fn json_i64(value: &serde_json::Value) -> Result<i64, AppError> {
