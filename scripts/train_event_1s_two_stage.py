@@ -103,12 +103,12 @@ def add_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
     pct = close.pct_change()
 
     features: list[str] = []
-    for sec in [1, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 600, 900, 1800, 3600]:
+    for sec in [1, 2, 3, 5, 10, 15, 30, 45, 60, 90, 120, 180, 300, 420, 600, 900, 1800, 3600]:
         name = f"ret_{sec}"
         df[name] = close / close.shift(sec) - 1.0
         features.append(name)
 
-    for sec in [15, 30, 60, 120, 300, 600, 900, 1800, 3600]:
+    for sec in [15, 30, 60, 120, 300, 420, 600, 900, 1800, 3600]:
         vol_name = f"vol_{sec}"
         df[vol_name] = pct.rolling(sec, min_periods=sec).std()
         features.append(vol_name)
@@ -131,12 +131,18 @@ def add_features(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
         open_price = close.shift(sec)
         rolling_high = high.rolling(sec, min_periods=sec).max()
         rolling_low = low.rolling(sec, min_periods=sec).min()
-        candle_high = pd.concat([rolling_high, open_price, close], axis=1).max(axis=1)
-        candle_low = pd.concat([rolling_low, open_price, close], axis=1).min(axis=1)
+        candle_high = pd.Series(
+            np.maximum(np.maximum(rolling_high.to_numpy(), open_price.to_numpy()), close.to_numpy()),
+            index=df.index,
+        )
+        candle_low = pd.Series(
+            np.minimum(np.minimum(rolling_low.to_numpy(), open_price.to_numpy()), close.to_numpy()),
+            index=df.index,
+        )
         candle_range = (candle_high - candle_low).replace(0, np.nan)
         body_abs = (close - open_price).abs()
-        upper_body = pd.concat([open_price, close], axis=1).max(axis=1)
-        lower_body = pd.concat([open_price, close], axis=1).min(axis=1)
+        upper_body = pd.Series(np.maximum(open_price.to_numpy(), close.to_numpy()), index=df.index)
+        lower_body = pd.Series(np.minimum(open_price.to_numpy(), close.to_numpy()), index=df.index)
         for name, series in [
             (f"candle_body_bp_{sec}", (close / open_price - 1.0) * 10000.0),
             (f"candle_body_share_{sec}", body_abs / candle_range),

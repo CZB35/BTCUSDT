@@ -86,6 +86,10 @@ const NIGHT_PROTECTION_END_MINUTE: u32 = 180;
 const NIGHT_CLUSTER_GAP_SECONDS: i64 = 180;
 const NIGHT_CLUSTER_SKIP_FIRST: usize = 2;
 const PREDICTION_LOSS_GUARD_LOOKBACK_HOURS: i64 = 12;
+const PREDICTION_GLOBAL_CONSECUTIVE_LOSS_GUARD_MIN: usize = 3;
+const PREDICTION_GLOBAL_LOSS_GUARD_COOLDOWN_MINUTES: i64 = 90;
+const PREDICTION_RULE_CONSECUTIVE_LOSS_GUARD_MIN: usize = 2;
+const PREDICTION_RULE_LOSS_GUARD_COOLDOWN_MINUTES: i64 = 120;
 const PREDICTION_LOSS_GUARD_MIN_RECENT: i64 = 3;
 const PREDICTION_LOSS_GUARD_MAX_WIN_RATE: f64 = 0.34;
 const USER_SESSION_TTL_SECONDS: i64 = 7 * 24 * 60 * 60;
@@ -149,9 +153,39 @@ const EVENT_ML_SLOW_REVERSAL_MIN_RET_5M: f64 = 0.00170;
 const EVENT_ML_SLOW_REVERSAL_MIN_RET_7M: f64 = 0.00210;
 const EVENT_ML_SLOW_REVERSAL_EXTREME_POS: f64 = 0.15;
 const EVENT_ML_SLOW_REVERSAL_RULE: &str = "slow_trend_reversal_1_3_5_7_live";
+const EVENT_ML_TWO_STAGE_RULE: &str = "two_stage_extra_trees";
+const EVENT_ML_TWO_STAGE_REVERSE_RULE: &str = "two_stage_reverse_extra_trees";
+const EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE: &str = "two_stage_downshift_extra_trees";
+const DEFAULT_EVENT_ML_TWO_STAGE_ENABLED: bool = true;
+const DEFAULT_EVENT_ML_TWO_STAGE_DOWNSHIFT_ENABLED: bool = false;
+const DEFAULT_EVENT_ML_TWO_STAGE_REVERSE_ENABLED: bool = false;
 const EVENT_ML_SLOW_REVERSAL_EXTREME_POS_300: f64 = 0.02;
 const EVENT_ML_SLOW_REVERSAL_MAX_BODY_SHARE_60: f64 = 0.95;
 const EVENT_ML_SLOW_REVERSAL_MIN_WICK_SHARE_60: f64 = 0.05;
+const EVENT_ML_SLOW_DOWN_MIN_POS_420: f64 = 0.95;
+const EVENT_ML_SLOW_DOWN_VERTICAL_RET_1M: f64 = 0.00400;
+const EVENT_ML_SLOW_DOWN_VERTICAL_RET_3M: f64 = 0.01000;
+const EVENT_ML_SLOW_DOWN_VERTICAL_RET_5M: f64 = 0.00800;
+const EVENT_ML_SLOW_DOWN_FAST_RET_1M: f64 = 0.00245;
+const EVENT_ML_SLOW_DOWN_FAST_RET_7M: f64 = 0.00440;
+const EVENT_ML_SLOW_DOWN_SOLID_BODY_SHARE_60: f64 = 0.995;
+const EVENT_ML_SLOW_DOWN_SOLID_MAX_WICK_SHARE_60: f64 = 0.005;
+const EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60: f64 = 0.18;
+const DEFAULT_EVENT_ML_SLOW_UP_ENABLED: bool = false;
+const EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE: f64 = 0.697;
+const EVENT_ML_SLOW_UP_STRONG_MAX_RET_300: f64 = -0.00245;
+const EVENT_ML_SLOW_DOWN_CONFIRM_MIN_CONFIDENCE: f64 = 0.684;
+const EVENT_ML_SLOW_DOWN_CONFIRM_MAX_RET_60: f64 = 0.00093;
+const EVENT_ML_SLOW_DOWN_CONFIRM_MAX_MOVE_PROBABILITY: f64 = 0.681;
+const EVENT_ML_SLOW_DOWN_CONFIRM_MIN_RET_300: f64 = 0.00290;
+const EVENT_ML_SLOW_DOWN_MAX_RET_600: f64 = 0.00251;
+const EVENT_ML_SLOW_DOWN_MAX_RET_900: f64 = 0.00143;
+const EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_420: f64 = -0.00293;
+const EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_600: f64 = -0.00430;
+const EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_RET_180: f64 = -0.00280;
+const EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_CLOSE_POS_60: f64 = 0.30;
+const EVENT_ML_TWO_STAGE_UP_HOLD_MIN_RET_300: f64 = -0.00300;
+const EVENT_ML_TWO_STAGE_UP_HOLD_MAX_RET_300: f64 = -0.00150;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -790,6 +824,12 @@ async fn guard_recent_strategy_losses(
     let Some(candidate) = prediction_candidate_from_snapshot(&decision.feature_snapshot) else {
         return Ok(None);
     };
+    if let Some(message) = guard_global_consecutive_losses(pool).await? {
+        return Ok(Some(message));
+    }
+    if let Some(message) = guard_rule_consecutive_losses(pool, &candidate).await? {
+        return Ok(Some(message));
+    }
     let row = sqlx::query(
         r#"
         select count(*)::bigint as total,
@@ -825,6 +865,106 @@ async fn guard_recent_strategy_losses(
         return Ok(Some(format!(
             "loss guard skipped {} mode {} rule {} recent {}/{} win_rate {:.4}",
             candidate.direction, candidate.mode, candidate.rule, wins, total, win_rate
+        )));
+    }
+    Ok(None)
+}
+
+async fn guard_global_consecutive_losses(pool: &PgPool) -> Result<Option<String>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        select result, direction, created_at
+        from signal_outcomes
+        where model_version = $1
+        order by created_at desc
+        limit $2
+        "#,
+    )
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(PREDICTION_GLOBAL_CONSECUTIVE_LOSS_GUARD_MIN as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    if rows.len() < PREDICTION_GLOBAL_CONSECUTIVE_LOSS_GUARD_MIN {
+        return Ok(None);
+    }
+    let losses = rows
+        .iter()
+        .filter(|row| row.get::<String, _>("result") == "loss")
+        .count();
+    if losses == rows.len() {
+        let Some(latest_at) = rows
+            .first()
+            .map(|row| row.get::<DateTime<Utc>, _>("created_at"))
+        else {
+            return Ok(None);
+        };
+        let cooldown_until =
+            latest_at + Duration::minutes(PREDICTION_GLOBAL_LOSS_GUARD_COOLDOWN_MINUTES);
+        if Utc::now() >= cooldown_until {
+            return Ok(None);
+        }
+        let last_direction = rows
+            .first()
+            .map(|row| row.get::<String, _>("direction"))
+            .unwrap_or_default();
+        return Ok(Some(format!(
+            "global loss guard skipped after {} consecutive {} losses, last direction {}, cooldown until {}",
+            losses, PREDICTION_MODEL_VERSION, last_direction, cooldown_until
+        )));
+    }
+    Ok(None)
+}
+
+async fn guard_rule_consecutive_losses(
+    pool: &PgPool,
+    candidate: &PredictionCandidate,
+) -> Result<Option<String>, AppError> {
+    let rows = sqlx::query(
+        r#"
+        select o.result, o.created_at
+        from signal_outcomes o
+        join prediction_audit_logs a on a.signal_id = o.signal_id
+        where o.model_version = $1
+          and o.direction = $2
+          and a.feature_snapshot->'decision'->>'candidate_mode' = $3
+          and a.feature_snapshot->'decision'->>'candidate_rule' = $4
+        order by o.created_at desc
+        limit $5
+        "#,
+    )
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(&candidate.direction)
+    .bind(&candidate.mode)
+    .bind(&candidate.rule)
+    .bind(PREDICTION_RULE_CONSECUTIVE_LOSS_GUARD_MIN as i64)
+    .fetch_all(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    if rows.len() < PREDICTION_RULE_CONSECUTIVE_LOSS_GUARD_MIN {
+        return Ok(None);
+    }
+    let losses = rows
+        .iter()
+        .filter(|row| row.get::<String, _>("result") == "loss")
+        .count();
+    if losses == rows.len() {
+        let Some(latest_at) = rows
+            .first()
+            .map(|row| row.get::<DateTime<Utc>, _>("created_at"))
+        else {
+            return Ok(None);
+        };
+        let cooldown_until =
+            latest_at + Duration::minutes(PREDICTION_RULE_LOSS_GUARD_COOLDOWN_MINUTES);
+        if Utc::now() >= cooldown_until {
+            return Ok(None);
+        }
+        return Ok(Some(format!(
+            "rule loss guard skipped {} mode {} rule {} after {} consecutive losses, cooldown until {}",
+            candidate.direction, candidate.mode, candidate.rule, losses, cooldown_until
         )));
     }
     Ok(None)
@@ -1559,6 +1699,14 @@ struct EventMlPrediction {
     features: serde_json::Value,
 }
 
+#[derive(Clone, Copy)]
+struct EventMlMetaPolicyOptions {
+    two_stage_enabled: bool,
+    two_stage_downshift_enabled: bool,
+    two_stage_reverse_enabled: bool,
+    slow_up_enabled: bool,
+}
+
 #[derive(Clone, Debug)]
 struct PredictionCandidate {
     direction: String,
@@ -1613,6 +1761,22 @@ impl PredictionCalibration {
             lookback_minutes: config.calibration_lookback_minutes,
             sample_seconds: config.calibration_sample_seconds,
             reason: "calibration unavailable".to_string(),
+        }
+    }
+
+    fn forced_allowed(config: &PredictionConfig, reason: String, win_rate: f64) -> Self {
+        Self {
+            allowed: true,
+            sample_count: 0,
+            wins: 0,
+            win_rate,
+            ev_usdt: 0.0,
+            min_samples: config.calibration_min_samples,
+            min_win_rate: config.calibration_min_win_rate,
+            min_ev_usdt: config.calibration_min_ev_usdt,
+            lookback_minutes: config.calibration_lookback_minutes,
+            sample_seconds: config.calibration_sample_seconds,
+            reason,
         }
     }
 }
@@ -5736,7 +5900,7 @@ fn build_event_ml_warmup_decision(
                 "model_version": model.version,
                 "candidate_direction": null,
                 "candidate_mode": "ml_extra_trees",
-                "candidate_rule": "two_stage_extra_trees",
+                "candidate_rule": EVENT_ML_TWO_STAGE_RULE,
                 "pre_filter_passed": false,
                 "pre_calibration_direction": "HOLD",
                 "calibration_required": false
@@ -5812,7 +5976,8 @@ fn build_event_ml_prediction_decision(
             }),
         });
     }
-    let prediction = event_ml_predict(model, &snapshot.second_bars)?;
+    let mut prediction = event_ml_predict(model, &snapshot.second_bars)?;
+    apply_event_ml_meta_policy(&mut prediction);
     let latest = snapshot.second_bars.last()?;
     let entry_price_time = millis_to_utc(snapshot.latest_price_time_ms).ok()?;
     let feature_price_time = millis_to_utc(latest.second_ms).ok()?;
@@ -5849,13 +6014,7 @@ fn build_event_ml_prediction_decision(
         direction = "HOLD".to_string();
         reason = "hold ml waiting for live indexPrice_1s after REST backfill".to_string();
     }
-    let confidence = if direction == "DOWN" {
-        1.0 - prediction.up_probability
-    } else if direction == "UP" {
-        prediction.up_probability
-    } else {
-        prediction.confidence
-    };
+    let confidence = prediction.confidence;
     let predicted_return = clamp((prediction.up_probability - 0.5) / 500.0, -0.003, 0.003);
     Some(PredictionDecision {
         direction: direction.clone(),
@@ -6665,7 +6824,9 @@ fn prediction_candidate(
 
 fn prediction_candidate_min_confidence(candidate: &PredictionCandidate) -> f64 {
     match candidate.rule.as_str() {
-        "two_stage_extra_trees" => 0.58,
+        EVENT_ML_TWO_STAGE_RULE
+        | EVENT_ML_TWO_STAGE_REVERSE_RULE
+        | EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE => 0.58,
         EVENT_ML_SLOW_REVERSAL_RULE => EVENT_ML_SLOW_REVERSAL_MIN_CONFIDENCE,
         "reversal_up_from_impulse_down" => PREDICTION_REVERSAL_UP_MIN_SETUP_CONFIDENCE,
         "reversal_down_from_impulse_up" => PREDICTION_REVERSAL_DOWN_MIN_SETUP_CONFIDENCE,
@@ -6706,6 +6867,20 @@ async fn apply_prediction_calibration(
             candidate.rule,
             candidate.direction,
             candidate.structure_score
+        );
+        merge_prediction_calibration(decision, &calibration, Some(&candidate));
+        return Ok(());
+    }
+    if candidate.rule == EVENT_ML_TWO_STAGE_REVERSE_RULE
+        || candidate.rule == EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE
+    {
+        let calibration = PredictionCalibration::forced_allowed(
+            config,
+            format!(
+                "forced current-regime two_stage meta mode {} rule {} direction {} raw {:.4}",
+                candidate.mode, candidate.rule, candidate.direction, candidate.raw_confidence
+            ),
+            candidate.raw_confidence,
         );
         merge_prediction_calibration(decision, &calibration, Some(&candidate));
         return Ok(());
@@ -7017,7 +7192,7 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
     let move_probability = model.models.move_model.predict_proba(&feature_values);
     let up_probability = model.models.direction.predict_proba(&feature_values);
     let mut direction = "HOLD".to_string();
-    let mut rule = "two_stage_extra_trees".to_string();
+    let mut rule = EVENT_ML_TWO_STAGE_RULE.to_string();
     if move_probability >= model.thresholds.move_probability {
         if up_probability >= model.thresholds.direction_probability {
             direction = "UP".to_string();
@@ -7087,6 +7262,245 @@ fn event_ml_predict(model: &EventMlModel, bars: &[MarketSecondBar]) -> Option<Ev
         filtered_reason,
         features,
     })
+}
+
+fn apply_event_ml_meta_policy(prediction: &mut EventMlPrediction) {
+    apply_event_ml_meta_policy_with_options(
+        prediction,
+        EventMlMetaPolicyOptions {
+            two_stage_enabled: env_bool(
+                "EVENT_ML_TWO_STAGE_ENABLED",
+                DEFAULT_EVENT_ML_TWO_STAGE_ENABLED,
+            ),
+            two_stage_downshift_enabled: env_bool(
+                "EVENT_ML_TWO_STAGE_DOWNSHIFT_ENABLED",
+                DEFAULT_EVENT_ML_TWO_STAGE_DOWNSHIFT_ENABLED,
+            ),
+            two_stage_reverse_enabled: env_bool(
+                "EVENT_ML_TWO_STAGE_REVERSE_ENABLED",
+                DEFAULT_EVENT_ML_TWO_STAGE_REVERSE_ENABLED,
+            ),
+            slow_up_enabled: env_bool("EVENT_ML_SLOW_UP_ENABLED", DEFAULT_EVENT_ML_SLOW_UP_ENABLED),
+        },
+    );
+}
+
+fn apply_event_ml_meta_policy_with_options(
+    prediction: &mut EventMlPrediction,
+    options: EventMlMetaPolicyOptions,
+) {
+    if prediction.rule == EVENT_ML_TWO_STAGE_RULE
+        && matches!(prediction.direction.as_str(), "UP" | "DOWN")
+    {
+        let original_direction = prediction.direction.clone();
+        if options.two_stage_downshift_enabled
+            && original_direction == "UP"
+            && event_ml_two_stage_downshift_allowed(prediction)
+        {
+            prediction.direction = "DOWN".to_string();
+            prediction.rule = EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE.to_string();
+            prediction.up_probability = 1.0 - prediction.up_probability;
+            prediction.confidence = event_ml_direction_confidence(
+                prediction.direction.as_str(),
+                prediction.up_probability,
+                prediction.confidence,
+            );
+            prediction.score =
+                event_ml_score(prediction.move_probability, prediction.up_probability);
+            return;
+        }
+        if original_direction == "UP" {
+            if let Some(reason) = event_ml_two_stage_up_filter_reason(prediction) {
+                prediction.direction = "HOLD".to_string();
+                prediction.filtered_reason = Some(reason);
+                prediction.confidence = 0.0;
+                return;
+            }
+        }
+        if options.two_stage_enabled {
+            return;
+        }
+        if !options.two_stage_reverse_enabled {
+            prediction.direction = "HOLD".to_string();
+            prediction.filtered_reason = Some(format!(
+                "hold two_stage disabled original_direction {} confidence {:.4}",
+                original_direction, prediction.confidence
+            ));
+            prediction.confidence = 0.0;
+            return;
+        }
+        prediction.direction = if prediction.direction == "UP" {
+            "DOWN".to_string()
+        } else {
+            "UP".to_string()
+        };
+        prediction.rule = EVENT_ML_TWO_STAGE_REVERSE_RULE.to_string();
+        prediction.up_probability = 1.0 - prediction.up_probability;
+        prediction.confidence = event_ml_direction_confidence(
+            prediction.direction.as_str(),
+            prediction.up_probability,
+            prediction.confidence,
+        );
+        prediction.score = event_ml_score(prediction.move_probability, prediction.up_probability);
+        if let Some(reason) = event_ml_two_stage_reverse_filter_reason(prediction) {
+            prediction.direction = "HOLD".to_string();
+            prediction.filtered_reason = Some(reason);
+            prediction.confidence = 0.0;
+        }
+        return;
+    }
+
+    if prediction.rule == EVENT_ML_SLOW_REVERSAL_RULE {
+        if let Some(reason) =
+            event_ml_slow_reversal_meta_filter_reason(prediction, options.slow_up_enabled)
+        {
+            prediction.direction = "HOLD".to_string();
+            prediction.filtered_reason = Some(reason);
+            prediction.confidence = 0.0;
+        }
+    }
+}
+
+fn event_ml_two_stage_downshift_allowed(prediction: &EventMlPrediction) -> bool {
+    let ret_180 = feature_f64(&prediction.features, "ret_180");
+    let close_pos_60 = feature_f64(&prediction.features, "candle_close_pos_60");
+    ret_180 < EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_RET_180
+        && close_pos_60 < EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_CLOSE_POS_60
+}
+
+fn event_ml_two_stage_up_filter_reason(prediction: &EventMlPrediction) -> Option<String> {
+    let ret_300 = feature_f64(&prediction.features, "ret_300");
+    if (EVENT_ML_TWO_STAGE_UP_HOLD_MIN_RET_300..EVENT_ML_TWO_STAGE_UP_HOLD_MAX_RET_300)
+        .contains(&ret_300)
+    {
+        return Some(format!(
+            "hold two_stage up medium downtrend ret300 {:.6}",
+            ret_300
+        ));
+    }
+    None
+}
+
+fn event_ml_direction_confidence(direction: &str, up_probability: f64, fallback: f64) -> f64 {
+    match direction {
+        "UP" => up_probability,
+        "DOWN" => 1.0 - up_probability,
+        _ => fallback,
+    }
+}
+
+fn event_ml_two_stage_reverse_filter_reason(prediction: &EventMlPrediction) -> Option<String> {
+    if prediction.direction != "DOWN" {
+        return Some(format!(
+            "hold two_stage reverse up not supported direction {} confidence {:.4}",
+            prediction.direction, prediction.confidence
+        ));
+    }
+    let features = &prediction.features;
+    let ret_420 = feature_f64(features, "ret_420");
+    let ret_600 = feature_f64(features, "ret_600");
+    if ret_420 < EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_420
+        || ret_600 < EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_600
+    {
+        return Some(format!(
+            "hold two_stage reverse down chasing drop ret420 {:.6} ret600 {:.6}",
+            ret_420, ret_600
+        ));
+    }
+    None
+}
+
+fn event_ml_slow_reversal_meta_filter_reason(
+    prediction: &EventMlPrediction,
+    slow_up_enabled: bool,
+) -> Option<String> {
+    let features = &prediction.features;
+    let direction = prediction.direction.as_str();
+    let ret_60 = feature_f64(features, "ret_60");
+    let ret_180 = feature_f64(features, "ret_180");
+    let ret_300 = feature_f64(features, "ret_300");
+    let ret_420 = feature_f64(features, "ret_420");
+    let ret_600 = feature_f64(features, "ret_600");
+    let ret_900 = feature_f64(features, "ret_900");
+    let pos_420 = feature_f64(features, "pos_420");
+    let body = feature_f64(features, "candle_body_share_60");
+    let upper_wick = feature_f64(features, "candle_upper_wick_share_60");
+    let lower_wick = feature_f64(features, "candle_lower_wick_share_60");
+    let wick = upper_wick + lower_wick;
+
+    if direction == "UP" && !slow_up_enabled {
+        return Some(format!(
+            "hold slow up disabled by 7d full 1s backtest confidence {:.4}",
+            prediction.confidence
+        ));
+    }
+    if direction == "UP"
+        && (lower_wick < EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60 || lower_wick < upper_wick)
+    {
+        return Some(format!(
+            "hold slow up bottom rejection weak lower_wick {:.3} upper_wick {:.3}",
+            lower_wick, upper_wick
+        ));
+    }
+    if direction == "UP"
+        && (prediction.confidence < EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE
+            || ret_300 > EVENT_ML_SLOW_UP_STRONG_MAX_RET_300)
+    {
+        return Some(format!(
+            "hold slow up weak edge confidence {:.4} ret300 {:.6}",
+            prediction.confidence, ret_300
+        ));
+    }
+
+    if direction != "DOWN" {
+        return None;
+    }
+    if pos_420 < EVENT_ML_SLOW_DOWN_MIN_POS_420 {
+        return Some(format!(
+            "hold slow down not extreme pos420 {:.3} < {:.3}",
+            pos_420, EVENT_ML_SLOW_DOWN_MIN_POS_420
+        ));
+    }
+    if ret_60 >= EVENT_ML_SLOW_DOWN_VERTICAL_RET_1M
+        || ret_180 >= EVENT_ML_SLOW_DOWN_VERTICAL_RET_3M
+        || ret_300 >= EVENT_ML_SLOW_DOWN_VERTICAL_RET_5M
+    {
+        return Some(format!(
+            "hold slow down vertical pump ret60 {:.6} ret180 {:.6} ret300 {:.6}",
+            ret_60, ret_180, ret_300
+        ));
+    }
+    if body >= EVENT_ML_SLOW_DOWN_SOLID_BODY_SHARE_60
+        && wick <= EVENT_ML_SLOW_DOWN_SOLID_MAX_WICK_SHARE_60
+    {
+        return Some(format!(
+            "hold slow down solid no rejection body {:.3} wick {:.3}",
+            body, wick
+        ));
+    }
+    if ret_60 >= EVENT_ML_SLOW_DOWN_FAST_RET_1M && ret_420 >= EVENT_ML_SLOW_DOWN_FAST_RET_7M {
+        return Some(format!(
+            "hold slow down fast continuation ret60 {:.6} ret420 {:.6}",
+            ret_60, ret_420
+        ));
+    }
+    if ret_600 > EVENT_ML_SLOW_DOWN_MAX_RET_600 || ret_900 > EVENT_ML_SLOW_DOWN_MAX_RET_900 {
+        return Some(format!(
+            "hold slow down overextended 10m/15m ret600 {:.6} ret900 {:.6}",
+            ret_600, ret_900
+        ));
+    }
+    let confirmed_edge = (prediction.confidence >= EVENT_ML_SLOW_DOWN_CONFIRM_MIN_CONFIDENCE
+        && ret_60 <= EVENT_ML_SLOW_DOWN_CONFIRM_MAX_RET_60)
+        || (prediction.move_probability <= EVENT_ML_SLOW_DOWN_CONFIRM_MAX_MOVE_PROBABILITY
+            && ret_300 >= EVENT_ML_SLOW_DOWN_CONFIRM_MIN_RET_300);
+    if !confirmed_edge {
+        return Some(format!(
+            "hold slow down weak edge confidence {:.4} move_prob {:.4} ret60 {:.6} ret300 {:.6}",
+            prediction.confidence, prediction.move_probability, ret_60, ret_300
+        ));
+    }
+    None
 }
 
 fn event_ml_score(move_probability: f64, up_probability: f64) -> f64 {
@@ -7402,6 +7816,261 @@ mod tests {
             0.70,
             1.0,
         )
+    }
+
+    fn test_ml_prediction(
+        direction: &str,
+        rule: &str,
+        features: serde_json::Value,
+    ) -> EventMlPrediction {
+        EventMlPrediction {
+            direction: direction.to_string(),
+            rule: rule.to_string(),
+            move_probability: 0.60,
+            up_probability: if direction == "UP" { 0.59 } else { 0.41 },
+            confidence: 0.59,
+            score: 1.0,
+            filtered_reason: None,
+            features,
+        }
+    }
+
+    fn test_meta_policy_options(
+        two_stage_enabled: bool,
+        two_stage_downshift_enabled: bool,
+        two_stage_reverse_enabled: bool,
+        slow_up_enabled: bool,
+    ) -> EventMlMetaPolicyOptions {
+        EventMlMetaPolicyOptions {
+            two_stage_enabled,
+            two_stage_downshift_enabled,
+            two_stage_reverse_enabled,
+            slow_up_enabled,
+        }
+    }
+
+    #[test]
+    fn meta_policy_allows_two_stage_by_default_after_bucket_backtest() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_TWO_STAGE_RULE,
+            json!({
+                "ret_180": -0.0010,
+                "ret_300": -0.0010,
+                "ret_420": -0.0010,
+                "ret_600": -0.0020,
+                "candle_close_pos_60": 0.450
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "UP");
+        assert_eq!(prediction.rule, EVENT_ML_TWO_STAGE_RULE);
+        assert!(prediction.filtered_reason.is_none());
+    }
+
+    #[test]
+    fn meta_policy_holds_two_stage_up_medium_downtrend_bucket() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_TWO_STAGE_RULE,
+            json!({
+                "ret_180": -0.0020,
+                "ret_300": -0.0021,
+                "ret_420": -0.0030,
+                "ret_600": -0.0035,
+                "candle_close_pos_60": 0.200
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert_eq!(prediction.rule, EVENT_ML_TWO_STAGE_RULE);
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("medium downtrend"));
+    }
+
+    #[test]
+    fn meta_policy_downshifts_two_stage_up_when_drop_continues() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_TWO_STAGE_RULE,
+            json!({
+                "ret_180": -0.0032,
+                "ret_420": -0.0040,
+                "ret_600": -0.0048,
+                "candle_close_pos_60": 0.120
+            }),
+        );
+        prediction.up_probability = 0.590;
+        prediction.confidence = 0.590;
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, true, false, false),
+        );
+
+        assert_eq!(prediction.direction, "DOWN");
+        assert_eq!(prediction.rule, EVENT_ML_TWO_STAGE_DOWNSHIFT_RULE);
+        assert!(prediction.confidence > 0.40);
+    }
+
+    #[test]
+    fn meta_policy_does_not_downshift_two_stage_up_after_reclaim() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_TWO_STAGE_RULE,
+            json!({
+                "ret_180": -0.0032,
+                "ret_420": -0.0040,
+                "ret_600": -0.0048,
+                "candle_close_pos_60": 0.520
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "UP");
+        assert_eq!(prediction.rule, EVENT_ML_TWO_STAGE_RULE);
+    }
+
+    #[test]
+    fn meta_policy_holds_slow_down_overextended_10m_15m() {
+        let mut prediction = test_ml_prediction(
+            "DOWN",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.980,
+                "ret_60": 0.0007,
+                "ret_180": 0.0019,
+                "ret_300": 0.0032,
+                "ret_420": 0.0034,
+                "ret_600": 0.0031,
+                "ret_900": 0.0018,
+                "candle_body_share_60": 0.750,
+                "candle_upper_wick_share_60": 0.180,
+                "candle_lower_wick_share_60": 0.070
+            }),
+        );
+        prediction.confidence = 0.700;
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("overextended"));
+    }
+
+    #[test]
+    fn meta_policy_holds_slow_down_vertical_pump() {
+        let mut prediction = test_ml_prediction(
+            "DOWN",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.980,
+                "ret_60": 0.0047,
+                "ret_180": 0.0128,
+                "ret_300": 0.0081,
+                "ret_420": 0.0022,
+                "candle_body_share_60": 0.931,
+                "candle_upper_wick_share_60": 0.069,
+                "candle_lower_wick_share_60": 0.000
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("vertical pump"));
+    }
+
+    #[test]
+    fn meta_policy_holds_slow_up_without_bottom_rejection() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.041,
+                "ret_60": -0.0013,
+                "ret_180": -0.0040,
+                "ret_300": -0.0036,
+                "ret_420": -0.0041,
+                "candle_body_share_60": 0.692,
+                "candle_upper_wick_share_60": 0.197,
+                "candle_lower_wick_share_60": 0.111
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slow up disabled"));
+    }
+
+    #[test]
+    fn meta_policy_holds_slow_up_weak_edge() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.041,
+                "ret_60": -0.0013,
+                "ret_180": -0.0030,
+                "ret_300": -0.0018,
+                "ret_420": -0.0041,
+                "candle_body_share_60": 0.450,
+                "candle_upper_wick_share_60": 0.050,
+                "candle_lower_wick_share_60": 0.500
+            }),
+        );
+        prediction.confidence = 0.650;
+        prediction.up_probability = 0.650;
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("slow up disabled"));
     }
 
     #[test]
