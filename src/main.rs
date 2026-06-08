@@ -105,7 +105,7 @@ const DEFAULT_PREDICTION_TECHNICAL_WEIGHT: f64 = 0.35;
 const DEFAULT_PREDICTION_PROBABILITY_WEIGHT: f64 = 0.65;
 const DEFAULT_PREDICTION_VOLATILITY_FLOOR: f64 = 0.00016;
 const DEFAULT_PREDICTION_SIGNAL_COOLDOWN_SECONDS: i64 = 60;
-const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v3-meta-guards";
+const PREDICTION_MODEL_VERSION: &str = "event-edge-ml-v3-reversal-guards";
 const FALLBACK_PREDICTION_MODEL_VERSION: &str = "event-edge-v10";
 const DEFAULT_EVENT_ML_MODEL_PATH: &str = "models/event_edge_ml_v1.json";
 #[cfg(test)]
@@ -172,6 +172,7 @@ const EVENT_ML_SLOW_DOWN_FAST_RET_1M: f64 = 0.00245;
 const EVENT_ML_SLOW_DOWN_FAST_RET_7M: f64 = 0.00440;
 const EVENT_ML_SLOW_DOWN_SOLID_BODY_SHARE_60: f64 = 0.995;
 const EVENT_ML_SLOW_DOWN_SOLID_MAX_WICK_SHARE_60: f64 = 0.005;
+const EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600: f64 = 0.00100;
 const EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60: f64 = 0.18;
 const DEFAULT_EVENT_ML_SLOW_UP_ENABLED: bool = false;
 const EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE: f64 = 0.697;
@@ -188,6 +189,8 @@ const EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_RET_180: f64 = -0.00280;
 const EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_CLOSE_POS_60: f64 = 0.30;
 const EVENT_ML_TWO_STAGE_UP_HOLD_MIN_RET_300: f64 = -0.00300;
 const EVENT_ML_TWO_STAGE_UP_HOLD_MAX_RET_300: f64 = -0.00150;
+const EVENT_ML_TWO_STAGE_UP_MIN_REJECTION_LOWER_WICK_SHARE_60: f64 = 0.20;
+const EVENT_ML_TWO_STAGE_UP_MAX_REJECTION_UPPER_WICK_SHARE_60: f64 = 0.45;
 const DEFAULT_MARKET_DATA_PRIMARY: &str = BINANCE_FAPI_BASE_URL;
 const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
@@ -7358,6 +7361,16 @@ fn event_ml_two_stage_up_filter_reason(prediction: &EventMlPrediction) -> Option
             ret_300
         ));
     }
+    let lower_wick = feature_f64(&prediction.features, "candle_lower_wick_share_60");
+    let upper_wick = feature_f64(&prediction.features, "candle_upper_wick_share_60");
+    if lower_wick < EVENT_ML_TWO_STAGE_UP_MIN_REJECTION_LOWER_WICK_SHARE_60
+        || upper_wick > EVENT_ML_TWO_STAGE_UP_MAX_REJECTION_UPPER_WICK_SHARE_60
+    {
+        return Some(format!(
+            "hold two_stage up weak rebound rejection lower_wick {:.3} upper_wick {:.3}",
+            lower_wick, upper_wick
+        ));
+    }
     None
 }
 
@@ -7468,6 +7481,12 @@ fn event_ml_slow_reversal_meta_filter_reason(
         return Some(format!(
             "hold slow down overextended 10m/15m ret600 {:.6} ret900 {:.6}",
             ret_600, ret_900
+        ));
+    }
+    if ret_600 > EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600 {
+        return Some(format!(
+            "hold slow down unbroken trend ret600 {:.6} > {:.6}",
+            ret_600, EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600
         ));
     }
     let confirmed_edge = (prediction.confidence >= EVENT_ML_SLOW_DOWN_CONFIRM_MIN_CONFIDENCE
@@ -7839,7 +7858,9 @@ mod tests {
                 "ret_300": -0.0010,
                 "ret_420": -0.0010,
                 "ret_600": -0.0020,
-                "candle_close_pos_60": 0.450
+                "candle_close_pos_60": 0.450,
+                "candle_lower_wick_share_60": 0.250,
+                "candle_upper_wick_share_60": 0.300
             }),
         );
 
@@ -7863,7 +7884,9 @@ mod tests {
                 "ret_300": -0.0021,
                 "ret_420": -0.0030,
                 "ret_600": -0.0035,
-                "candle_close_pos_60": 0.200
+                "candle_close_pos_60": 0.200,
+                "candle_lower_wick_share_60": 0.250,
+                "candle_upper_wick_share_60": 0.200
             }),
         );
 
@@ -7879,6 +7902,36 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("medium downtrend"));
+    }
+
+    #[test]
+    fn meta_policy_holds_two_stage_up_weak_rebound_rejection() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_TWO_STAGE_RULE,
+            json!({
+                "ret_180": -0.0010,
+                "ret_300": -0.0035,
+                "ret_420": -0.0040,
+                "ret_600": -0.0052,
+                "candle_close_pos_60": 0.450,
+                "candle_lower_wick_share_60": 0.171,
+                "candle_upper_wick_share_60": 0.494
+            }),
+        );
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert_eq!(prediction.rule, EVENT_ML_TWO_STAGE_RULE);
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("weak rebound rejection"));
     }
 
     #[test]
@@ -7915,7 +7968,9 @@ mod tests {
                 "ret_180": -0.0032,
                 "ret_420": -0.0040,
                 "ret_600": -0.0048,
-                "candle_close_pos_60": 0.520
+                "candle_close_pos_60": 0.520,
+                "candle_lower_wick_share_60": 0.250,
+                "candle_upper_wick_share_60": 0.300
             }),
         );
 
@@ -7959,6 +8014,39 @@ mod tests {
             .as_deref()
             .unwrap_or_default()
             .contains("overextended"));
+    }
+
+    #[test]
+    fn meta_policy_holds_slow_down_unbroken_trend() {
+        let mut prediction = test_ml_prediction(
+            "DOWN",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.980,
+                "ret_60": 0.0007,
+                "ret_180": 0.0019,
+                "ret_300": 0.0032,
+                "ret_420": 0.0034,
+                "ret_600": 0.0017,
+                "ret_900": 0.0008,
+                "candle_body_share_60": 0.750,
+                "candle_upper_wick_share_60": 0.180,
+                "candle_lower_wick_share_60": 0.070
+            }),
+        );
+        prediction.confidence = 0.700;
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "HOLD");
+        assert!(prediction
+            .filtered_reason
+            .as_deref()
+            .unwrap_or_default()
+            .contains("unbroken trend"));
     }
 
     #[test]
