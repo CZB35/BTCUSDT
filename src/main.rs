@@ -183,6 +183,10 @@ const EVENT_ML_SLOW_DOWN_CONFIRM_MAX_MOVE_PROBABILITY: f64 = 0.681;
 const EVENT_ML_SLOW_DOWN_CONFIRM_MIN_RET_300: f64 = 0.00290;
 const EVENT_ML_SLOW_DOWN_MAX_RET_600: f64 = 0.00251;
 const EVENT_ML_SLOW_DOWN_MAX_RET_900: f64 = 0.00143;
+const EVENT_ML_SLOW_DOWN_BOOTSTRAP_LOOKBACK_MINUTES: i64 = 24 * 60;
+const EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_SAMPLES: i32 = 3;
+const EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_WIN_RATE: f64 = 2.0 / 3.0;
+const EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_RAW_CONFIDENCE: f64 = 0.64;
 const EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_420: f64 = -0.00293;
 const EVENT_ML_TWO_STAGE_REVERSE_DOWN_MIN_RET_600: f64 = -0.00430;
 const EVENT_ML_TWO_STAGE_DOWNSHIFT_MAX_RET_180: f64 = -0.00280;
@@ -12686,6 +12690,82 @@ async fn db_prediction_calibration(
     let fee = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE * PROFIT_SHARE_RATE);
     let net_win = gross_win - fee;
     let loss = decimal_to_f64(MIN_EVENT_STAKE * (Decimal::ONE - PROFIT_SHARE_RATE));
+    let min_raw_confidence = effective_prediction_candidate_min_confidence(config, candidate);
+    let (sample_count, wins) = db_prediction_calibration_samples(
+        pool,
+        candidate,
+        PREDICTION_MODEL_VERSION,
+        config.calibration_lookback_minutes,
+        config.calibration_sample_seconds,
+        min_raw_confidence,
+    )
+    .await?;
+    let min_samples = config.calibration_min_samples;
+    let min_win_rate = config
+        .calibration_min_win_rate
+        .max(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE);
+
+    if sample_count < i64::from(min_samples) {
+        if let Some(bootstrap) =
+            db_prediction_slow_down_bootstrap_calibration(pool, candidate).await?
+        {
+            return Ok(bootstrap);
+        }
+    }
+
+    let win_rate = if sample_count > 0 {
+        wins as f64 / sample_count as f64
+    } else {
+        0.0
+    };
+    let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
+    let allowed = sample_count >= i64::from(min_samples)
+        && win_rate >= min_win_rate
+        && ev_usdt >= config.calibration_min_ev_usdt;
+    let reason = if sample_count < i64::from(min_samples) {
+        format!(
+            "hold calibration warmup mode {} rule {} direction {} samples {}/{}",
+            candidate.mode, candidate.rule, candidate.direction, sample_count, min_samples
+        )
+    } else if win_rate < min_win_rate {
+        format!(
+            "hold calibration win_rate {:.4} < {:.4} mode {} rule {} samples {}",
+            win_rate, min_win_rate, candidate.mode, candidate.rule, sample_count
+        )
+    } else if ev_usdt < config.calibration_min_ev_usdt {
+        format!(
+            "hold calibration ev {:.4} < {:.4} mode {} rule {} samples {}",
+            ev_usdt, config.calibration_min_ev_usdt, candidate.mode, candidate.rule, sample_count
+        )
+    } else {
+        format!(
+            "calibration passed win_rate {:.4} ev {:.4} mode {} rule {} samples {}",
+            win_rate, ev_usdt, candidate.mode, candidate.rule, sample_count
+        )
+    };
+    Ok(PredictionCalibration {
+        allowed,
+        sample_count,
+        wins,
+        win_rate,
+        ev_usdt,
+        min_samples,
+        min_win_rate,
+        min_ev_usdt: config.calibration_min_ev_usdt,
+        lookback_minutes: config.calibration_lookback_minutes,
+        sample_seconds: config.calibration_sample_seconds,
+        reason,
+    })
+}
+
+async fn db_prediction_calibration_samples(
+    pool: &PgPool,
+    candidate: &PredictionCandidate,
+    model_version: &str,
+    lookback_minutes: i64,
+    sample_seconds: i64,
+    min_raw_confidence: f64,
+) -> Result<(i64, i64), AppError> {
     let row = sqlx::query(
         r#"
         with matched as (
@@ -12726,15 +12806,13 @@ async fn db_prediction_calibration(
         from scored
         "#,
     )
-    .bind(PREDICTION_MODEL_VERSION)
-    .bind(config.calibration_lookback_minutes)
+    .bind(model_version)
+    .bind(lookback_minutes)
     .bind(&candidate.mode)
     .bind(&candidate.rule)
     .bind(&candidate.direction)
-    .bind(config.calibration_sample_seconds.max(1))
-    .bind(effective_prediction_candidate_min_confidence(
-        config, candidate,
-    ))
+    .bind(sample_seconds.max(1))
+    .bind(min_raw_confidence)
     .bind(DEFAULT_PERIOD_SECONDS)
     .fetch_one(pool)
     .await
@@ -12742,56 +12820,66 @@ async fn db_prediction_calibration(
 
     let sample_count: i64 = row.get("samples");
     let wins: i64 = row.get("wins");
+    Ok((sample_count, wins))
+}
+
+async fn db_prediction_slow_down_bootstrap_calibration(
+    pool: &PgPool,
+    candidate: &PredictionCandidate,
+) -> Result<Option<PredictionCalibration>, AppError> {
+    if candidate.rule != EVENT_ML_SLOW_REVERSAL_RULE || candidate.direction != "DOWN" {
+        return Ok(None);
+    }
+    if candidate.raw_confidence < EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_RAW_CONFIDENCE {
+        return Ok(None);
+    }
+
+    let (sample_count, wins) = db_prediction_calibration_samples(
+        pool,
+        candidate,
+        PREDICTION_MODEL_VERSION,
+        EVENT_ML_SLOW_DOWN_BOOTSTRAP_LOOKBACK_MINUTES,
+        DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS,
+        EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_RAW_CONFIDENCE,
+    )
+    .await?;
     let win_rate = if sample_count > 0 {
         wins as f64 / sample_count as f64
     } else {
         0.0
     };
+    if sample_count < i64::from(EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_SAMPLES)
+        || win_rate < EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_WIN_RATE
+    {
+        return Ok(None);
+    }
+
+    let gross_win = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE);
+    let fee = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE * PROFIT_SHARE_RATE);
+    let net_win = gross_win - fee;
+    let loss = decimal_to_f64(MIN_EVENT_STAKE * (Decimal::ONE - PROFIT_SHARE_RATE));
     let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
-    let effective_min_win_rate = config
-        .calibration_min_win_rate
-        .max(DEFAULT_PREDICTION_CALIBRATION_MIN_WIN_RATE);
-    let allowed = sample_count >= i64::from(config.calibration_min_samples)
-        && win_rate >= effective_min_win_rate
-        && ev_usdt >= config.calibration_min_ev_usdt;
-    let reason = if sample_count < i64::from(config.calibration_min_samples) {
-        format!(
-            "hold calibration warmup mode {} rule {} direction {} samples {}/{}",
-            candidate.mode,
-            candidate.rule,
-            candidate.direction,
-            sample_count,
-            config.calibration_min_samples
-        )
-    } else if win_rate < effective_min_win_rate {
-        format!(
-            "hold calibration win_rate {:.4} < {:.4} mode {} rule {} samples {}",
-            win_rate, effective_min_win_rate, candidate.mode, candidate.rule, sample_count
-        )
-    } else if ev_usdt < config.calibration_min_ev_usdt {
-        format!(
-            "hold calibration ev {:.4} < {:.4} mode {} rule {} samples {}",
-            ev_usdt, config.calibration_min_ev_usdt, candidate.mode, candidate.rule, sample_count
-        )
-    } else {
-        format!(
-            "calibration passed win_rate {:.4} ev {:.4} mode {} rule {} samples {}",
-            win_rate, ev_usdt, candidate.mode, candidate.rule, sample_count
-        )
-    };
-    Ok(PredictionCalibration {
-        allowed,
+    Ok(Some(PredictionCalibration {
+        allowed: true,
         sample_count,
         wins,
         win_rate,
         ev_usdt,
-        min_samples: config.calibration_min_samples,
-        min_win_rate: effective_min_win_rate,
-        min_ev_usdt: config.calibration_min_ev_usdt,
-        lookback_minutes: config.calibration_lookback_minutes,
-        sample_seconds: config.calibration_sample_seconds,
-        reason,
-    })
+        min_samples: EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_SAMPLES,
+        min_win_rate: EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_WIN_RATE,
+        min_ev_usdt: DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT,
+        lookback_minutes: EVENT_ML_SLOW_DOWN_BOOTSTRAP_LOOKBACK_MINUTES,
+        sample_seconds: DEFAULT_PREDICTION_CALIBRATION_SAMPLE_SECONDS,
+        reason: format!(
+            "calibration bootstrap passed win_rate {:.4} ev {:.4} mode {} rule {} samples {}/{}",
+            win_rate,
+            ev_usdt,
+            candidate.mode,
+            candidate.rule,
+            sample_count,
+            EVENT_ML_SLOW_DOWN_BOOTSTRAP_MIN_SAMPLES
+        ),
+    }))
 }
 
 async fn db_prediction_observations(
