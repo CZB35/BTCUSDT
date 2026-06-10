@@ -200,6 +200,7 @@ const DEFAULT_MARKET_WS_URL: &str =
     "wss://fstream.binance.com/market/stream?streams=btcusdt@aggTrade/btcusdt@markPrice@1s/btcusdt@kline_1m";
 const DEFAULT_MARKET_MIN_WARM_CANDLES: usize = 240;
 const DEFAULT_MARKET_WS_RECONNECT_SECONDS: u64 = 2;
+const DEFAULT_MARKET_WS_IDLE_TIMEOUT_SECONDS: u64 = 15;
 const DEFAULT_EXCHANGE_WORKER_SHARD_TOTAL: i32 = 1;
 const DEFAULT_EXCHANGE_WORKER_SHARD_INDEX: i32 = 0;
 const DEFAULT_BSC_USDT_CONTRACT: &str = "0x55d398326f99059fF775485246999027B3197955";
@@ -1528,6 +1529,7 @@ struct PredictionConfig {
     market_data_base_url: String,
     market_ws_url: String,
     market_ws_reconnect_seconds: u64,
+    market_ws_idle_timeout_seconds: u64,
     signal_cooldown_seconds: i64,
     calibration_lookback_minutes: i64,
     calibration_min_samples: i32,
@@ -2250,6 +2252,11 @@ impl PredictionConfig {
                 "MARKET_WS_RECONNECT_SECONDS",
                 DEFAULT_MARKET_WS_RECONNECT_SECONDS,
                 1,
+            ),
+            market_ws_idle_timeout_seconds: env_u64(
+                "MARKET_WS_IDLE_TIMEOUT_SECONDS",
+                DEFAULT_MARKET_WS_IDLE_TIMEOUT_SECONDS,
+                5,
             ),
             signal_cooldown_seconds: env_i64(
                 "PREDICTION_SIGNAL_COOLDOWN_SECONDS",
@@ -5467,9 +5474,31 @@ async fn run_market_ws(state: &SharedState, config: &PredictionConfig) -> Result
         market.last_error = None;
     }
     let (mut write, mut read) = ws_stream.split();
-    while let Some(message) = read.next().await {
-        let message = message
-            .map_err(|err| AppError::bad_request("MARKET_WS_READ_FAILED", err.to_string()))?;
+    loop {
+        let message = match tokio::time::timeout(
+            StdDuration::from_secs(config.market_ws_idle_timeout_seconds.max(5)),
+            read.next(),
+        )
+        .await
+        {
+            Ok(Some(message)) => message
+                .map_err(|err| AppError::bad_request("MARKET_WS_READ_FAILED", err.to_string()))?,
+            Ok(None) => {
+                return Err(AppError::bad_request(
+                    "MARKET_WS_CLOSED",
+                    "market websocket closed",
+                ));
+            }
+            Err(_) => {
+                return Err(AppError::bad_request(
+                    "MARKET_WS_IDLE_TIMEOUT",
+                    format!(
+                        "market websocket idle for {}s",
+                        config.market_ws_idle_timeout_seconds.max(5)
+                    ),
+                ));
+            }
+        };
         if let TungsteniteMessage::Ping(payload) = message {
             write
                 .send(TungsteniteMessage::Pong(payload))
@@ -5485,10 +5514,6 @@ async fn run_market_ws(state: &SharedState, config: &PredictionConfig) -> Result
             .map_err(|err| AppError::bad_request("MARKET_WS_MESSAGE_INVALID", err.to_string()))?;
         apply_market_ws_message(state, config, text).await?;
     }
-    Err(AppError::bad_request(
-        "MARKET_WS_CLOSED",
-        "market websocket closed",
-    ))
 }
 
 async fn apply_market_ws_message(
@@ -5689,6 +5714,7 @@ async fn update_market_aux_price(
 }
 
 async fn record_market_error(state: &SharedState, message: String) {
+    eprintln!("market feed error: {message}");
     let mut market = state.market_data.write().await;
     market.last_error = Some(message.chars().take(500).collect());
 }
