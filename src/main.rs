@@ -176,7 +176,15 @@ const EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600: f64 = 0.00100;
 const EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60: f64 = 0.18;
 const DEFAULT_EVENT_ML_SLOW_UP_ENABLED: bool = false;
 const EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE: f64 = 0.697;
+const EVENT_ML_SLOW_UP_STRONG_MIN_MOVE_PROBABILITY: f64 = 0.68;
+const EVENT_ML_SLOW_UP_STRONG_MAX_RET_60: f64 = -0.00060;
 const EVENT_ML_SLOW_UP_STRONG_MAX_RET_300: f64 = -0.00245;
+const EVENT_ML_SLOW_UP_STRONG_MAX_RET_420: f64 = -0.00300;
+const EVENT_ML_SLOW_UP_STRONG_MIN_CLOSE_POS_60: f64 = 0.20;
+const EVENT_ML_SLOW_UP_STRONG_MAX_BUY_IMBALANCE_60: f64 = -0.02;
+const EVENT_ML_SLOW_UP_BOOTSTRAP_LOOKBACK_MINUTES: i64 = 7 * 24 * 60;
+const EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_SAMPLES: i32 = 3;
+const EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_WIN_RATE: f64 = 2.0 / 3.0;
 const EVENT_ML_SLOW_DOWN_CONFIRM_MIN_CONFIDENCE: f64 = 0.684;
 const EVENT_ML_SLOW_DOWN_CONFIRM_MAX_RET_60: f64 = 0.00093;
 const EVENT_ML_SLOW_DOWN_CONFIRM_MAX_MOVE_PROBABILITY: f64 = 0.681;
@@ -1716,6 +1724,17 @@ struct EventMlMetaPolicyOptions {
     two_stage_downshift_enabled: bool,
     two_stage_reverse_enabled: bool,
     slow_up_enabled: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct EventMlSlowUpConfirmation {
+    ret_60: f64,
+    ret_300: f64,
+    ret_420: f64,
+    lower_wick: f64,
+    upper_wick: f64,
+    close_pos_60: f64,
+    buy_imbalance_60: f64,
 }
 
 #[derive(Clone, Debug)]
@@ -7449,14 +7468,19 @@ fn event_ml_slow_reversal_meta_filter_reason(
     let body = feature_f64(features, "candle_body_share_60");
     let upper_wick = feature_f64(features, "candle_upper_wick_share_60");
     let lower_wick = feature_f64(features, "candle_lower_wick_share_60");
+    let close_pos_60 = feature_f64(features, "candle_close_pos_60");
+    let buy_imbalance_60 = feature_f64(features, "buy_imbalance_60");
+    let slow_up_confirmation = EventMlSlowUpConfirmation {
+        ret_60,
+        ret_300,
+        ret_420,
+        lower_wick,
+        upper_wick,
+        close_pos_60,
+        buy_imbalance_60,
+    };
     let wick = upper_wick + lower_wick;
 
-    if direction == "UP" && !slow_up_enabled {
-        return Some(format!(
-            "hold slow up disabled by 7d full 1s backtest confidence {:.4}",
-            prediction.confidence
-        ));
-    }
     if direction == "UP"
         && (lower_wick < EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60 || lower_wick < upper_wick)
     {
@@ -7466,12 +7490,29 @@ fn event_ml_slow_reversal_meta_filter_reason(
         ));
     }
     if direction == "UP"
+        && !slow_up_enabled
+        && !event_ml_strong_slow_up_allowed(prediction, slow_up_confirmation)
+    {
+        return Some(format!(
+            "hold slow up disabled except strong confirmation confidence {:.4} move_prob {:.4} ret60 {:.6} ret300 {:.6} ret420 {:.6} close_pos {:.3} buy_imbalance_60 {:.3}",
+            prediction.confidence,
+            prediction.move_probability,
+            ret_60,
+            ret_300,
+            ret_420,
+            close_pos_60,
+            buy_imbalance_60
+        ));
+    }
+    if direction == "UP"
         && (prediction.confidence < EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE
+            || prediction.move_probability < EVENT_ML_SLOW_UP_STRONG_MIN_MOVE_PROBABILITY
+            || ret_60 > EVENT_ML_SLOW_UP_STRONG_MAX_RET_60
             || ret_300 > EVENT_ML_SLOW_UP_STRONG_MAX_RET_300)
     {
         return Some(format!(
-            "hold slow up weak edge confidence {:.4} ret300 {:.6}",
-            prediction.confidence, ret_300
+            "hold slow up weak edge confidence {:.4} move_prob {:.4} ret60 {:.6} ret300 {:.6}",
+            prediction.confidence, prediction.move_probability, ret_60, ret_300
         ));
     }
 
@@ -7530,6 +7571,21 @@ fn event_ml_slow_reversal_meta_filter_reason(
         ));
     }
     None
+}
+
+fn event_ml_strong_slow_up_allowed(
+    prediction: &EventMlPrediction,
+    confirmation: EventMlSlowUpConfirmation,
+) -> bool {
+    prediction.confidence >= EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE
+        && prediction.move_probability >= EVENT_ML_SLOW_UP_STRONG_MIN_MOVE_PROBABILITY
+        && confirmation.ret_60 <= EVENT_ML_SLOW_UP_STRONG_MAX_RET_60
+        && confirmation.ret_300 <= EVENT_ML_SLOW_UP_STRONG_MAX_RET_300
+        && confirmation.ret_420 <= EVENT_ML_SLOW_UP_STRONG_MAX_RET_420
+        && confirmation.lower_wick >= EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60
+        && confirmation.lower_wick >= confirmation.upper_wick
+        && confirmation.close_pos_60 >= EVENT_ML_SLOW_UP_STRONG_MIN_CLOSE_POS_60
+        && confirmation.buy_imbalance_60 <= EVENT_ML_SLOW_UP_STRONG_MAX_BUY_IMBALANCE_60
 }
 
 fn event_ml_score(move_probability: f64, up_probability: f64) -> f64 {
@@ -8136,7 +8192,7 @@ mod tests {
             .filtered_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("slow up disabled"));
+            .contains("bottom rejection weak"));
     }
 
     #[test]
@@ -8168,7 +8224,38 @@ mod tests {
             .filtered_reason
             .as_deref()
             .unwrap_or_default()
-            .contains("slow up disabled"));
+            .contains("disabled except strong confirmation"));
+    }
+
+    #[test]
+    fn meta_policy_allows_strong_slow_up_with_bottom_rejection() {
+        let mut prediction = test_ml_prediction(
+            "UP",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.030,
+                "ret_60": -0.0018,
+                "ret_180": -0.0032,
+                "ret_300": -0.0032,
+                "ret_420": -0.0042,
+                "candle_body_share_60": 0.390,
+                "candle_upper_wick_share_60": 0.080,
+                "candle_lower_wick_share_60": 0.360,
+                "candle_close_pos_60": 0.360,
+                "buy_imbalance_60": -0.080
+            }),
+        );
+        prediction.confidence = 0.705;
+        prediction.up_probability = 0.705;
+        prediction.move_probability = 0.705;
+
+        apply_event_ml_meta_policy_with_options(
+            &mut prediction,
+            test_meta_policy_options(true, false, false, false),
+        );
+
+        assert_eq!(prediction.direction, "UP");
+        assert!(prediction.filtered_reason.is_none());
     }
 
     #[test]
@@ -12733,6 +12820,11 @@ async fn db_prediction_calibration(
 
     if sample_count < i64::from(min_samples) {
         if let Some(bootstrap) =
+            db_prediction_slow_up_bootstrap_calibration(pool, candidate).await?
+        {
+            return Ok(bootstrap);
+        }
+        if let Some(bootstrap) =
             db_prediction_slow_down_bootstrap_calibration(pool, candidate).await?
         {
             return Ok(bootstrap);
@@ -12847,6 +12939,126 @@ async fn db_prediction_calibration_samples(
     let sample_count: i64 = row.get("samples");
     let wins: i64 = row.get("wins");
     Ok((sample_count, wins))
+}
+
+async fn db_prediction_slow_up_bootstrap_calibration(
+    pool: &PgPool,
+    candidate: &PredictionCandidate,
+) -> Result<Option<PredictionCalibration>, AppError> {
+    if candidate.rule != EVENT_ML_SLOW_REVERSAL_RULE || candidate.direction != "UP" {
+        return Ok(None);
+    }
+    if candidate.raw_confidence < EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE {
+        return Ok(None);
+    }
+
+    let row = sqlx::query(
+        r#"
+        with eligible as (
+          select o.created_at,
+                 o.entry_price::float8 as entry_price,
+                 f.entry_price::float8 as future_price
+          from prediction_observations o
+          join lateral (
+            select entry_price
+            from prediction_observations p
+            where p.created_at >= o.created_at + make_interval(secs => $10::double precision)
+            order by p.created_at asc
+            limit 1
+          ) f on true
+          where o.model_version = $1
+            and o.created_at >= now() - ($2::text || ' minutes')::interval
+            and o.created_at <= now() - make_interval(secs => $10::double precision)
+            and o.feature_snapshot->'decision'->>'candidate_mode' = $3
+            and o.feature_snapshot->'decision'->>'candidate_rule' = $4
+            and (o.feature_snapshot->'ml'->>'up_probability')::float8 >= $5
+            and (o.feature_snapshot->'scores'->>'move_probability')::float8 >= $6
+            and (o.feature_snapshot->'features'->>'ret_60')::float8 <= $7
+            and (o.feature_snapshot->'features'->>'ret_300')::float8 <= $8
+            and (o.feature_snapshot->'features'->>'ret_420')::float8 <= $9
+            and (o.feature_snapshot->'features'->>'candle_lower_wick_share_60')::float8 >= $11
+            and (o.feature_snapshot->'features'->>'candle_lower_wick_share_60')::float8
+                >= (o.feature_snapshot->'features'->>'candle_upper_wick_share_60')::float8
+            and (o.feature_snapshot->'features'->>'candle_close_pos_60')::float8 >= $12
+            and (o.feature_snapshot->'features'->>'buy_imbalance_60')::float8 <= $13
+        ),
+        matched as (
+          select distinct on (
+                   floor(extract(epoch from created_at) / $14::double precision)
+                 )
+                 created_at,
+                 entry_price,
+                 future_price
+          from eligible
+          order by floor(extract(epoch from created_at) / $14::double precision), created_at desc
+        ),
+        scored as (
+          select *,
+                 case when future_price > entry_price then 1 else 0 end as win
+          from matched
+        )
+        select count(*)::bigint as samples,
+               coalesce(sum(win), 0)::bigint as wins
+        from scored
+        "#,
+    )
+    .bind(PREDICTION_MODEL_VERSION)
+    .bind(EVENT_ML_SLOW_UP_BOOTSTRAP_LOOKBACK_MINUTES)
+    .bind(&candidate.mode)
+    .bind(&candidate.rule)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MIN_MOVE_PROBABILITY)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MAX_RET_60)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MAX_RET_300)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MAX_RET_420)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .bind(EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MIN_CLOSE_POS_60)
+    .bind(EVENT_ML_SLOW_UP_STRONG_MAX_BUY_IMBALANCE_60)
+    .bind(DEFAULT_PERIOD_SECONDS)
+    .fetch_one(pool)
+    .await
+    .map_err(AppError::from_sqlx)?;
+
+    let sample_count: i64 = row.get("samples");
+    let wins: i64 = row.get("wins");
+    let win_rate = if sample_count > 0 {
+        wins as f64 / sample_count as f64
+    } else {
+        0.0
+    };
+    if sample_count < i64::from(EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_SAMPLES)
+        || win_rate < EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_WIN_RATE
+    {
+        return Ok(None);
+    }
+
+    let gross_win = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE);
+    let fee = decimal_to_f64(DEFAULT_PAYOUT_RATIO * MIN_EVENT_STAKE * PROFIT_SHARE_RATE);
+    let net_win = gross_win - fee;
+    let loss = decimal_to_f64(MIN_EVENT_STAKE * (Decimal::ONE - PROFIT_SHARE_RATE));
+    let ev_usdt = win_rate * net_win - (1.0 - win_rate) * loss;
+    Ok(Some(PredictionCalibration {
+        allowed: true,
+        sample_count,
+        wins,
+        win_rate,
+        ev_usdt,
+        min_samples: EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_SAMPLES,
+        min_win_rate: EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_WIN_RATE,
+        min_ev_usdt: DEFAULT_PREDICTION_CALIBRATION_MIN_EV_USDT,
+        lookback_minutes: EVENT_ML_SLOW_UP_BOOTSTRAP_LOOKBACK_MINUTES,
+        sample_seconds: i64::from(DEFAULT_PERIOD_SECONDS),
+        reason: format!(
+            "calibration slow up bootstrap passed win_rate {:.4} ev {:.4} mode {} rule {} samples {}/{}",
+            win_rate,
+            ev_usdt,
+            candidate.mode,
+            candidate.rule,
+            sample_count,
+            EVENT_ML_SLOW_UP_BOOTSTRAP_MIN_SAMPLES
+        ),
+    }))
 }
 
 async fn db_prediction_slow_down_bootstrap_calibration(
