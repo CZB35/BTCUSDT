@@ -172,7 +172,7 @@ const EVENT_ML_SLOW_DOWN_FAST_RET_1M: f64 = 0.00245;
 const EVENT_ML_SLOW_DOWN_FAST_RET_7M: f64 = 0.00440;
 const EVENT_ML_SLOW_DOWN_SOLID_BODY_SHARE_60: f64 = 0.995;
 const EVENT_ML_SLOW_DOWN_SOLID_MAX_WICK_SHARE_60: f64 = 0.005;
-const EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600: f64 = 0.00100;
+const DEFAULT_EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600: f64 = 0.00251;
 const EVENT_ML_SLOW_UP_MIN_LOWER_WICK_SHARE_60: f64 = 0.18;
 const DEFAULT_EVENT_ML_SLOW_UP_ENABLED: bool = false;
 const EVENT_ML_SLOW_UP_STRONG_MIN_CONFIDENCE: f64 = 0.697;
@@ -1724,6 +1724,7 @@ struct EventMlMetaPolicyOptions {
     two_stage_downshift_enabled: bool,
     two_stage_reverse_enabled: bool,
     slow_up_enabled: bool,
+    slow_down_max_unbroken_ret_600: f64,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -7313,6 +7314,7 @@ fn apply_event_ml_meta_policy(prediction: &mut EventMlPrediction) {
                 DEFAULT_EVENT_ML_TWO_STAGE_REVERSE_ENABLED,
             ),
             slow_up_enabled: env_bool("EVENT_ML_SLOW_UP_ENABLED", DEFAULT_EVENT_ML_SLOW_UP_ENABLED),
+            slow_down_max_unbroken_ret_600: event_ml_slow_down_max_unbroken_ret_600(),
         },
     );
 }
@@ -7383,9 +7385,11 @@ fn apply_event_ml_meta_policy_with_options(
     }
 
     if prediction.rule == EVENT_ML_SLOW_REVERSAL_RULE {
-        if let Some(reason) =
-            event_ml_slow_reversal_meta_filter_reason(prediction, options.slow_up_enabled)
-        {
+        if let Some(reason) = event_ml_slow_reversal_meta_filter_reason(
+            prediction,
+            options.slow_up_enabled,
+            options.slow_down_max_unbroken_ret_600,
+        ) {
             prediction.direction = "HOLD".to_string();
             prediction.filtered_reason = Some(reason);
             prediction.confidence = 0.0;
@@ -7455,6 +7459,7 @@ fn event_ml_two_stage_reverse_filter_reason(prediction: &EventMlPrediction) -> O
 fn event_ml_slow_reversal_meta_filter_reason(
     prediction: &EventMlPrediction,
     slow_up_enabled: bool,
+    slow_down_max_unbroken_ret_600: f64,
 ) -> Option<String> {
     let features = &prediction.features;
     let direction = prediction.direction.as_str();
@@ -7554,10 +7559,11 @@ fn event_ml_slow_reversal_meta_filter_reason(
             ret_600, ret_900
         ));
     }
-    if ret_600 > EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600 {
+    let max_unbroken_ret_600 = slow_down_max_unbroken_ret_600;
+    if ret_600 > max_unbroken_ret_600 {
         return Some(format!(
             "hold slow down unbroken trend ret600 {:.6} > {:.6}",
-            ret_600, EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600
+            ret_600, max_unbroken_ret_600
         ));
     }
     let confirmed_edge = (prediction.confidence >= EVENT_ML_SLOW_DOWN_CONFIRM_MIN_CONFIDENCE
@@ -7571,6 +7577,14 @@ fn event_ml_slow_reversal_meta_filter_reason(
         ));
     }
     None
+}
+
+fn event_ml_slow_down_max_unbroken_ret_600() -> f64 {
+    env_f64(
+        "EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600",
+        DEFAULT_EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600,
+        0.0,
+    )
 }
 
 fn event_ml_strong_slow_up_allowed(
@@ -7931,6 +7945,7 @@ mod tests {
             two_stage_downshift_enabled,
             two_stage_reverse_enabled,
             slow_up_enabled,
+            slow_down_max_unbroken_ret_600: DEFAULT_EVENT_ML_SLOW_DOWN_MAX_UNBROKEN_RET_600,
         }
     }
 
@@ -8103,7 +8118,7 @@ mod tests {
     }
 
     #[test]
-    fn meta_policy_holds_slow_down_unbroken_trend() {
+    fn meta_policy_allows_slow_down_unbroken_trend_by_default() {
         let mut prediction = test_ml_prediction(
             "DOWN",
             EVENT_ML_SLOW_REVERSAL_RULE,
@@ -8126,6 +8141,34 @@ mod tests {
             &mut prediction,
             test_meta_policy_options(true, false, false, false),
         );
+
+        assert_eq!(prediction.direction, "DOWN");
+        assert!(prediction.filtered_reason.is_none());
+    }
+
+    #[test]
+    fn meta_policy_slow_down_unbroken_threshold_can_be_tightened() {
+        let mut prediction = test_ml_prediction(
+            "DOWN",
+            EVENT_ML_SLOW_REVERSAL_RULE,
+            json!({
+                "pos_420": 0.980,
+                "ret_60": 0.0007,
+                "ret_180": 0.0019,
+                "ret_300": 0.0032,
+                "ret_420": 0.0034,
+                "ret_600": 0.0017,
+                "ret_900": 0.0008,
+                "candle_body_share_60": 0.750,
+                "candle_upper_wick_share_60": 0.180,
+                "candle_lower_wick_share_60": 0.070
+            }),
+        );
+        prediction.confidence = 0.700;
+
+        let mut options = test_meta_policy_options(true, false, false, false);
+        options.slow_down_max_unbroken_ret_600 = 0.00100;
+        apply_event_ml_meta_policy_with_options(&mut prediction, options);
 
         assert_eq!(prediction.direction, "HOLD");
         assert!(prediction
